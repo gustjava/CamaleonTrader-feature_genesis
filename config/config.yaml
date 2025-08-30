@@ -1,0 +1,108 @@
+# Dynamic Stage 0 - Configuration File
+# GPU-Accelerated Feature Stationarization Pipeline
+
+# Database Configuration
+database:
+  host: ${MYSQL_HOST:localhost}
+  port: ${MYSQL_PORT:3010}
+  database: ${MYSQL_DATABASE:dynamic_stage0_db}
+  username: ${MYSQL_USERNAME:root}
+  password: ${MYSQL_PASSWORD:root}
+  charset: utf8mb4
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+  pool_recycle: 3600
+
+# Cloudflare R2 Configuration
+r2:
+  account_id: ${R2_ACCOUNT_ID:ac68ac775ba99b267edee7f9b4b3bc4e}
+  access_key: ${R2_ACCESS_KEY:0e315105695707ca4fe1e5f83a38f807}
+  secret_key: ${R2_SECRET_KEY:5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515}
+  bucket_name: ${R2_BUCKET_NAME:camaleon}
+  endpoint_url: ${R2_ENDPOINT_URL:https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com}
+  region: ${R2_REGION:auto}
+
+# Dask-CUDA Configuration
+dask:
+  gpus_per_worker: 1
+  threads_per_worker: 1
+  memory_limit: "auto"
+  rmm:
+    pool_size: "24GB"
+    initial_pool_size: "12GB"
+    maximum_pool_size: "48GB"
+  spilling:
+    enabled: true
+    target: 0.8
+    max_spill: "32GB"
+
+# Feature Engineering Configuration
+features:
+  # Rolling window features
+  rolling_corr:
+    windows: [20, 50, 100, 200]
+    min_periods: 10
+  
+  # Fractional differentiation
+  frac_diff:
+    d_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+    threshold: 1e-5
+    max_lag: 1000
+  
+  # Baxter-King filter
+  baxter_king:
+    low_freq: 6
+    high_freq: 32
+    k: 12
+  
+  # GARCH parameters
+  garch:
+    p: 1
+    q: 1
+    max_iter: 1000
+    tolerance: 1e-6
+  
+  # Distance correlation
+  distance_corr:
+    max_samples: 10000  # Limit for large datasets
+  
+  # Empirical Mode Decomposition
+  emd:
+    max_imfs: 10
+    tolerance: 1e-10
+    max_iterations: 100
+
+# Processing Configuration
+processing:
+  batch_size: 10000
+  chunk_size: "256MB"
+  max_workers: 4
+  timeout: 3600  # 1 hour per pair
+  
+# Logging Configuration
+logging:
+  level: ${LOG_LEVEL:INFO}
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: ${LOG_FILE:logs/dynamic_stage0.log}
+  max_size: "100MB"
+  backup_count: 5
+  
+# Monitoring Configuration
+monitoring:
+  metrics_enabled: true
+  dashboard_port: 8787
+  health_check_interval: 30
+  
+# Output Configuration
+output:
+  format: parquet
+  compression: snappy
+  partition_size: "1GB"
+  output_path: ${OUTPUT_PATH:data/processed_features/}
+  
+# Development Configuration
+development:
+  debug: ${DEBUG:false}
+  profile: ${PROFILE:false}
+  test_mode: ${TEST_MODE:false}
