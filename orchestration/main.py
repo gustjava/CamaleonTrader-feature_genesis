@@ -29,7 +29,7 @@ except ImportError as e:
 
 from config import get_config
 from config.settings import get_settings
-from data_io.db_handler import DatabaseHandler, get_pending_currency_pairs, update_task_status
+from data_io.db_handler import DatabaseHandler, update_task_status
 # Alterado para carregar do loader local
 from data_io.local_loader import LocalDataLoader
 
@@ -79,27 +79,47 @@ class DaskClusterManager:
         try:
             logger.info("Starting Dask-CUDA cluster...")
             gpu_count = self._get_gpu_count()
-            logger.info(f"Detected {gpu_count} GPU(s)")
+            logger.info("Detected %d GPU(s)", gpu_count)
 
-            # Simplificado: Deixa o LocalCUDACluster gerenciar o RMM com base nos parâmetros
-            self.cluster = LocalCUDACluster(
+            # RMM via cudaMallocAsync (pool + menos fragmentação)
+            os.environ.setdefault("RMM_ALLOCATOR", "cuda_async")
+
+            # calcula pool ~80% da VRAM da 1ª GPU
+            free_b, total_b = cp.cuda.runtime.memGetInfo()
+            pool_bytes = int(total_b * 0.80)
+            pool_str = f"{pool_bytes // (1024**3)}GB"
+
+            common_kwargs = dict(
                 n_workers=gpu_count,
-                rmm_pool_size=self.settings.dask.rmm_pool_size,
-                protocol='tcp',
-                dashboard_address=':8787',
-                silence_logs=logging.WARNING
+                threads_per_worker=1,          # GPU: 1 thread por worker
+                rmm_async=True,                # cudaMallocAsync
+                rmm_pool_size=pool_str,        # evita hardcode "24GB"
+                jit_unspill=True,              # spill gradual p/ host
+                device_memory_limit="0.85",    # 85% como float
+                dashboard_address=":8787",
+                silence_logs=logging.WARNING,
             )
 
-            logger.info(f"Cluster created with {gpu_count} workers")
+            try:
+                logger.info("Creating LocalCUDACluster with UCX...")
+                self.cluster = LocalCUDACluster(protocol="ucx", **common_kwargs)
+            except Exception as ucx_err:
+                logger.warning("UCX unavailable (%s); falling back to TCP.", ucx_err)
+                self.cluster = LocalCUDACluster(protocol="tcp", **common_kwargs)
+
+            logger.info("✓ Cluster created successfully")
             self.client = Client(self.cluster)
-            logger.info("Waiting for cluster to be ready...")
-            self.client.wait_for_workers(gpu_count, timeout=60)
-            logger.info("Dask-CUDA cluster is active and ready!")
-            logger.info(f"Dashboard URL: {self.client.dashboard_link}")
+            logger.info("✓ Client created successfully")
+
+            logger.info("Waiting for workers to be ready...")
+            self.client.wait_for_workers(gpu_count, timeout=120)
+            logger.info("✓ %d workers ready", gpu_count)
+            logger.info("✓ Dashboard URL: %s", self.client.dashboard_link)
+            logger.info("✓ Active workers: %d", len(self.client.scheduler_info()["workers"]))
             return True
 
         except Exception as e:
-            logger.error(f"Failed to start Dask-CUDA cluster: {e}", exc_info=True)
+            logger.error("Failed to start Dask-CUDA cluster: %s", e, exc_info=True)
             self.shutdown()
             return False
 
@@ -151,53 +171,244 @@ def managed_dask_cluster():
         cluster_manager.shutdown()
 
 
+def save_processed_data_cudf(
+    gdf: 'cudf.DataFrame',
+    currency_pair: str,
+    settings,
+    task_id: str,
+    db_handler: DatabaseHandler
+) -> bool:
+    """
+    Save processed cuDF DataFrame to Feather v2 format.
+    """
+    try:
+        import pyarrow.feather as feather
+        import pathlib
+        
+        out_dir = pathlib.Path(settings.output.output_path) / currency_pair
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{currency_pair}.feather"
+
+        table = gdf.to_arrow()
+        feather.write_feather(table, str(out_path), compression="lz4", version=2)
+        logger.info("Saved single Feather file: %s (%d rows)", out_path, len(gdf))
+        return True
+    except Exception as e:
+        logger.error("Failed to save cuDF: %s", e, exc_info=True)
+        db_handler.update_task_status(task_id, 'FAILED', f"Data saving error: {e}")
+        return False
+
+
+def save_processed_data(
+    df: dask_cudf.DataFrame,
+    currency_pair: str,
+    settings,
+    task_id: str,
+    db_handler: DatabaseHandler
+) -> bool:
+    """
+    Save processed DataFrame with all features to Feather v2 files (Arrow IPC).
+    
+    Args:
+        df: Processed DataFrame with all features
+        currency_pair: Currency pair identifier
+        settings: Application settings
+        task_id: Task ID for status updates
+        db_handler: Database handler for status updates
+        
+    Returns:
+        bool: True if saved successfully, False otherwise
+    """
+    try:
+        logger.info(f"Saving processed data with {len(df.columns)} columns to Feather v2 files for {currency_pair}")
+        
+        # Get the output path from settings
+        output_path = settings.output.output_path
+        compression = "lz4"  # Fast compression for Feather v2
+        
+        # Create output directory structure
+        import pathlib
+        import os
+        import gc
+        import pyarrow.feather as feather
+        
+        output_dir = pathlib.Path(output_path) / currency_pair
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Log data statistics before saving
+        logger.info(f"Data shape: {df.shape}")
+        logger.info(f"Columns: {list(df.columns)}")
+        logger.info(f"Data types: {df.dtypes.to_dict()}")
+        logger.info(f"Number of partitions: {df.npartitions}")
+        
+        # Save using Feather v2 with partitioning to avoid memory spikes
+        logger.info(f"Saving to: {output_dir} using Feather v2 (Arrow IPC) - partitioned approach")
+        
+        # Ensure global ordering by timestamp if 'ts' column exists
+        if 'ts' in df.columns:
+            logger.info("Ensuring global ordering by timestamp...")
+            df = df.set_index('ts', shuffle='tasks')
+        
+        # Save each partition as a separate Feather v2 file
+        partition_files = []
+        for i, part in enumerate(df.to_delayed()):
+            try:
+                # Compute partition in GPU
+                gpart = part.compute()  # cudf.DataFrame da partição (GPU)
+                
+                # Convert to Arrow (CPU)
+                table = gpart.to_arrow()
+                
+                # Save as Feather v2
+                part_filename = f"part-{i:05d}.feather"
+                part_path = output_dir / part_filename
+                
+                feather.write_feather(
+                    table,
+                    str(part_path),
+                    compression=compression,
+                    version=2  # garante Feather v2
+                )
+                
+                partition_files.append(part_filename)
+                logger.info(f"Saved partition {i+1}/{df.npartitions}: {part_filename} ({len(gpart)} rows)")
+                
+                # Clean up GPU memory
+                del gpart, table
+                gc.collect()
+                
+            except Exception as part_error:
+                logger.error(f"Error saving partition {i}: {part_error}")
+                raise
+        
+        # Create a consolidated single file for easier access (optional)
+        logger.info("Creating consolidated single Feather v2 file...")
+        try:
+            # Read all partitions and concatenate in CPU
+            import glob
+            import pyarrow as pa
+            
+            # Get all partition files
+            part_files = sorted(glob.glob(str(output_dir / "part-*.feather")))
+            
+            if part_files:
+                # Read and concatenate all partitions
+                tables = []
+                for part_file in part_files:
+                    table = feather.read_feather(part_file)
+                    tables.append(table)
+                
+                # Concatenate all tables
+                consolidated_table = pa.concat_tables(tables)
+                
+                # Save consolidated file
+                consolidated_path = output_dir / f"{currency_pair}.feather"
+                feather.write_feather(
+                    consolidated_table,
+                    str(consolidated_path),
+                    compression=compression,
+                    version=2
+                )
+                
+                logger.info(f"Created consolidated file: {consolidated_path}")
+                
+                # Clean up
+                del tables, consolidated_table
+                gc.collect()
+                
+        except Exception as consolidate_error:
+            logger.warning(f"Could not create consolidated file: {consolidate_error}")
+            # Continue anyway, partitioned files are still available
+        
+        # Verify the saved data
+        saved_files = list(output_dir.glob("*.feather"))
+        total_size_mb = sum(f.stat().st_size for f in saved_files) / (1024 * 1024)
+        
+        logger.info(f"Successfully saved processed data for {currency_pair}")
+        logger.info(f"Files created: {len(saved_files)}")
+        logger.info(f"Partition files: {len(partition_files)}")
+        logger.info(f"Total size: {total_size_mb:.2f} MB")
+        
+        return True
+        
+    except Exception as save_error:
+        logger.error(f"Failed to save processed data for {currency_pair}: {save_error}", exc_info=True)
+        db_handler.update_task_status(task_id, 'FAILED', f"Data saving error: {str(save_error)}")
+        return False
+
+
 def process_currency_pair(
     task: Dict[str, Any],
     client: Client,
-    db_handler: DatabaseHandler,
-    local_loader: LocalDataLoader
+    db_handler=None,
+    local_loader=None
 ) -> bool:
     """
     Process a single currency pair through the pipeline.
+    Caminho A: cuDF por worker (um par por worker)
     """
+    # ❌ NÃO passe db_handler/local_loader do driver.
+    # ✅ Crie no worker:
+    from data_io.db_handler import DatabaseHandler
+    from data_io.local_loader import LocalDataLoader
+
     task_id = task['task_id']
     currency_pair = task['currency_pair']
-    # O 'r2_path' agora é o caminho relativo que será usado para encontrar os dados locais
     relative_data_path = task['r2_path']
 
+    db = DatabaseHandler()
+    if not db.connect():
+        logger.error("DB connect failed in worker")
+        return False
+
     try:
-        logger.info(f"Starting processing for {currency_pair} (Task ID: {task_id})")
-        if not db_handler.update_task_status(task_id, 'RUNNING'):
-            logger.error(f"Failed to update status to RUNNING for {currency_pair}")
+        logger.info("Starting processing for %s (Task ID: %s)", currency_pair, task_id)
+        db.update_task_status(task_id, 'RUNNING')
+
+        loader = LocalDataLoader()
+
+        # ⚠️ carregue como **cuDF** no worker (um par por worker)
+        gdf = loader.load_currency_pair_data_feather_sync(relative_data_path)
+        if gdf is None:
+            gdf = loader.load_currency_pair_data_sync(relative_data_path)
+        if gdf is None:
+            db.update_task_status(task_id, 'FAILED', f"Failed to load data from {relative_data_path}")
             return False
 
-        logger.info(f"Loading data for {currency_pair} from local path derived from: {relative_data_path}")
-        df = local_loader.load_currency_pair_data(relative_data_path, client)
+        logger.info("Data loaded: %d rows, %d cols", len(gdf), len(gdf.columns))
 
-        if df is None:
-            logger.error(f"Failed to load data for {currency_pair}")
-            db_handler.update_task_status(task_id, 'FAILED', f"Failed to load data from local path: {relative_data_path}")
+        # ---- feature engines em cuDF (versões compatíveis) ----
+        from features import StationarizationEngine, StatisticalTests, SignalProcessor, GARCHModels
+        settings = get_settings()
+
+        station = StationarizationEngine(settings, client)
+        stats   = StatisticalTests(settings, client)
+        sig     = SignalProcessor(settings, client)
+        garch   = GARCHModels(settings, client)
+
+        # todas trabalhando sobre **cuDF**:
+        gdf = station.process_currency_pair(gdf)
+        gdf = stats.process_cudf(gdf)          # exponha um .process_cudf no módulo
+        gdf = sig.process_cudf(gdf)            # idem
+        gdf = garch.process_cudf(gdf)          # idem
+
+        logger.info("Final cuDF shape: %s", (len(gdf), len(gdf.columns)))
+
+        # salvar (versão cuDF)
+        if not save_processed_data_cudf(gdf, currency_pair, settings, task_id, db):
             return False
 
-        logger.info(f"Verifying data loading for {currency_pair}...")
-        data_length = len(df)
-        logger.info(f"Total rows for {currency_pair}: {data_length}")
-
-        # Placeholder para a lógica da Tarefa 7 em diante
-        # features_df = calculate_native_features(df)
-        # ... etc
-
-        if not db_handler.update_task_status(task_id, 'COMPLETED'):
-            logger.error(f"Failed to update status to COMPLETED for {currency_pair}")
-            return False
-
-        logger.info(f"Successfully completed processing for {currency_pair}")
+        db.update_task_status(task_id, 'COMPLETED')
+        logger.info("Successfully completed %s", currency_pair)
         return True
 
     except Exception as e:
-        logger.error(f"Error processing {currency_pair}: {e}", exc_info=True)
-        db_handler.update_task_status(task_id, 'FAILED', f"Processing error: {str(e)}")
+        logger.error("Error processing %s: %s", currency_pair, e, exc_info=True)
+        db.update_task_status(task_id, 'FAILED', f"Processing error: {e}")
         return False
+    finally:
+        try: db.close()
+        except: pass
 
 
 def run_pipeline():
@@ -211,32 +422,85 @@ def run_pipeline():
         db_handler = DatabaseHandler()
         local_loader = LocalDataLoader()
 
-        pending_tasks = get_pending_currency_pairs()
-        if not pending_tasks:
-            logger.info("No pending tasks found. Pipeline complete.")
+        # Connect to database
+        if not db_handler.connect():
+            logger.error("Failed to connect to database. Exiting.")
+            return 1
+
+        # Discover all available currency pairs in /data
+        logger.info("Discovering currency pairs in local data directory...")
+        available_pairs = local_loader.discover_currency_pairs()
+        
+        if not available_pairs:
+            logger.info("No currency pairs found in data directory. Pipeline complete.")
             return 0
+
+        logger.info(f"Found {len(available_pairs)} currency pairs in data directory")
+
+        # Filter pairs that need processing
+        pending_tasks = []
+        for pair_info in available_pairs:
+            currency_pair = pair_info['currency_pair']
+            
+            # Check if already processed in database
+            if db_handler.is_currency_pair_processed(currency_pair):
+                logger.info(f"Skipping {currency_pair} - already processed")
+                continue
+            
+            # Register the pair for processing
+            task_id = db_handler.register_currency_pair(currency_pair, pair_info['data_path'])
+            if task_id:
+                task = {
+                    'task_id': task_id,
+                    'currency_pair': currency_pair,
+                    'r2_path': pair_info['data_path'],
+                    'file_type': pair_info['file_type'],
+                    'file_size_mb': pair_info['file_size_mb'],
+                    'filename': pair_info['filename']
+                }
+                pending_tasks.append(task)
+                logger.info(f"Added {currency_pair} to processing queue (Task ID: {task_id})")
+            else:
+                logger.error(f"Failed to register {currency_pair} for processing")
+
+        if not pending_tasks:
+            logger.info("All currency pairs already processed. Pipeline complete.")
+            return 0
+
+        logger.info(f"Processing {len(pending_tasks)} currency pairs that need feature engineering")
 
         with managed_dask_cluster() as cluster_manager:
             if not cluster_manager.is_active():
                  raise RuntimeError("Failed to start or activate Dask cluster.")
             client = cluster_manager.get_client()
 
-            successful_tasks, failed_tasks = 0, 0
+            logger.info(f"Processing {len(pending_tasks)} tasks in parallel using {len(client.scheduler_info()['workers'])} workers")
+
+            # Submit all tasks to the cluster for parallel processing
+            futures = []
             for task in pending_tasks:
-                success = process_currency_pair(
+                future = client.submit(
+                    process_currency_pair,
                     task=task,
                     client=client,
-                    db_handler=db_handler,
-                    local_loader=local_loader
+                    db_handler=None,      # será criado no worker
+                    local_loader=None     # idem
                 )
-                if success:
-                    successful_tasks += 1
-                else:
-                    failed_tasks += 1
+                futures.append(future)
+
+            # Wait for all tasks to complete and gather results
+            logger.info("Waiting for all tasks to complete...")
+            results = client.gather(futures)
+            
+            # Count successful and failed tasks
+            successful_tasks = sum(1 for result in results if result)
+            failed_tasks = len(results) - successful_tasks
 
             logger.info("=" * 60)
             logger.info("PIPELINE EXECUTION SUMMARY")
-            logger.info(f"Total tasks processed: {len(pending_tasks)}")
+            logger.info(f"Total currency pairs found: {len(available_pairs)}")
+            logger.info(f"Already processed: {len(available_pairs) - len(pending_tasks)}")
+            logger.info(f"Tasks submitted: {len(pending_tasks)}")
             logger.info(f"Successful tasks: {successful_tasks}")
             logger.info(f"Failed tasks: {failed_tasks}")
             logger.info("=" * 60)
@@ -249,4 +513,6 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
     sys.exit(run_pipeline())

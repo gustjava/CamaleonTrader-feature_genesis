@@ -96,8 +96,8 @@ monitoring:
   
 # Output Configuration
 output:
-  format: parquet
-  compression: snappy
+  format: feather
+  compression: lz4
   partition_size: "1GB"
   output_path: ${OUTPUT_PATH:data/processed_features/}
   

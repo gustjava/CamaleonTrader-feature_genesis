@@ -315,6 +315,154 @@ class DatabaseHandler:
         """Context manager exit."""
         self.close()
 
+    def is_currency_pair_processed(self, currency_pair: str) -> bool:
+        """
+        Check if a currency pair has been successfully processed.
+        
+        Args:
+            currency_pair: The currency pair to check (e.g., 'EURUSD')
+            
+        Returns:
+            bool: True if processed, False otherwise
+        """
+        if not self.engine:
+            logger.error("Database not connected. Call connect() first.")
+            return False
+        
+        try:
+            with self.engine.connect() as conn:
+                query = text("""
+                    SELECT fs.status 
+                    FROM processing_tasks pt
+                    JOIN feature_status fs ON pt.task_id = fs.task_id
+                    WHERE pt.currency_pair = :currency_pair
+                    ORDER BY fs.status_id DESC
+                    LIMIT 1
+                """)
+                
+                result = conn.execute(query, {'currency_pair': currency_pair})
+                row = result.fetchone()
+                
+                if row and row[0] == 'COMPLETED':
+                    logger.info(f"Currency pair {currency_pair} already processed")
+                    return True
+                else:
+                    logger.info(f"Currency pair {currency_pair} not yet processed")
+                    return False
+                    
+        except SQLAlchemyError as e:
+            logger.error(f"Error checking processing status for {currency_pair}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking processing status for {currency_pair}: {e}")
+            return False
+
+    def register_currency_pair(self, currency_pair: str, data_path: str) -> Optional[int]:
+        """
+        Register a new currency pair for processing.
+        
+        Args:
+            currency_pair: The currency pair identifier
+            data_path: Path to the data files
+            
+        Returns:
+            Optional[int]: Task ID if successful, None otherwise
+        """
+        if not self.engine:
+            logger.error("Database not connected. Call connect() first.")
+            return None
+        
+        try:
+            with self.engine.begin() as conn:
+                # Insert new task
+                insert_query = text("""
+                    INSERT INTO processing_tasks (currency_pair, r2_path, added_timestamp)
+                    VALUES (:currency_pair, :data_path, :timestamp)
+                    ON DUPLICATE KEY UPDATE 
+                        r2_path = :data_path,
+                        added_timestamp = :timestamp
+                """)
+                
+                result = conn.execute(insert_query, {
+                    'currency_pair': currency_pair,
+                    'data_path': data_path,
+                    'timestamp': datetime.utcnow()
+                })
+                
+                # Get the task ID
+                task_id_query = text("""
+                    SELECT task_id FROM processing_tasks 
+                    WHERE currency_pair = :currency_pair
+                """)
+                
+                task_result = conn.execute(task_id_query, {'currency_pair': currency_pair})
+                task_row = task_result.fetchone()
+                
+                if task_row:
+                    task_id = task_row[0]
+                    logger.info(f"Registered currency pair {currency_pair} with task ID {task_id}")
+                    return task_id
+                else:
+                    logger.error(f"Failed to get task ID for {currency_pair}")
+                    return None
+                    
+        except SQLAlchemyError as e:
+            logger.error(f"Error registering currency pair {currency_pair}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error registering currency pair {currency_pair}: {e}")
+            return None
+
+    def get_processed_features(self, currency_pair: str) -> Optional[Dict[str, Any]]:
+        """
+        Get information about features that were generated for a currency pair.
+        
+        Args:
+            currency_pair: The currency pair to check
+            
+        Returns:
+            Optional[Dict]: Feature information if processed, None otherwise
+        """
+        if not self.engine:
+            logger.error("Database not connected. Call connect() first.")
+            return None
+        
+        try:
+            with self.engine.connect() as conn:
+                query = text("""
+                    SELECT pt.task_id, pt.currency_pair, pt.r2_path,
+                           fs.status, fs.start_time, fs.end_time, fs.hostname
+                    FROM processing_tasks pt
+                    JOIN feature_status fs ON pt.task_id = fs.task_id
+                    WHERE pt.currency_pair = :currency_pair
+                    AND fs.status = 'COMPLETED'
+                    ORDER BY fs.status_id DESC
+                    LIMIT 1
+                """)
+                
+                result = conn.execute(query, {'currency_pair': currency_pair})
+                row = result.fetchone()
+                
+                if row:
+                    return {
+                        'task_id': row[0],
+                        'currency_pair': row[1],
+                        'data_path': row[2],
+                        'status': row[3],
+                        'start_time': row[4],
+                        'end_time': row[5],
+                        'hostname': row[6]
+                    }
+                else:
+                    return None
+                    
+        except SQLAlchemyError as e:
+            logger.error(f"Error getting processed features for {currency_pair}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error getting processed features for {currency_pair}: {e}")
+            return None
+
 
 # Convenience functions for direct use
 def get_pending_currency_pairs() -> List[Dict[str, Any]]:
