@@ -239,9 +239,43 @@ access_key_id = \$R2_ACCESS_KEY
 secret_access_key = \$R2_SECRET_KEY
 endpoint = \$R2_ENDPOINT_URL\" > ~/.config/rclone/rclone.conf
 
+# Sync data from R2
 rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress
 
+# Check what files were synced
+echo '--- [REMOTO] Verificando arquivos sincronizados...'
+ls -la \"$REMOTE_DATA_DIR\" || echo \"Diretório $REMOTE_DATA_DIR não existe\"
+
+# Check for master_features files specifically
+echo '--- [REMOTO] Verificando arquivos master_features...'
+MASTER_FEATURES_FILES=$(find \"$REMOTE_DATA_DIR\" -name \"*_master_features.parquet\" -type f 2>/dev/null | head -10)
+if [[ -n \"$MASTER_FEATURES_FILES\" ]]; then
+    echo \"Arquivos master_features encontrados:\"
+    echo \"$MASTER_FEATURES_FILES\"
+else
+    echo \"Nenhum arquivo master_features encontrado\"
+fi
+
+# If no master_features files found, try to find any parquet files
+echo '--- [REMOTO] Verificando outros arquivos parquet...'
+PARQUET_FILES=$(find \"$REMOTE_DATA_DIR\" -name \"*.parquet\" -type f 2>/dev/null | head -10)
+if [[ -n \"$PARQUET_FILES\" ]]; then
+    echo \"Arquivos parquet encontrados:\"
+    echo \"$PARQUET_FILES\"
+else
+    echo \"Nenhum arquivo parquet encontrado\"
+fi
+
+# Check if we have any data files to work with
+if [[ -z \"$MASTER_FEATURES_FILES\" && -z \"$PARQUET_FILES\" ]]; then
+    echo \"⚠️  AVISO: Nenhum arquivo de dados encontrado. O pipeline pode falhar.\"
+    echo \"   Verifique se o R2 bucket contém os arquivos necessários.\"
+    echo \"   Arquivos esperados: *_master_features.parquet\"
+fi
+
 echo '--- [REMOTO] Iniciando pipeline...'
+# Suppress CUDA deprecation warnings
+export PYTHONWARNINGS="ignore::FutureWarning:distributed.diagnostics.rmm,ignore::FutureWarning:rmm"
 python orchestration/main.py
 "
 

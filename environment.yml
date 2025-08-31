@@ -6,7 +6,7 @@ channels:
   - defaults
 dependencies:
   # Core RAPIDS stack (latest stable)
-  - rapids=24.06
+  - rapids=24.12
   - python=3.10
   - cuda-version=12.5
   

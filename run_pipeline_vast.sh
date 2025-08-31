@@ -161,14 +161,8 @@ echo "✅ Sincronização de arquivos de programa completa."
 # --- EXECUÇÃO DO PIPELINE ---
 echo -e "\n🚀  Executando pipeline remotamente..."
 
-# Variáveis de ambiente para R2 e MySQL
+# Variáveis de ambiente para MySQL
 REMOTE_ENV_EXPORTS=$(cat <<EOF
-export R2_ACCOUNT_ID=ac68ac775ba99b267edee7f9b4b3bc4e
-export R2_ACCESS_KEY=0e315105695707ca4fe1e5f83a38f807
-export R2_SECRET_KEY=5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515
-export R2_BUCKET_NAME=camaleon
-export R2_ENDPOINT_URL=https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com
-export R2_REGION=auto
 export MYSQL_HOST=127.0.0.1
 export MYSQL_PORT=${REMOTE_MYSQL_PORT}
 export MYSQL_DATABASE=dynamic_stage0_db
@@ -187,19 +181,7 @@ cd $REMOTE_PROJECT_DIR
 source /opt/conda/etc/profile.d/conda.sh
 conda activate dynamic-stage0
 
-echo '--- [REMOTO] Sincronizando dados do R2...'
 $REMOTE_ENV_EXPORTS
-
-# Cria o arquivo de config do rclone
-mkdir -p ~/.config/rclone
-echo \"[R2]
-type = s3
-provider = Cloudflare
-access_key_id = \$R2_ACCESS_KEY
-secret_access_key = \$R2_SECRET_KEY
-endpoint = \$R2_ENDPOINT_URL\" > ~/.config/rclone/rclone.conf
-
-rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress
 
 echo '--- [REMOTO] Iniciando pipeline...'
 python orchestration/main.py

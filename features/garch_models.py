@@ -28,7 +28,11 @@ class GARCHModels(BaseFeatureEngine):
     def __init__(self, settings: Settings, client: Client):
         """Initialize the GARCH models engine with configuration."""
         super().__init__(settings, client)
-        self.config = self.settings.features.garch
+        # Access individual GARCH settings instead of nested object
+        self.p = self.settings.features.garch_p
+        self.q = self.settings.features.garch_q
+        self.max_iter = self.settings.features.garch_max_iter
+        self.tolerance = self.settings.features.garch_tolerance
         self.max_samples = self.settings.features.distance_corr_max_samples # Reusing this for consistency
 
     def _log_likelihood_gpu(self, params: np.ndarray, returns: cp.ndarray) -> float:
@@ -89,7 +93,7 @@ class GARCHModels(BaseFeatureEngine):
                 method='SLSQP',
                 bounds=bounds,
                 constraints=constraints,
-                options={'maxiter': self.config.max_iter, 'ftol': self.config.tolerance}
+                options={'maxiter': self.max_iter, 'ftol': self.tolerance}
             )
 
             if not result.success:
