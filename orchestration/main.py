@@ -92,10 +92,8 @@ class DaskClusterManager:
             common_kwargs = dict(
                 n_workers=gpu_count,
                 threads_per_worker=1,          # GPU: 1 thread por worker
-                rmm_async=True,                # cudaMallocAsync
+                memory_limit="auto",           # deixar Dask decidir
                 rmm_pool_size=pool_str,        # evita hardcode "24GB"
-                jit_unspill=True,              # spill gradual p/ host
-                device_memory_limit="0.85",    # 85% como float
                 dashboard_address=":8787",
                 silence_logs=logging.WARNING,
             )

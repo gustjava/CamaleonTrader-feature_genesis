@@ -159,6 +159,9 @@ cd $REMOTE_PROJECT_DIR
 source /opt/conda/etc/profile.d/conda.sh
 conda activate base
 
+echo '--- [REMOTO] Atualizando ambiente Conda...'
+conda env update -f environment.yml --prune
+
 pip install SQLAlchemy PyMySQL -q
 
 echo '--- [REMOTO] Sincronizando dados do R2...'

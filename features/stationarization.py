@@ -5,12 +5,13 @@ This module implements GPU-accelerated stationarization techniques including:
 - Fractional differentiation for memory-preserving stationarization
 - Rolling window stationarization
 - Variance stabilization
+- Rolling correlations for dynamic relationship analysis
 """
 
 import logging
 import numpy as np
 import cupy as cp
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
 import dask_cudf
 import cudf
@@ -253,51 +254,332 @@ class StationarizationEngine(BaseFeatureEngine):
             self._log_error(f"Error in variance stabilization for {column_name}: {e}")
             return None
     
-    def process_currency_pair(
-        self, 
-        df: 'cudf.DataFrame'
-    ) -> Optional['cudf.DataFrame']:
+    def process(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
         """
-        Apply stationarization techniques to a currency pair DataFrame.
+        Main processing method for dask_cudf DataFrame.
+        
+        Applies stationarization techniques including:
+        - Fractional differentiation
+        - Rolling stationarization
+        - Variance stabilization
+        - Rolling correlations
+        
+        Args:
+            df: Input dask_cudf DataFrame
+            
+        Returns:
+            DataFrame with additional stationarized features
+        """
+        try:
+            self._log_info("Starting stationarization pipeline...")
+            
+            # Apply fractional differentiation
+            df = self._apply_fractional_differentiation(df)
+            
+            # Apply rolling correlations
+            df = self._compute_rolling_correlations(df)
+            
+            # Apply rolling stationarization
+            df = self._apply_rolling_stationarization(df)
+            
+            # Apply variance stabilization
+            df = self._apply_variance_stabilization(df)
+            
+            self._log_info("Stationarization pipeline completed successfully")
+            return df
+            
+        except Exception as e:
+            self._log_error(f"Error in stationarization pipeline: {e}")
+            return df
+    
+    def _compute_rolling_correlations(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
+        """
+        Calcula correlações rolantes para pares de features pré-definidos.
+        
+        Args:
+            df: Input dask_cudf DataFrame
+            
+        Returns:
+            DataFrame with rolling correlation features added
+        """
+        self._log_progress("Applying rolling correlations...")
+
+        # Pares de features para analisar
+        feature_pairs = [
+            ('returns', 'tick_volume'),
+            ('returns', 'ofi'),
+            ('spread_rel', 'realized_vol'),
+            ('close', 'volume'),
+            ('returns', 'spread_rel'),
+            ('tick_volume', 'spread_rel')
+        ]
+
+        # Janelas definidas no config.yaml
+        windows = self.settings.features.rolling_windows
+        min_periods = self.settings.features.rolling_min_periods
+
+        for col1, col2 in feature_pairs:
+            if col1 in df.columns and col2 in df.columns:
+                for window in windows:
+                    self._log_progress(f"  -> Corr({col1}, {col2}) | Window={window}")
+
+                    # Create a function for this specific correlation computation
+                    def compute_corr_for_pair(pdf, col1=col1, col2=col2, window=window, min_periods=min_periods):
+                        return self._compute_rolling_corr_partition(pdf, col1, col2, window, min_periods)
+                    
+                    # Calculate rolling correlation using dask_cudf
+                    df = df.map_partitions(compute_corr_for_pair, meta=df._meta)
+
+        return df
+    
+    def _compute_rolling_corr_partition(self, pdf: cudf.DataFrame, col1: str, col2: str, 
+                                       window: int, min_periods: int) -> cudf.DataFrame:
+        """
+        Compute rolling correlation for a single partition.
+        
+        Args:
+            pdf: cuDF DataFrame partition
+            col1: First column name
+            col2: Second column name
+            window: Rolling window size
+            min_periods: Minimum periods required
+            
+        Returns:
+            DataFrame with rolling correlation column added
+        """
+        try:
+            # Calculate rolling correlation
+            rolling_corr = pdf[[col1, col2]].rolling(
+                window=window,
+                min_periods=min_periods
+            ).corr()
+            
+            # Extract the correlation between col1 and col2
+            # The result is a Series with MultiIndex, we need to unstack and get the cross-correlation
+            if not rolling_corr.empty:
+                # Unstack to get correlation matrix
+                corr_matrix = rolling_corr.unstack()
+                
+                # Get the correlation between col1 and col2
+                # This will be in the position (col1, col2) of the correlation matrix
+                if col2 in corr_matrix.columns:
+                    corr_series = corr_matrix[col2]
+                    if col1 in corr_series.index:
+                        corr_values = corr_series[col1]
+                    else:
+                        # If col1 is not in index, try the other way around
+                        corr_values = corr_matrix.loc[col1, col2] if col1 in corr_matrix.index else cudf.Series([np.nan] * len(pdf), dtype=np.float64)
+                else:
+                    corr_values = cudf.Series([np.nan] * len(pdf), dtype=np.float64)
+            else:
+                corr_values = cudf.Series([np.nan] * len(pdf), dtype=np.float64)
+            
+            # Ensure the series has numeric dtype
+            corr_values = corr_values.astype(np.float64)
+            
+            # Rename the new column and add to DataFrame
+            new_col_name = f"rolling_corr_{col1}_{col2}_{window}w"
+            pdf[new_col_name] = corr_values
+            
+        except Exception as e:
+            self._log_error(f"Error computing rolling correlation for {col1}-{col2}: {e}")
+            # Add NaN column if computation fails
+            new_col_name = f"rolling_corr_{col1}_{col2}_{window}w"
+            pdf[new_col_name] = cudf.Series([np.nan] * len(pdf), dtype=np.float64)
+        
+        return pdf
+    
+    def _apply_fractional_differentiation(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
+        """
+        Apply fractional differentiation to relevant columns.
+        
+        Args:
+            df: Input dask_cudf DataFrame
+            
+        Returns:
+            DataFrame with fractional differentiation features
+        """
+        self._log_progress("Applying fractional differentiation...")
+        
+        # Apply to close prices if available
+        if 'close' in df.columns:
+            def apply_frac_diff_close(pdf):
+                return self._apply_frac_diff_to_partition(pdf, 'close')
+            df = df.map_partitions(apply_frac_diff_close, meta=df._meta)
+        
+        # Apply to returns if available
+        if 'returns' in df.columns:
+            def apply_frac_diff_returns(pdf):
+                return self._apply_frac_diff_to_partition(pdf, 'returns')
+            df = df.map_partitions(apply_frac_diff_returns, meta=df._meta)
+        
+        return df
+    
+    def _apply_frac_diff_to_partition(self, pdf: cudf.DataFrame, column: str) -> cudf.DataFrame:
+        """
+        Apply fractional differentiation to a single partition.
+        
+        Args:
+            pdf: cuDF DataFrame partition
+            column: Column name to apply fractional differentiation to
+            
+        Returns:
+            DataFrame with fractional differentiation features added
+        """
+        try:
+            data = pdf[column].to_cupy()
+            frac_diff_result = self.find_optimal_d(data, column)
+            
+            if frac_diff_result:
+                # Add fractionally differentiated series
+                pdf[f'frac_diff_{column}'] = frac_diff_result['differentiated_series']
+                pdf[f'frac_diff_{column}_d'] = frac_diff_result['optimal_d']
+                pdf[f'frac_diff_{column}_stationary'] = frac_diff_result['is_stationary']
+                pdf[f'frac_diff_{column}_variance_ratio'] = frac_diff_result['variance_ratio']
+                
+                # Add statistics
+                pdf[f'frac_diff_{column}_mean'] = frac_diff_result['differentiated_stats']['mean']
+                pdf[f'frac_diff_{column}_std'] = frac_diff_result['differentiated_stats']['std']
+                pdf[f'frac_diff_{column}_skewness'] = frac_diff_result['differentiated_stats']['skewness']
+                pdf[f'frac_diff_{column}_kurtosis'] = frac_diff_result['differentiated_stats']['kurtosis']
+        
+        except Exception as e:
+            self._log_error(f"Error applying fractional differentiation to {column}: {e}")
+        
+        return pdf
+    
+    def _apply_rolling_stationarization(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
+        """
+        Apply rolling stationarization to relevant columns.
+        
+        Args:
+            df: Input dask_cudf DataFrame
+            
+        Returns:
+            DataFrame with rolling stationarization features
+        """
+        self._log_progress("Applying rolling stationarization...")
+        
+        # Apply to close prices if available
+        if 'close' in df.columns:
+            def apply_rolling_stationary_close(pdf):
+                return self._apply_rolling_stationary_to_partition(pdf, 'close')
+            df = df.map_partitions(apply_rolling_stationary_close, meta=df._meta)
+        
+        return df
+    
+    def _apply_rolling_stationary_to_partition(self, pdf: cudf.DataFrame, column: str) -> cudf.DataFrame:
+        """
+        Apply rolling stationarization to a single partition.
+        
+        Args:
+            pdf: cuDF DataFrame partition
+            column: Column name to apply rolling stationarization to
+            
+        Returns:
+            DataFrame with rolling stationarization features added
+        """
+        try:
+            data = pdf[column].to_cupy()
+            rolling_stationary = self.rolling_stationarization(data, window=252, column_name=column)
+            if rolling_stationary is not None:
+                pdf[f'rolling_stationary_{column}'] = rolling_stationary
+        
+        except Exception as e:
+            self._log_error(f"Error applying rolling stationarization to {column}: {e}")
+        
+        return pdf
+    
+    def _apply_variance_stabilization(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
+        """
+        Apply variance stabilization to relevant columns.
+        
+        Args:
+            df: Input dask_cudf DataFrame
+            
+        Returns:
+            DataFrame with variance stabilization features
+        """
+        self._log_progress("Applying variance stabilization...")
+        
+        # Apply to close prices if available
+        if 'close' in df.columns:
+            def apply_variance_stabilization_close(pdf):
+                return self._apply_variance_stabilization_to_partition(pdf, 'close')
+            df = df.map_partitions(apply_variance_stabilization_close, meta=df._meta)
+        
+        return df
+    
+    def _apply_variance_stabilization_to_partition(self, pdf: cudf.DataFrame, column: str) -> cudf.DataFrame:
+        """
+        Apply variance stabilization to a single partition.
+        
+        Args:
+            pdf: cuDF DataFrame partition
+            column: Column name to apply variance stabilization to
+            
+        Returns:
+            DataFrame with variance stabilization features added
+        """
+        try:
+            data = pdf[column].to_cupy()
+            log_stabilized = self.variance_stabilization(data, method="log", column_name=column)
+            if log_stabilized is not None:
+                pdf[f'log_stabilized_{column}'] = log_stabilized
+        
+        except Exception as e:
+            self._log_error(f"Error applying variance stabilization to {column}: {e}")
+        
+        return pdf
+    
+    def process_cudf(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        """
+        Apply stationarization techniques to a cuDF DataFrame.
         
         Args:
             df: Input DataFrame with OHLCV data
             
         Returns:
-            DataFrame with additional stationarized features, or None if failed
+            DataFrame with additional stationarized features
         """
         try:
-            self._log_info("Starting stationarization for currency pair")
+            self._log_info("Starting stationarization for cuDF DataFrame")
             
             # Create a copy to avoid modifying the original
             result_df = df.copy()
             
             # Apply fractional differentiation to close prices
-            close_prices = df['close'].values
-            frac_diff_result = self.find_optimal_d(close_prices, "close")
-            
-            if frac_diff_result:
-                # Add fractionally differentiated series
-                result_df['frac_diff_close'] = frac_diff_result['differentiated_series']
-                result_df['frac_diff_d'] = frac_diff_result['optimal_d']
-                result_df['frac_diff_stationary'] = frac_diff_result['is_stationary']
-                result_df['frac_diff_variance_ratio'] = frac_diff_result['variance_ratio']
+            if 'close' in df.columns:
+                close_prices = df['close'].values
+                frac_diff_result = self.find_optimal_d(close_prices, "close")
                 
-                # Add statistics
-                result_df['frac_diff_mean'] = frac_diff_result['differentiated_stats']['mean']
-                result_df['frac_diff_std'] = frac_diff_result['differentiated_stats']['std']
-                result_df['frac_diff_skewness'] = frac_diff_result['differentiated_stats']['skewness']
-                result_df['frac_diff_kurtosis'] = frac_diff_result['differentiated_stats']['kurtosis']
+                if frac_diff_result:
+                    # Add fractionally differentiated series
+                    result_df['frac_diff_close'] = frac_diff_result['differentiated_series']
+                    result_df['frac_diff_d'] = frac_diff_result['optimal_d']
+                    result_df['frac_diff_stationary'] = frac_diff_result['is_stationary']
+                    result_df['frac_diff_variance_ratio'] = frac_diff_result['variance_ratio']
+                    
+                    # Add statistics
+                    result_df['frac_diff_mean'] = frac_diff_result['differentiated_stats']['mean']
+                    result_df['frac_diff_std'] = frac_diff_result['differentiated_stats']['std']
+                    result_df['frac_diff_skewness'] = frac_diff_result['differentiated_stats']['skewness']
+                    result_df['frac_diff_kurtosis'] = frac_diff_result['differentiated_stats']['kurtosis']
+            
+            # Apply rolling correlations
+            result_df = self._compute_rolling_correlations_cudf(result_df)
             
             # Apply rolling stationarization
-            rolling_stationary = self.rolling_stationarization(close_prices, window=252, column_name="close")
-            if rolling_stationary is not None:
-                result_df['rolling_stationary_close'] = rolling_stationary
+            if 'close' in df.columns:
+                rolling_stationary = self.rolling_stationarization(close_prices, window=252, column_name="close")
+                if rolling_stationary is not None:
+                    result_df['rolling_stationary_close'] = rolling_stationary
             
             # Apply variance stabilization
-            log_stabilized = self.variance_stabilization(close_prices, method="log", column_name="close")
-            if log_stabilized is not None:
-                result_df['log_stabilized_close'] = log_stabilized
+            if 'close' in df.columns:
+                log_stabilized = self.variance_stabilization(close_prices, method="log", column_name="close")
+                if log_stabilized is not None:
+                    result_df['log_stabilized_close'] = log_stabilized
             
             # Apply to returns if volume exists
             if 'volume' in df.columns:
@@ -318,17 +600,126 @@ class StationarizationEngine(BaseFeatureEngine):
             
         except Exception as e:
             self._log_error(f"Error in stationarization: {e}")
+            return df
+    
+    def _compute_rolling_correlations_cudf(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        """
+        Calcula correlações rolantes para pares de features pré-definidos (cuDF version).
+        
+        Args:
+            df: Input cuDF DataFrame
+            
+        Returns:
+            DataFrame with rolling correlation features added
+        """
+        self._log_progress("Applying rolling correlations (cuDF)...")
+
+        # Pares de features para analisar
+        feature_pairs = [
+            ('returns', 'tick_volume'),
+            ('returns', 'ofi'),
+            ('spread_rel', 'realized_vol'),
+            ('close', 'volume'),
+            ('returns', 'spread_rel'),
+            ('tick_volume', 'spread_rel')
+        ]
+
+        # Janelas definidas no config.yaml
+        windows = self.settings.features.rolling_windows
+        min_periods = self.settings.features.rolling_min_periods
+
+        for col1, col2 in feature_pairs:
+            if col1 in df.columns and col2 in df.columns:
+                for window in windows:
+                    self._log_progress(f"  -> Corr({col1}, {col2}) | Window={window}")
+
+                    try:
+                        # Calculate rolling correlation
+                        rolling_corr = df[[col1, col2]].rolling(
+                            window=window,
+                            min_periods=min_periods
+                        ).corr()
+                        
+                        # Extract the correlation between col1 and col2
+                        if not rolling_corr.empty:
+                            # Unstack to get correlation matrix
+                            corr_matrix = rolling_corr.unstack()
+                            
+                            # Get the correlation between col1 and col2
+                            if col2 in corr_matrix.columns:
+                                corr_series = corr_matrix[col2]
+                                if col1 in corr_series.index:
+                                    corr_values = corr_series[col1]
+                                else:
+                                    # If col1 is not in index, try the other way around
+                                    corr_values = corr_matrix.loc[col1, col2] if col1 in corr_matrix.index else cudf.Series([np.nan] * len(df), dtype=np.float64)
+                            else:
+                                corr_values = cudf.Series([np.nan] * len(df), dtype=np.float64)
+                        else:
+                            corr_values = cudf.Series([np.nan] * len(df), dtype=np.float64)
+                        
+                        # Ensure the series has numeric dtype
+                        corr_values = corr_values.astype(np.float64)
+                        
+                        # Rename the new column and add to DataFrame
+                        new_col_name = f"rolling_corr_{col1}_{col2}_{window}w"
+                        df[new_col_name] = corr_values
+                        
+                    except Exception as e:
+                        self._log_error(f"Error computing rolling correlation for {col1}-{col2}: {e}")
+                        # Add NaN column if computation fails
+                        new_col_name = f"rolling_corr_{col1}_{col2}_{window}w"
+                        df[new_col_name] = cudf.Series([np.nan] * len(df), dtype=np.float64)
+
+        return df
+    
+    def process_currency_pair(
+        self, 
+        df: 'cudf.DataFrame'
+    ) -> Optional['cudf.DataFrame']:
+        """
+        Apply stationarization techniques to a currency pair DataFrame.
+        
+        Args:
+            df: Input DataFrame with OHLCV data
+            
+        Returns:
+            DataFrame with additional stationarized features, or None if failed
+        """
+        try:
+            self._log_info("Starting stationarization for currency pair")
+            
+            # Use the new process_cudf method for consistency
+            result_df = self.process_cudf(df)
+            
+            self._log_info("Stationarization completed successfully")
+            return result_df
+            
+        except Exception as e:
+            self._log_error(f"Error in stationarization: {e}")
             return None
     
     def get_stationarization_info(self) -> Dict[str, Any]:
         """Get information about the stationarization techniques."""
         return {
-            'available_methods': ['FractionalDifferentiation', 'RollingStationarization', 'VarianceStabilization'],
+            'available_methods': ['FractionalDifferentiation', 'RollingStationarization', 'VarianceStabilization', 'RollingCorrelations'],
             'frac_diff_config': {
                 'd_values': self.config.d_values,
                 'threshold': self.config.threshold,
                 'max_lag': self.config.max_lag,
                 'min_periods': self.config.min_periods
             },
-            'description': 'GPU-accelerated stationarization techniques for financial time series'
+            'rolling_corr_config': {
+                'windows': self.settings.features.rolling_windows,
+                'min_periods': self.settings.features.rolling_min_periods,
+                'feature_pairs': [
+                    ('returns', 'tick_volume'),
+                    ('returns', 'ofi'),
+                    ('spread_rel', 'realized_vol'),
+                    ('close', 'volume'),
+                    ('returns', 'spread_rel'),
+                    ('tick_volume', 'spread_rel')
+                ]
+            },
+            'description': 'GPU-accelerated stationarization techniques for financial time series including rolling correlations for dynamic relationship analysis'
         }
