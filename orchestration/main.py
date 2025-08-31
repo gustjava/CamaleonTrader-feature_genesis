@@ -339,7 +339,6 @@ def save_processed_data(
 
 def process_currency_pair(
     task: Dict[str, Any],
-    client: Client,
     db_handler=None,
     local_loader=None
 ) -> bool:
@@ -362,8 +361,7 @@ def process_currency_pair(
         return False
 
     try:
-        logger.info("Starting processing for %s (Task ID: %s)", currency_pair, task_id)
-        db.update_task_status(task_id, 'RUNNING')
+        logger.info("Starting processing for %s", currency_pair)
 
         loader = LocalDataLoader()
 
@@ -379,12 +377,16 @@ def process_currency_pair(
 
         # ---- feature engines em cuDF (versões compatíveis) ----
         from features import StationarizationEngine, StatisticalTests, SignalProcessor, GARCHModels
+        from dask.distributed import Client
         settings = get_settings()
 
-        station = StationarizationEngine(settings, client)
-        stats   = StatisticalTests(settings, client)
-        sig     = SignalProcessor(settings, client)
-        garch   = GARCHModels(settings, client)
+        # Create a local client for this worker
+        local_client = Client("tcp://localhost:8786")  # Connect to the scheduler
+
+        station = StationarizationEngine(settings, local_client)
+        stats   = StatisticalTests(settings, local_client)
+        sig     = SignalProcessor(settings, local_client)
+        garch   = GARCHModels(settings, local_client)
 
         # todas trabalhando sobre **cuDF**:
         gdf = station.process_currency_pair(gdf)
@@ -405,6 +407,8 @@ def process_currency_pair(
             logger.info("Successfully completed %s (Task ID: %s)", currency_pair, task_id)
         else:
             logger.warning("Failed to register task in database for %s", currency_pair)
+        
+        return True
         
         return True
 
@@ -501,7 +505,6 @@ def run_pipeline():
                 future = client.submit(
                     process_currency_pair,
                     task=task,
-                    client=client,
                     db_handler=None,      # será criado no worker
                     local_loader=None     # idem
                 )
