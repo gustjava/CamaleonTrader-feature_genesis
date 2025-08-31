@@ -164,6 +164,8 @@ def managed_dask_cluster():
     """Context manager for Dask-CUDA cluster lifecycle."""
     cluster_manager = DaskClusterManager()
     try:
+        if not cluster_manager.start_cluster():
+            raise RuntimeError("Failed to start Dask-CUDA cluster")
         yield cluster_manager
     finally:
         cluster_manager.shutdown()
@@ -350,10 +352,10 @@ def process_currency_pair(
     from data_io.db_handler import DatabaseHandler
     from data_io.local_loader import LocalDataLoader
 
-    task_id = task['task_id']
     currency_pair = task['currency_pair']
     relative_data_path = task['r2_path']
 
+    # Register task in database only after successful processing
     db = DatabaseHandler()
     if not db.connect():
         logger.error("DB connect failed in worker")
@@ -393,16 +395,21 @@ def process_currency_pair(
         logger.info("Final cuDF shape: %s", (len(gdf), len(gdf.columns)))
 
         # salvar (versão cuDF)
-        if not save_processed_data_cudf(gdf, currency_pair, settings, task_id, db):
+        if not save_processed_data_cudf(gdf, currency_pair, settings, None, db):
             return False
 
-        db.update_task_status(task_id, 'COMPLETED')
-        logger.info("Successfully completed %s", currency_pair)
+        # Register task in database only after successful processing
+        task_id = db.register_currency_pair(currency_pair, relative_data_path)
+        if task_id:
+            db.update_task_status(task_id, 'COMPLETED')
+            logger.info("Successfully completed %s (Task ID: %s)", currency_pair, task_id)
+        else:
+            logger.warning("Failed to register task in database for %s", currency_pair)
+        
         return True
 
     except Exception as e:
         logger.error("Error processing %s: %s", currency_pair, e, exc_info=True)
-        db.update_task_status(task_id, 'FAILED', f"Processing error: {e}")
         return False
     finally:
         try: db.close()
@@ -440,26 +447,23 @@ def run_pipeline():
         for pair_info in available_pairs:
             currency_pair = pair_info['currency_pair']
             
-            # Check if already processed in database
-            if db_handler.is_currency_pair_processed(currency_pair):
-                logger.info(f"Skipping {currency_pair} - already processed")
+            # Check if output file already exists (idempotent approach)
+            output_path = f"{settings.output.output_path}/{currency_pair}/{currency_pair}.feather"
+            if os.path.exists(output_path):
+                logger.info(f"Skipping {currency_pair} - output file already exists: {output_path}")
                 continue
             
-            # Register the pair for processing
-            task_id = db_handler.register_currency_pair(currency_pair, pair_info['data_path'])
-            if task_id:
-                task = {
-                    'task_id': task_id,
-                    'currency_pair': currency_pair,
-                    'r2_path': pair_info['data_path'],
-                    'file_type': pair_info['file_type'],
-                    'file_size_mb': pair_info['file_size_mb'],
-                    'filename': pair_info['filename']
-                }
-                pending_tasks.append(task)
-                logger.info(f"Added {currency_pair} to processing queue (Task ID: {task_id})")
-            else:
-                logger.error(f"Failed to register {currency_pair} for processing")
+            # Create task without registering in database yet
+            task = {
+                'task_id': None,  # Will be assigned after successful processing
+                'currency_pair': currency_pair,
+                'r2_path': pair_info['data_path'],
+                'file_type': pair_info['file_type'],
+                'file_size_mb': pair_info['file_size_mb'],
+                'filename': pair_info['filename']
+            }
+            pending_tasks.append(task)
+            logger.info(f"Added {currency_pair} to processing queue")
 
         if not pending_tasks:
             logger.info("All currency pairs already processed. Pipeline complete.")
@@ -469,8 +473,25 @@ def run_pipeline():
 
         with managed_dask_cluster() as cluster_manager:
             if not cluster_manager.is_active():
-                 raise RuntimeError("Failed to start or activate Dask cluster.")
+                logger.error("Cluster manager is not active")
+                raise RuntimeError("Failed to start or activate Dask cluster.")
+            
             client = cluster_manager.get_client()
+            if not client:
+                logger.error("Failed to get Dask client")
+                raise RuntimeError("Failed to get Dask client.")
+            
+            logger.info(f"Cluster status: {cluster_manager.is_active()}")
+            logger.info(f"Client status: {client is not None}")
+            logger.info(f"Dashboard link: {client.dashboard_link}")
+            
+            # Diagnostic logs to verify workers and GPU availability
+            logger.info("Workers: %s", list(client.scheduler_info()["workers"].keys()))
+            try:
+                dev_ids = client.run(lambda: __import__("cupy").cuda.runtime.getDevice())
+                logger.info("CUDA device per worker: %s", dev_ids)
+            except Exception as e:
+                logger.warning("Could not get CUDA device info: %s", e)
 
             logger.info(f"Processing {len(pending_tasks)} tasks in parallel using {len(client.scheduler_info()['workers'])} workers")
 

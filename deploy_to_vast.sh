@@ -127,7 +127,7 @@ echo "💡 Para parar o túnel: kill \$(cat $TUNNEL_PID_FILE)"
 
 echo -e "\n🔄  Sincronizando código local com a instância remota via rsync..."
 rsync -avz --delete -e "ssh $SSH_OPTS" \
-  --exclude='.git/' --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
+  --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
   "$LOCAL_PROJECT_DIR/" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
 echo "✅ Sincronização de código completa."
 
@@ -157,12 +157,73 @@ set -e
 echo '--- [REMOTO] Configurando ambiente...'
 cd $REMOTE_PROJECT_DIR
 source /opt/conda/etc/profile.d/conda.sh
-conda activate base
 
-echo '--- [REMOTO] Atualizando ambiente Conda...'
-conda env update -f environment.yml --prune
+# Verificar recursos do sistema
+echo '--- [REMOTO] Verificando recursos do sistema...'
+echo \"Memória disponível: \$(free -h | grep Mem | awk '{print \$7}')\"
+echo \"Espaço em disco: \$(df -h / | tail -1 | awk '{print \$4}')\"
+echo \"GPUs disponíveis: \$(nvidia-smi --list-gpus | wc -l 2>/dev/null || echo '0')\"
 
-pip install SQLAlchemy PyMySQL -q
+# Limpar cache do conda se necessário
+echo '--- [REMOTO] Limpando cache do conda...'
+conda clean --all -y || true
+
+# Verificar se mamba está disponível, se não, instalar
+if ! command -v mamba &> /dev/null; then
+    echo 'Instalando mamba...'
+    conda install mamba -n base -c conda-forge -y
+fi
+
+# Tentar criar/atualizar ambiente com diferentes abordagens
+echo '--- [REMOTO] Criando/atualizando ambiente...'
+
+# Tentar criar/atualizar ambiente com diferentes abordagens
+echo '--- [REMOTO] Criando/atualizando ambiente...'
+
+# Tentar criar/atualizar ambiente
+if conda env list | grep -q 'dynamic-stage0'; then
+    echo 'Atualizando ambiente existente...'
+    # Tentar mamba primeiro
+    if mamba env update -f environment.yml --prune; then
+        echo '✅ Mamba atualizou ambiente com sucesso.'
+    else
+        echo 'Mamba falhou, tentando conda...'
+        if conda env update -f environment.yml --prune; then
+            echo '✅ Conda atualizou ambiente com sucesso.'
+        else
+            echo '❌ Falha na atualização do ambiente.'
+        fi
+    fi
+else
+    echo 'Criando novo ambiente...'
+    # Tentar mamba primeiro
+    if mamba env create -f environment.yml; then
+        echo '✅ Mamba criou ambiente com sucesso.'
+    else
+        echo 'Mamba falhou, tentando conda...'
+        if conda env create -f environment.yml; then
+            echo '✅ Conda criou ambiente com sucesso.'
+        else
+            echo '❌ Falha na criação do ambiente. Tentando abordagem alternativa...'
+            # Tentar criar ambiente básico e depois instalar RAPIDS
+            conda create -n dynamic-stage0 python=3.10 -y
+            conda activate dynamic-stage0
+            conda install -c rapidsai -c conda-forge -c nvidia rapids=24.06 cuda-version=12.5 -y
+            conda install -c conda-forge jupyterlab ipykernel pytest black flake8 -y
+            echo '✅ Ambiente criado com abordagem alternativa.'
+        fi
+    fi
+fi
+
+
+
+
+
+# Ativar ambiente
+conda activate dynamic-stage0
+
+echo '--- [REMOTO] Instalando dependências adicionais...'
+conda install -c conda-forge sqlalchemy pymysql -y
 
 echo '--- [REMOTO] Sincronizando dados do R2...'
 $REMOTE_ENV_EXPORTS

@@ -86,6 +86,9 @@ class DatabaseHandler:
                 result = conn.execute(text("SELECT 1"))
                 result.fetchone()
             
+            # Create tables if they don't exist
+            self.create_tables()
+            
             logger.info(f"Database connection established to {self.settings.database.host}:{self.settings.database.port}")
             return True
             
@@ -98,6 +101,28 @@ class DatabaseHandler:
         except Exception as e:
             logger.error(f"Unexpected error during database connection: {e}")
             return False
+
+    def create_tables(self):
+        """Create database tables if they don't exist."""
+        try:
+            self.metadata.create_all(self.engine)
+            logger.info("Database tables created/verified successfully")
+        except Exception as e:
+            logger.error(f"Error creating tables: {e}")
+            raise
+
+    def clear_old_records(self):
+        """Clear old processing records to start fresh."""
+        try:
+            with self.engine.begin() as conn:
+                # Clear feature_status table
+                conn.execute(text("DELETE FROM feature_status"))
+                # Clear processing_tasks table
+                conn.execute(text("DELETE FROM processing_tasks"))
+                logger.info("Cleared old processing records")
+        except Exception as e:
+            logger.error(f"Error clearing old records: {e}")
+            raise
     
     def get_pending_currency_pairs(self) -> List[Dict[str, Any]]:
         """

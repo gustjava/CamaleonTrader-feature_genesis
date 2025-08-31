@@ -1,46 +1,22 @@
 name: dynamic-stage0
 channels:
   - rapidsai
-  - nvidia
   - conda-forge
+  - nvidia
   - defaults
 dependencies:
-  # Core RAPIDS stack
-  - rapids=23.12
-  - cudf=23.12
-  - dask-cudf=23.12
-  - dask-cuda=23.12
-  - cupy-cuda12x>=12.2.0
-  
-  # Scientific computing
-  - numpy=1.24.3
-  - pandas=2.0.3
-  - scipy=1.11.1
-  - scikit-learn=1.3.0
-  
-  # Signal processing
-  - cusignal=23.12
-  
-  # Machine learning
-  - cuml=23.12
-  
-  # Visualization (optional)
-  - matplotlib=3.7.2
-  - seaborn=0.12.2
-  
-  # Jupyter for development
-  - jupyter=1.0.0
-  - ipykernel=6.25.0
+  # Core RAPIDS stack (latest stable)
+  - rapids=24.06
+  - python=3.10
+  - cuda-version=12.5
   
   # Development tools
-  - pytest=7.4.0
-  - black=23.7.0
-  - flake8=6.0.0
+  - jupyterlab
+  - ipykernel
+  - pytest
+  - black
+  - flake8
   
-  # System dependencies
-  - gcc_linux-64=11.2.0
-  - gxx_linux-64=11.2.0
-  - cmake=3.26.4
-  
-  # Python version
-  - python=3.10
+  # Additional dependencies (will be installed via pip in deploy script)
+  # - SQLAlchemy
+  # - PyMySQL
