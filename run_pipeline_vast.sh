@@ -187,11 +187,6 @@ cd $REMOTE_PROJECT_DIR
 source /opt/conda/etc/profile.d/conda.sh
 conda activate dynamic-stage0
 
-echo '--- [REMOTO] Verificando recursos do sistema...'
-echo \"Memória disponível: \$(free -h | grep Mem | awk '{print \$7}')\"
-echo \"Espaço em disco: \$(df -h / | tail -1 | awk '{print \$4}')\"
-echo \"GPUs disponíveis: \$(nvidia-smi --list-gpus | wc -l 2>/dev/null || echo '0')\"
-
 echo '--- [REMOTO] Sincronizando dados do R2...'
 $REMOTE_ENV_EXPORTS
 

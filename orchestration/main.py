@@ -377,16 +377,13 @@ def process_currency_pair(
 
         # ---- feature engines em cuDF (versões compatíveis) ----
         from features import StationarizationEngine, StatisticalTests, SignalProcessor, GARCHModels
-        from dask.distributed import Client
         settings = get_settings()
 
-        # Create a local client for this worker
-        local_client = Client("tcp://localhost:8786")  # Connect to the scheduler
-
-        station = StationarizationEngine(settings, local_client)
-        stats   = StatisticalTests(settings, local_client)
-        sig     = SignalProcessor(settings, local_client)
-        garch   = GARCHModels(settings, local_client)
+        # Use None for client - the engines should work without Dask client
+        station = StationarizationEngine(settings, None)
+        stats   = StatisticalTests(settings, None)
+        sig     = SignalProcessor(settings, None)
+        garch   = GARCHModels(settings, None)
 
         # todas trabalhando sobre **cuDF**:
         gdf = station.process_currency_pair(gdf)
