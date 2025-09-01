@@ -129,8 +129,8 @@ class FeatureConfig:
     # Selection stage (Stage 1) and dCor extras
     selection_target_column: str = "y_ret_1m"
     dcor_top_k: int = 50
-    dcor_include_permutation: bool = False
-    dcor_permutations: int = 0
+    dcor_include_permutation: bool = True
+    dcor_permutations: int = 100
     selection_max_rows: int = 100000
     vif_threshold: float = 5.0
     mi_threshold: float = 0.3
@@ -147,8 +147,8 @@ class FeatureConfig:
     stage3_lgbm_bagging_fraction: float = 0.8
     stage3_lgbm_bagging_freq: int = 0
     stage3_lgbm_early_stopping_rounds: int = 0
-    stage3_use_gpu: bool = False
-    stage3_wrapper_backend: str = "lgbm"  # lgbm|xgb_gpu
+    stage3_use_gpu: bool = True
+    stage3_wrapper_backend: str = "xgb_gpu"  # lgbm|xgb_gpu
     # Stage 1 retention controls
     dcor_min_threshold: float = 0.0
     dcor_min_percentile: float = 0.0  # 0.0..1.0
@@ -156,12 +156,12 @@ class FeatureConfig:
     # Stage 0 ADF
     adf_alpha: float = 0.05
     # dCor fast 1D approximation and permutation stage
-    dcor_fast_1d_enabled: bool = False
+    dcor_fast_1d_enabled: bool = True
     dcor_fast_1d_bins: int = 2048
-    dcor_permutation_top_k: int = 0   # 0 = disabled, else apply on top-K by dCor
+    dcor_permutation_top_k: int = 20   # 0 = disabled, else apply on top-K by dCor
     dcor_pvalue_alpha: float = 0.05
     # Stage 1 rolling dCor (new)
-    stage1_rolling_enabled: bool = False
+    stage1_rolling_enabled: bool = True
     stage1_rolling_window: int = 2000
     stage1_rolling_step: int = 500
     stage1_rolling_min_periods: int = 200
@@ -176,7 +176,7 @@ class FeatureConfig:
     mi_max_candidates: int = 400
     mi_chunk_size: int = 128
     # CPCV controls
-    cpcv_enabled: bool = False
+    cpcv_enabled: bool = True
     cpcv_n_groups: int = 6
     cpcv_k_leave_out: int = 2
     cpcv_purge: int = 0

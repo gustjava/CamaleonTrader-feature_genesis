@@ -120,12 +120,23 @@ class DaskClusterManager:
             # Configure RMM before creating cluster
             self._configure_rmm()
 
-            # Build cluster configuration from unified config
+            # Configure worker memory via dask config to avoid deprecation warnings
+            try:
+                import dask
+                dask.config.set({
+                    'distributed.worker.memory.target': float(self.config.dask.memory_target_fraction),
+                    'distributed.worker.memory.spill': float(self.config.dask.memory_spill_fraction),
+                })
+                logger.info("Dask memory config set (target=%.2f, spill=%.2f)",
+                            float(self.config.dask.memory_target_fraction),
+                            float(self.config.dask.memory_spill_fraction))
+            except Exception as e:
+                logger.warning(f"Could not set Dask memory config: {e}")
+
+            # Build cluster configuration from unified config (omit deprecated kwargs)
             cluster_kwargs = {
                 'n_workers': gpu_count,
                 'threads_per_worker': self.config.dask.threads_per_worker,
-                'memory_target_fraction': self.config.dask.memory_target_fraction,
-                'memory_spill_fraction': self.config.dask.memory_spill_fraction,
                 'rmm_pool_size': self.config.dask.rmm_pool_size,
                 'local_directory': self.config.dask.local_directory,
             }

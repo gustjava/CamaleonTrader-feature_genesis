@@ -250,6 +250,32 @@ if ! ls \"$REMOTE_DATA_DIR\"/*.parquet 1>/dev/null 2>&1; then
     echo \"   Arquivos esperados: *_master_features.parquet\"
 fi
 
+echo '--- [REMOTO] Verificando processos existentes...'
+KILL_EXISTING=\"${KILL_EXISTING:-1}\"
+EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | awk '{print \$1}')
+if [ -n \"\$EXISTING_PIDS\" ]; then
+    COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w)
+    echo \"🚨🚨🚨 ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
+    ps -fp \$EXISTING_PIDS 2>/dev/null || true
+    if [ \"\$KILL_EXISTING\" = \"1\" ]; then
+        echo '🧹 Encerrando processos antigos...'
+        for pid in \$EXISTING_PIDS; do kill \"$pid\" 2>/dev/null || true; done
+        sleep 5
+        STILL=\$(ps -p \$EXISTING_PIDS -o pid= 2>/dev/null | tr -s ' ')
+        if [ -n \"\$STILL\" ]; then
+            echo \"⚠️  Forçando encerramento (SIGKILL) dos PIDs: \$STILL\"
+            for pid in \$STILL; do kill -9 \"$pid\" 2>/dev/null || true; done
+            sleep 1
+        fi
+        echo '✅ Processos antigos encerrados.'
+    else
+        echo '🚨🚨🚨 CONTINUANDO EM 5 SEGUNDOS... 🚨🚨🚨'
+        sleep 5
+    fi
+else
+    echo '✅ Nenhum processo do pipeline detectado.'
+fi
+
 echo '--- [REMOTO] Iniciando pipeline...'
 python orchestration/main.py
 "

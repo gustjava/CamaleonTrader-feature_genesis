@@ -593,8 +593,8 @@ class StationarizationEngine(BaseFeatureEngine):
             (volume_features, spread_features)
         ]
 
-        # Temporarily skip rolling correlations to avoid Dask hashing issues
-        self._log_progress("Skipping rolling correlations (Dask hashing issue)")
+        # If we reach here without an implementation, fail fast (no silent skip)
+        self._critical_error("Rolling correlations not executed (deterministic Dask partition function missing)")
         
         # for feat_list_1, feat_list_2 in categories:
         #     for col1, col2 in product(feat_list_1, feat_list_2):
@@ -675,10 +675,9 @@ class StationarizationEngine(BaseFeatureEngine):
         """
         self._log_progress("Applying fractional differentiation...")
         
-        # Temporarily skip fractional differentiation to avoid Dask hashing issues
-        self._log_progress("Skipping fractional differentiation (Dask hashing issue)")
-        
-        return df
+        # Fail fast instead of silently skipping
+        self._critical_error("Fractional differentiation not executed (deterministic Dask partition function missing)")
+        return df  # unreachable
     
     def _apply_frac_diff_to_partition_wrapper(self, pdf: cudf.DataFrame, column: str) -> cudf.DataFrame:
         """Wrapper method for Dask map_partitions to avoid hashing issues."""
@@ -729,10 +728,9 @@ class StationarizationEngine(BaseFeatureEngine):
         """
         self._log_progress("Applying rolling stationarization...")
         
-        # Temporarily skip rolling stationarization to avoid Dask hashing issues
-        self._log_progress("Skipping rolling stationarization (Dask hashing issue)")
-        
-        return df
+        # Fail fast instead of silently skipping
+        self._critical_error("Rolling stationarization not executed (deterministic Dask partition function missing)")
+        return df  # unreachable
     
     def _apply_rolling_stationary_to_partition_wrapper(self, pdf: cudf.DataFrame, column: str) -> cudf.DataFrame:
         """Wrapper method for Dask map_partitions to avoid hashing issues."""
@@ -772,10 +770,9 @@ class StationarizationEngine(BaseFeatureEngine):
         """
         self._log_progress("Applying variance stabilization...")
         
-        # Temporarily skip variance stabilization to avoid Dask hashing issues
-        self._log_progress("Skipping variance stabilization (Dask hashing issue)")
-        
-        return df
+        # Fail fast instead of silently skipping
+        self._critical_error("Variance stabilization not executed (deterministic Dask partition function missing)")
+        return df  # unreachable
     
     def _apply_variance_stabilization_to_partition_wrapper(self, pdf: cudf.DataFrame, column: str) -> cudf.DataFrame:
         """Wrapper method for Dask map_partitions to avoid hashing issues."""

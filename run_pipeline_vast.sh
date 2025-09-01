@@ -51,36 +51,12 @@ echo "Usando vast CLI: $VAST_BIN"
 # --------------------------- SELEÇÃO/CONEXÃO INSTÂNCIA ------------------------------
 echo -e "\n--- Instâncias ativas ---"
 INSTANCES_RAW="$("$VAST_BIN" show instances --raw)"
-INSTANCES_JSON=$(echo "$INSTANCES_RAW" | jq -r '.[] | select(.actual_status=="running") | {id: .id, image: .image, gpus: .num_gpus, status: .status_msg}')
-
-if [ -z "$INSTANCES_JSON" ]; then
-    echo "❌ Nenhuma instância ativa encontrada."
-    exit 1
+INSTANCE_ID=$(echo "$INSTANCES_RAW" | jq -r '[.[] | select(.actual_status=="running")][0].id // empty')
+if [[ -z "$INSTANCE_ID" ]]; then
+  echo "❌ Nenhuma instância ativa encontrada."
+  exit 1
 fi
-
-# Contar instâncias ativas
-INSTANCE_COUNT=$(echo "$INSTANCES_JSON" | jq -s 'length')
-
-# Seleciona a primeira instância por padrão em modo AUTO ou não interativo
-FIRST_INSTANCE_ID=$(echo "$INSTANCES_RAW" | jq -r '[.[] | select(.actual_status=="running")][0].id // empty')
-
-if [ "$INSTANCE_COUNT" -eq 1 ]; then
-    INSTANCE_ID=$(echo "$INSTANCES_JSON" | jq -r '.id')
-    echo "✅ Instância única encontrada: $INSTANCE_ID (seleção automática)"
-else
-    echo "$INSTANCES_JSON" | jq -r '(["ID","Imagem","GPUs","Status"], (.[].id as $id | . | [.id, .image, .gpus, .status])) | @tsv' || true
-    echo "----------------------------------------------------------------------------------"
-    if [[ -n "${AUTO:-}" || ! -t 0 ]]; then
-        INSTANCE_ID="$FIRST_INSTANCE_ID"
-        echo "AUTO=1 ou stdin não interativo: usando a primeira instância ($INSTANCE_ID)"
-    else
-        read -t 5 -rp "Digite o ID da instância vast.ai (Enter para usar a primeira: $FIRST_INSTANCE_ID): " INSTANCE_ID || true
-        INSTANCE_ID="${INSTANCE_ID:-$FIRST_INSTANCE_ID}"
-    fi
-    [[ -z "${INSTANCE_ID}" ]] && { echo "Erro: ID da instância vazio."; exit 1; }
-fi
-
-echo "✅ Instância selecionada: $INSTANCE_ID"
+echo "✅ Instância selecionada automaticamente: $INSTANCE_ID"
 
 # --------------------------- CONEXÃO SSH --------------------------------------------
 echo "Aguardando SSH da instância $INSTANCE_ID ficar disponível..."
@@ -185,17 +161,32 @@ EOF
 PIPELINE_CMD="
 set -e
 echo '--- [REMOTO] Verificando processos existentes...'
+KILL_EXISTING=\"1\"
 # Verificar se há processos do pipeline rodando
-EXISTING_PROCESSES=\$(ps aux | grep -E '(python.*main\.py|dask-worker|dask-scheduler)' | grep -v grep | wc -l)
-if [ \"\$EXISTING_PROCESSES\" -gt 0 ]; then
-    echo '🚨🚨🚨 ATENÇÃO: PROCESSOS EXISTENTES DETECTADOS! 🚨🚨🚨'
-    echo '🚨🚨🚨 EXISTEM \$EXISTING_PROCESSES PROCESSOS DO PIPELINE RODANDO! 🚨🚨🚨'
-    echo '🚨🚨🚨 ISSO PODE CAUSAR CONFLITOS DE RECURSOS! 🚨🚨🚨'
-    echo '🚨🚨🚨 VERIFIQUE SE VOCÊ QUER CONTINUAR! 🚨🚨🚨'
-    echo '🚨🚨🚨 PROCESSOS DETECTADOS: 🚨🚨🚨'
-    ps aux | grep -E '(python.*main\.py|dask-worker|dask-scheduler)' | grep -v grep || echo 'Nenhum processo encontrado'
-    echo '🚨🚨🚨 CONTINUANDO EM 5 SEGUNDOS... 🚨🚨🚨'
-    sleep 5
+EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | awk '{print \$1}')
+if [ -n \"\$EXISTING_PIDS\" ]; then
+    COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w)
+    echo \"🚨🚨🚨 ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
+    ps -fp \$EXISTING_PIDS 2>/dev/null || true
+    if [ \"\$KILL_EXISTING\" = \"1\" ]; then
+        echo '🧹 Encerrando processos antigos antes de iniciar novo pipeline...'
+        for pid in \$EXISTING_PIDS; do
+            kill \"\$pid\" 2>/dev/null || true
+        done
+        sleep 5
+        STILL=\$(ps -p \$EXISTING_PIDS -o pid= 2>/dev/null | tr -s ' ')
+        if [ -n \"\$STILL\" ]; then
+            echo \"⚠️  Forçando encerramento (SIGKILL) dos PIDs: \$STILL\"
+            for pid in \$STILL; do
+                kill -9 \"\$pid\" 2>/dev/null || true
+            done
+            sleep 1
+        fi
+        echo '✅ Processos antigos encerrados.'
+    else
+        echo '🚨🚨🚨 CONTINUANDO EM 5 SEGUNDOS... 🚨🚨🚨'
+        sleep 5
+    fi
 else
     echo '✅ Nenhum processo do pipeline detectado. Continuando...'
 fi
@@ -230,38 +221,44 @@ PIPELINE_PID=$!
 echo "$PIPELINE_PID" > "/tmp/vast_pipeline_${INSTANCE_ID}.pid"
 
 echo "✅ Pipeline iniciado (PID: $PIPELINE_PID)"
-echo "🔄 Monitorando execução..."
+echo "📡 Acompanhe os logs em tempo real abaixo (Ctrl+C para parar o tail):"
 
-# Monitora o progresso do pipeline
-MONITOR_INTERVAL=${MONITOR_INTERVAL:-10}
-LOG_TAIL_LINES=${LOG_TAIL_LINES:-50}
-MAX_WAIT_TIME=3600  # 1 hora
-elapsed_time=0
+# Tail em tempo real do log local gerado pelo SSH
+touch "$PIPELINE_LOG_FILE"
+TAIL_PID=""
+tail -n +1 -F "$PIPELINE_LOG_FILE" &
+TAIL_PID=$!
 
-while [ $elapsed_time -lt $MAX_WAIT_TIME ]; do
-    # Verifica se o processo ainda está rodando
-    if ! kill -0 $PIPELINE_PID 2>/dev/null; then
-        echo "✅ Pipeline concluído!"
-        break
-    fi
-    
-    # Mostra apenas erros críticos
-    if [ -f "$PIPELINE_LOG_FILE" ]; then
-        errors=$(tail -n 500 "$PIPELINE_LOG_FILE" 2>/dev/null | grep -E "ERROR|CRITICAL|Traceback|TokenizationError" | tail -n 5)
-        if [ -n "$errors" ]; then
-            echo "❌ Erros recentes:"
-            echo "$errors"
-        fi
-    fi
-    
-    sleep $MONITOR_INTERVAL
-    elapsed_time=$((elapsed_time + MONITOR_INTERVAL))
-done
+# Garante limpeza do tail ao sair
+cleanup() {
+  if [ -n "${TAIL_PID:-}" ]; then
+    kill "$TAIL_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup INT TERM EXIT
 
-# Verifica o resultado final
-if [ $elapsed_time -ge $MAX_WAIT_TIME ]; then
-    echo "⚠️  Timeout atingido (${MAX_WAIT_TIME}s). Verificando status..."
+# Aguarda o término do processo SSH (pipeline remoto)
+PIPELINE_EXIT_CODE=1
+if [ -n "${PIPELINE_PID:-}" ]; then
+  wait "$PIPELINE_PID"
+  PIPELINE_EXIT_CODE=$?
 fi
+
+# Para o tail e imprime resumo final
+cleanup
+
+echo "📋 RESULTADO FINAL (código $PIPELINE_EXIT_CODE):"
+echo "--- Últimas 50 linhas do log ---"
+tail -n 50 "$PIPELINE_LOG_FILE" || true
+echo "---"
+
+if [ $PIPELINE_EXIT_CODE -eq 0 ]; then
+  echo "✅ Pipeline finalizado com sucesso."
+else
+  echo "❌ Pipeline finalizado com erro (código $PIPELINE_EXIT_CODE)."
+fi
+
+# (monitor removido)
 
 # Mostra apenas o resultado final resumido
 if [ -f "$PIPELINE_LOG_FILE" ]; then
@@ -270,7 +267,7 @@ if [ -f "$PIPELINE_LOG_FILE" ]; then
 fi
 
 # Verifica se o processo ainda está rodando
-if kill -0 $PIPELINE_PID 2>/dev/null; then
+if [ -n "${PIPELINE_PID:-}" ] && kill -0 "$PIPELINE_PID" 2>/dev/null; then
     echo "🔄 Pipeline ainda em execução. Para parar: kill $PIPELINE_PID"
 else
     echo "✅ Pipeline finalizado."

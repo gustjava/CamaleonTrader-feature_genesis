@@ -126,6 +126,59 @@ def _perm_pvalues_partition(pdf: cudf.DataFrame, target: str, feat_list: List[st
     return cudf.DataFrame([out])
 
 
+def _dcor_rolling_partition(
+    pdf: cudf.DataFrame,
+    target: str,
+    candidates: List[str],
+    window: int,
+    step: int,
+    min_periods: int,
+    max_rows: int,
+    max_windows: int,
+    agg: str,
+    max_samples: int,
+) -> cudf.DataFrame:
+    import pandas as pd
+    # Convert to pandas for CPU rolling; limit rows
+    pdf = pdf.head(max_rows) if hasattr(pdf, 'head') else pdf
+    pdf_pd = pdf.to_pandas()
+    y = pdf_pd[target].values
+    n = len(y)
+    scores = {}
+    if n < max(min_periods, 3):
+        return cudf.DataFrame([{k: float('nan') for k in [f"dcor_roll_{c}" for c in candidates]}])
+    starts = list(range(0, max(0, n - min_periods + 1), max(1, step)))
+    # Limit number of windows
+    if len(starts) > max_windows:
+        starts = starts[-max_windows:]
+    for c in candidates:
+        x = pdf_pd[c].values
+        vals = []
+        for s in starts:
+            e = min(n, s + window)
+            if e - s < min_periods:
+                continue
+            vals.append(_distance_correlation_cpu(x[s:e], y[s:e], max_samples=max_samples))
+        if not vals:
+            scores[f"dcor_roll_{c}"] = float('nan')
+        else:
+            if agg == 'mean':
+                outv = float(np.nanmean(vals))
+            elif agg == 'min':
+                outv = float(np.nanmin(vals))
+            elif agg == 'max':
+                outv = float(np.nanmax(vals))
+            elif agg == 'p25':
+                outv = float(np.nanpercentile(vals, 25))
+            elif agg == 'p75':
+                outv = float(np.nanpercentile(vals, 75))
+            else:
+                # default median
+                outv = float(np.nanmedian(vals))
+            scores[f"dcor_roll_{c}"] = outv
+    return cudf.DataFrame([scores])
+
+
 class StatisticalTests(BaseFeatureEngine):
     """
     Applies a set of statistical tests to a DataFrame.
@@ -2155,7 +2208,36 @@ class StatisticalTests(BaseFeatureEngine):
                     # Optionally compute rolling aggregated dCor
                     roll_scores = {}
                     if self.stage1_rolling_enabled:
-                        self._log_warn("Rolling dCor disabled for now to avoid Dask hashing issues")
+                        # Compute rolling dCor scores via module-level partition function
+                        w = int(self.stage1_rolling_window)
+                        st = int(self.stage1_rolling_step)
+                        mp = int(self.stage1_rolling_min_periods)
+                        mr = int(self.stage1_rolling_max_rows)
+                        mw = int(self.stage1_rolling_max_windows)
+                        ag = str(self.stage1_agg).lower()
+                        roll_meta = {f"dcor_roll_{c}": 'f8' for c in candidates}
+                        if hasattr(one, 'map_partitions'):
+                            roll_ddf = one.map_partitions(
+                                _dcor_rolling_partition,
+                                target,
+                                candidates,
+                                w,
+                                st,
+                                mp,
+                                mr,
+                                mw,
+                                ag,
+                                int(self.dcor_max_samples),
+                                meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in roll_meta.items()})
+                            )
+                            roll_pdf = roll_ddf.compute().to_pandas()
+                        else:
+                            roll_result = _dcor_rolling_partition(one, target, candidates, w, st, mp, mr, mw, ag, int(self.dcor_max_samples))
+                            roll_pdf = roll_result.to_pandas()
+                        if not roll_pdf.empty:
+                            roll_row = roll_pdf.iloc[0].to_dict()
+                            df = self._broadcast_scalars(df, roll_row)
+                            roll_scores = {c: float(roll_row.get(f"dcor_roll_{c}", np.nan)) for c in candidates if np.isfinite(roll_row.get(f"dcor_roll_{c}", np.nan))}
 
                     # Use module-level deterministic partition function for dCor
 

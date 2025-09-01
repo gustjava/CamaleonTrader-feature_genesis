@@ -106,8 +106,8 @@ features:
   distance_corr_tile_size: 2048
   selection_target_column: y_ret_1m
   dcor_top_k: 50
-  dcor_include_permutation: false
-  dcor_permutations: 0
+  dcor_include_permutation: true
+  dcor_permutations: 100
   selection_max_rows: 100000
   vif_threshold: 5.0
   mi_threshold: 0.3
@@ -124,17 +124,17 @@ features:
   stage3_lgbm_bagging_fraction: 0.8
   stage3_lgbm_bagging_freq: 0
   stage3_lgbm_early_stopping_rounds: 0
-  stage3_use_gpu: false
-  stage3_wrapper_backend: lgbm  # lgbm|xgb_gpu
+  stage3_use_gpu: true
+  stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
   dcor_min_threshold: 0.0
   dcor_min_percentile: 0.0
   stage1_top_n: 0
-  dcor_fast_1d_enabled: false
+  dcor_fast_1d_enabled: true
   dcor_fast_1d_bins: 2048
-  dcor_permutation_top_k: 0
+  dcor_permutation_top_k: 20
   dcor_pvalue_alpha: 0.05
   # Stage 1 rolling dCor (exposed)
-  stage1_rolling_enabled: false
+  stage1_rolling_enabled: true
   stage1_rolling_window: 2000
   stage1_rolling_step: 500
   stage1_rolling_min_periods: 200
@@ -151,7 +151,7 @@ features:
   mi_cluster_threshold: 0.3
   mi_max_candidates: 400
   mi_chunk_size: 128
-  cpcv_enabled: false
+  cpcv_enabled: true
   cpcv_n_groups: 6
   cpcv_k_leave_out: 2
   cpcv_purge: 0
