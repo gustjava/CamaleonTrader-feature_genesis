@@ -160,6 +160,8 @@ class FeatureConfig:
     dcor_fast_1d_bins: int = 2048
     dcor_permutation_top_k: int = 20   # 0 = disabled, else apply on top-K by dCor
     dcor_pvalue_alpha: float = 0.05
+    # Stage 1 batching for progress logging
+    dcor_batch_size: int = 64
     # Stage 1 rolling dCor (new)
     stage1_rolling_enabled: bool = True
     stage1_rolling_window: int = 2000

@@ -2241,26 +2241,39 @@ class StatisticalTests(BaseFeatureEngine):
 
                     # Use module-level deterministic partition function for dCor
 
-                    meta_cols = {f"dcor_{c}": 'f8' for c in candidates}
-                    if self.dcor_include_permutation and self.dcor_permutations > 0:
-                        meta_cols.update({f"dcor_pvalue_{c}": 'f8' for c in candidates})
+                    # Batch computation for progress visibility
+                    batch_size = int(getattr(self, 'dcor_batch_size', 64))
+                    all_scores: Dict[str, float] = {}
+                    total = len(candidates)
+                    processed = 0
+                    for start in range(0, total, max(1, batch_size)):
+                        batch = candidates[start:start + batch_size]
+                        meta_cols = {f"dcor_{c}": 'f8' for c in batch}
+                        if hasattr(one, 'map_partitions'):
+                            res_ddf = one.map_partitions(
+                                _dcor_partition,
+                                target,
+                                batch,
+                                int(self.dcor_max_samples),
+                                meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in meta_cols.items()})
+                            )
+                            res_pdf = res_ddf.compute().to_pandas()
+                        else:
+                            res_result = _dcor_partition(one, target, batch, int(self.dcor_max_samples))
+                            res_pdf = res_result.to_pandas()
+                        if not res_pdf.empty:
+                            row_b = res_pdf.iloc[0].to_dict()
+                            # accumulate
+                            for c in batch:
+                                val = row_b.get(f"dcor_{c}")
+                                if val is not None:
+                                    all_scores[c] = float(val)
+                        processed = min(total, start + len(batch))
+                        self._log_info("dCor batch completed", processed=processed, total=total, batch=len(batch))
 
-                    # Check if DataFrame has map_partitions method (Dask DataFrame)
-                    if hasattr(one, 'map_partitions'):
-                        res_ddf = one.map_partitions(
-                            _dcor_partition,
-                            target,
-                            candidates,
-                            int(self.dcor_max_samples),
-                            meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in meta_cols.items()})
-                        )
-                        res_pdf = res_ddf.compute().to_pandas()
-                    else:
-                        # For regular cuDF DataFrame, compute directly
-                        res_result = dcor_partition(one)
-                        res_pdf = res_result.to_pandas()
-                    if not res_pdf.empty:
-                        row = res_pdf.iloc[0].to_dict()
+                    # Broadcast the aggregated dCor scores as scalars
+                    if all_scores:
+                        row = {f"dcor_{k}": v for k, v in all_scores.items()}
                         df = self._broadcast_scalars(df, row)
 
                         # Choose scores source

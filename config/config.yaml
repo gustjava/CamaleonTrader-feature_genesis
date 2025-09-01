@@ -133,6 +133,8 @@ features:
   dcor_fast_1d_bins: 2048
   dcor_permutation_top_k: 20
   dcor_pvalue_alpha: 0.05
+  # Stage 1 batching for progress visibility
+  dcor_batch_size: 64
   # Stage 1 rolling dCor (exposed)
   stage1_rolling_enabled: true
   stage1_rolling_window: 2000

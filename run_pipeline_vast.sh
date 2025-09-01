@@ -163,7 +163,7 @@ set -e
 echo '--- [REMOTO] Verificando processos existentes...'
 KILL_EXISTING=\"1\"
 # Verificar se há processos do pipeline rodando
-EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | awk '{print \$1}')
+EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | sed -E 's/^[[:space:]]*([0-9]+).*/\1/')
 if [ -n \"\$EXISTING_PIDS\" ]; then
     COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w)
     echo \"🚨🚨🚨 ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
@@ -182,6 +182,26 @@ if [ -n \"\$EXISTING_PIDS\" ]; then
             done
             sleep 1
         fi
+        # Aguarda até que todos os processos antigos terminem de fato
+        WAITED=0
+        while :; do
+            REMAIN=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | sed -E 's/^[[:space:]]*([0-9]+).*/\1/')
+            if [ -z \"\$REMAIN\" ]; then
+                echo '✅ Todos os processos anteriores foram encerrados.'
+                break
+            fi
+            echo \"⏳ Aguardando processos terminarem: \$REMAIN (t=\$WAITED s)\"
+            if [ \"\$WAITED\" -ge 60 ]; then
+                echo '⚠️  Timeout de 60s; reforçando SIGKILL'
+                for pid in \$REMAIN; do
+                    kill -9 \"\$pid\" 2>/dev/null || true
+                done
+                sleep 2
+            else
+                sleep 2
+            fi
+            WAITED=\$((\$WAITED+2))
+        done
         echo '✅ Processos antigos encerrados.'
     else
         echo '🚨🚨🚨 CONTINUANDO EM 5 SEGUNDOS... 🚨🚨🚨'
