@@ -50,7 +50,8 @@ echo "Usando vast CLI: $VAST_BIN"
 
 # --------------------------- SELEÇÃO/CONEXÃO INSTÂNCIA ------------------------------
 echo -e "\n--- Instâncias ativas ---"
-INSTANCES_JSON=$("$VAST_BIN" show instances --raw | jq -r '.[] | select(.actual_status=="running") | {id: .id, image: .image, gpus: .num_gpus, status: .status_msg}')
+INSTANCES_RAW="$("$VAST_BIN" show instances --raw)"
+INSTANCES_JSON=$(echo "$INSTANCES_RAW" | jq -r '.[] | select(.actual_status=="running") | {id: .id, image: .image, gpus: .num_gpus, status: .status_msg}')
 
 if [ -z "$INSTANCES_JSON" ]; then
     echo "❌ Nenhuma instância ativa encontrada."
@@ -60,15 +61,22 @@ fi
 # Contar instâncias ativas
 INSTANCE_COUNT=$(echo "$INSTANCES_JSON" | jq -s 'length')
 
+# Seleciona a primeira instância por padrão em modo AUTO ou não interativo
+FIRST_INSTANCE_ID=$(echo "$INSTANCES_RAW" | jq -r '[.[] | select(.actual_status=="running")][0].id // empty')
+
 if [ "$INSTANCE_COUNT" -eq 1 ]; then
-    # Se há apenas 1 instância, seleciona automaticamente
     INSTANCE_ID=$(echo "$INSTANCES_JSON" | jq -r '.id')
     echo "✅ Instância única encontrada: $INSTANCE_ID (seleção automática)"
 else
-    # Se há múltiplas instâncias, mostra lista e pergunta
-    echo "$INSTANCES_JSON" | jq -r '(["ID","Imagem","GPUs","Status"], (.[] | [.id, .image, .gpus, .status])) | @tsv'
+    echo "$INSTANCES_JSON" | jq -r '(["ID","Imagem","GPUs","Status"], (.[].id as $id | . | [.id, .image, .gpus, .status])) | @tsv' || true
     echo "----------------------------------------------------------------------------------"
-    read -rp "Digite o ID da instância vast.ai que deseja usar: " INSTANCE_ID
+    if [[ -n "${AUTO:-}" || ! -t 0 ]]; then
+        INSTANCE_ID="$FIRST_INSTANCE_ID"
+        echo "AUTO=1 ou stdin não interativo: usando a primeira instância ($INSTANCE_ID)"
+    else
+        read -t 5 -rp "Digite o ID da instância vast.ai (Enter para usar a primeira: $FIRST_INSTANCE_ID): " INSTANCE_ID || true
+        INSTANCE_ID="${INSTANCE_ID:-$FIRST_INSTANCE_ID}"
+    fi
     [[ -z "${INSTANCE_ID}" ]] && { echo "Erro: ID da instância vazio."; exit 1; }
 fi
 
@@ -176,10 +184,34 @@ EOF
 # Comando de execução do pipeline
 PIPELINE_CMD="
 set -e
-echo '--- [REMOTO] Ativando ambiente...'
+echo '--- [REMOTO] Verificando processos existentes...'
+# Verificar se há processos do pipeline rodando
+EXISTING_PROCESSES=\$(ps aux | grep -E '(python.*main\.py|dask-worker|dask-scheduler)' | grep -v grep | wc -l)
+if [ \"\$EXISTING_PROCESSES\" -gt 0 ]; then
+    echo '🚨🚨🚨 ATENÇÃO: PROCESSOS EXISTENTES DETECTADOS! 🚨🚨🚨'
+    echo '🚨🚨🚨 EXISTEM \$EXISTING_PROCESSES PROCESSOS DO PIPELINE RODANDO! 🚨🚨🚨'
+    echo '🚨🚨🚨 ISSO PODE CAUSAR CONFLITOS DE RECURSOS! 🚨🚨🚨'
+    echo '🚨🚨🚨 VERIFIQUE SE VOCÊ QUER CONTINUAR! 🚨🚨🚨'
+    echo '🚨🚨🚨 PROCESSOS DETECTADOS: 🚨🚨🚨'
+    ps aux | grep -E '(python.*main\.py|dask-worker|dask-scheduler)' | grep -v grep || echo 'Nenhum processo encontrado'
+    echo '🚨🚨🚨 CONTINUANDO EM 5 SEGUNDOS... 🚨🚨🚨'
+    sleep 5
+else
+    echo '✅ Nenhum processo do pipeline detectado. Continuando...'
+fi
+
+echo '--- [REMOTO] Configurando ambiente...'
 cd $REMOTE_PROJECT_DIR
 source /opt/conda/etc/profile.d/conda.sh
-conda activate dynamic-stage0
+
+# Verificar se o ambiente dynamic-stage0 existe, senão usar base
+if conda env list | grep -q 'dynamic-stage0'; then
+    echo '✅ Ativando ambiente dynamic-stage0...'
+    conda activate dynamic-stage0
+else
+    echo '⚠️  Usando ambiente base (RAPIDS já instalado)...'
+    # Não ativar nenhum ambiente específico, usar o base
+fi
 
 $REMOTE_ENV_EXPORTS
 
@@ -187,19 +219,61 @@ echo '--- [REMOTO] Iniciando pipeline...'
 python orchestration/main.py
 "
 
-# Executa o comando via SSH
-ssh $SSH_OPTS "root@$SSH_HOST" "$PIPELINE_CMD"
+# Criar arquivo de log para o pipeline
+PIPELINE_LOG_FILE="/tmp/vast_pipeline_${INSTANCE_ID}.log"
+echo "📝 Logs do pipeline: $PIPELINE_LOG_FILE"
 
-echo -e "\n✅ Pipeline executado com sucesso!"
-echo -e "\n📋 RESUMO:"
-echo "   • Túnel SSH persistente: ATIVO (PID: $TUNNEL_PID)"
-echo "   • Arquivo PID: $TUNNEL_PID_FILE"
-echo "   • Logs do túnel: /tmp/vast_tunnel_${INSTANCE_ID}.log"
-echo "   • Porta local: $LOCAL_MYSQL_PORT → Porta remota: $REMOTE_MYSQL_PORT"
-echo ""
-echo "💡 COMANDOS ÚTEIS:"
-echo "   • Verificar se túnel está ativo: ps aux | grep 'ssh.*$SSH_HOST'"
-echo "   • Parar túnel: kill \$(cat $TUNNEL_PID_FILE)"
-echo "   • Ver logs do túnel: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
-echo ""
-echo "⚠️  IMPORTANTE: O túnel continuará rodando mesmo após fechar esta sessão!"
+# Executa o comando via SSH em background e salva o PID
+echo "🔄 Iniciando pipeline em background..."
+ssh $SSH_OPTS "root@$SSH_HOST" "$PIPELINE_CMD" > "$PIPELINE_LOG_FILE" 2>&1 &
+PIPELINE_PID=$!
+echo "$PIPELINE_PID" > "/tmp/vast_pipeline_${INSTANCE_ID}.pid"
+
+echo "✅ Pipeline iniciado (PID: $PIPELINE_PID)"
+echo "🔄 Monitorando execução..."
+
+# Monitora o progresso do pipeline
+MONITOR_INTERVAL=${MONITOR_INTERVAL:-10}
+LOG_TAIL_LINES=${LOG_TAIL_LINES:-50}
+MAX_WAIT_TIME=3600  # 1 hora
+elapsed_time=0
+
+while [ $elapsed_time -lt $MAX_WAIT_TIME ]; do
+    # Verifica se o processo ainda está rodando
+    if ! kill -0 $PIPELINE_PID 2>/dev/null; then
+        echo "✅ Pipeline concluído!"
+        break
+    fi
+    
+    # Mostra apenas erros críticos
+    if [ -f "$PIPELINE_LOG_FILE" ]; then
+        errors=$(tail -n 500 "$PIPELINE_LOG_FILE" 2>/dev/null | grep -E "ERROR|CRITICAL|Traceback|TokenizationError" | tail -n 5)
+        if [ -n "$errors" ]; then
+            echo "❌ Erros recentes:"
+            echo "$errors"
+        fi
+    fi
+    
+    sleep $MONITOR_INTERVAL
+    elapsed_time=$((elapsed_time + MONITOR_INTERVAL))
+done
+
+# Verifica o resultado final
+if [ $elapsed_time -ge $MAX_WAIT_TIME ]; then
+    echo "⚠️  Timeout atingido (${MAX_WAIT_TIME}s). Verificando status..."
+fi
+
+# Mostra apenas o resultado final resumido
+if [ -f "$PIPELINE_LOG_FILE" ]; then
+    echo "📋 RESULTADO FINAL:"
+    tail -n 10 "$PIPELINE_LOG_FILE" | grep -E "SUCCESS|FAILURE|ERROR|CRITICAL" || echo "Pipeline concluído"
+fi
+
+# Verifica se o processo ainda está rodando
+if kill -0 $PIPELINE_PID 2>/dev/null; then
+    echo "🔄 Pipeline ainda em execução. Para parar: kill $PIPELINE_PID"
+else
+    echo "✅ Pipeline finalizado."
+fi
+
+echo "✅ Pipeline finalizado. Logs: $PIPELINE_LOG_FILE"

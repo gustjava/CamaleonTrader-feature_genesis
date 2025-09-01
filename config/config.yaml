@@ -1,7 +1,17 @@
-# Dynamic Stage 0 - Configuration File
-# GPU-Accelerated Feature Stationarization Pipeline
+# Dynamic Stage 0 - Unified Configuration File
+# GPU-Accelerated Feature Engineering Pipeline
+# 
+# This configuration file consolidates all settings for the pipeline including:
+# - Database connectivity
+# - Cloud storage (R2)
+# - Dask-CUDA cluster settings
+# - Feature engineering parameters
+# - Processing pipeline configuration
+# - Error handling and monitoring
+# - Development and debugging options
 
 # Database Configuration
+# MySQL database connection settings for task tracking and metadata
 database:
   host: ${MYSQL_HOST:localhost}
   port: ${MYSQL_PORT:3010}
@@ -14,95 +24,318 @@ database:
   pool_timeout: 30
   pool_recycle: 3600
 
-# Cloudflare R2 Configuration
+# Cloudflare R2 Storage Configuration
+# Cloud storage settings for data input/output
 r2:
   account_id: ${R2_ACCOUNT_ID:ac68ac775ba99b267edee7f9b4b3bc4e}
   access_key: ${R2_ACCESS_KEY:0e315105695707ca4fe1e5f83a38f807}
   secret_key: ${R2_SECRET_KEY:5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515}
   bucket_name: ${R2_BUCKET_NAME:camaleon}
   endpoint_url: ${R2_ENDPOINT_URL:https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com}
-  region: ${R2_REGION:auto}
+  region: auto
 
-# Dask-CUDA Configuration
+# Dask-CUDA Cluster Configuration
+# GPU cluster settings for distributed processing
 dask:
+  # Worker configuration
   gpus_per_worker: 1
   threads_per_worker: 1
-  memory_limit: "auto"
-  rmm:
-    pool_size: "24GB"
-    initial_pool_size: "12GB"
-    maximum_pool_size: "48GB"
-  spilling:
-    enabled: true
-    target: 0.8
-    max_spill: "32GB"
+  memory_limit: "8GB"
+  
+  # RMM (RAPIDS Memory Manager) settings
+  rmm_pool_size: "4GB"
+  rmm_initial_pool_size: "4GB"
+  rmm_maximum_pool_size: "8GB"
+  spilling_enabled: true
+  spilling_target: 0.9
+  spilling_max_spill: "32GB"
+  
+  # Memory management
+  memory_target_fraction: 0.8
+  memory_spill_fraction: 0.9
+  local_directory: "/tmp/dask-worker-space"
+  
+  # Network protocol settings
+  protocol: "ucx"
+  enable_tcp_over_ucx: true
+  enable_infiniband: false
+  enable_nvlink: true
 
 # Feature Engineering Configuration
+# Parameters for all feature engineering engines
 features:
-  # Rolling window features
-  rolling_corr:
-    windows: [20, 50, 100, 200]
-    min_periods: 10
+  # Rolling window configurations for various calculations
+  rolling_windows: [10, 20, 50, 100, 200]
+  rolling_min_periods: 1
   
-  # Fractional differentiation
+  # Rolling correlation configuration
+  rolling_corr:
+    windows: [15, 30, 60]
+    min_periods: 1
+  
+  # Fractional differentiation configuration
   frac_diff:
-    d_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+    d_values: [0.1, 0.2, 0.3, 0.4, 0.5]
     threshold: 1e-5
     max_lag: 1000
   
-  # Baxter-King filter
+  # Baxter-King filter configuration
   baxter_king:
     low_freq: 6
     high_freq: 32
     k: 12
   
-  # GARCH parameters
+  # GARCH model configuration
   garch:
     p: 1
     q: 1
     max_iter: 1000
     tolerance: 1e-6
   
-  # Distance correlation
+  # Distance correlation configuration
   distance_corr:
-    max_samples: 10000  # Limit for large datasets
+    max_samples: 10000
   
-  # Empirical Mode Decomposition
+  # Empirical Mode Decomposition configuration
   emd:
     max_imfs: 10
-    tolerance: 1e-10
+    tolerance: 1e-8
     max_iterations: 100
-
-# Processing Configuration
-processing:
-  batch_size: 10000
-  chunk_size: "256MB"
-  max_workers: 4
-  timeout: 3600  # 1 hour per pair
   
+  # Statistical tests parameters
+  distance_corr_tile_size: 2048
+  selection_target_column: y_ret_1m
+  dcor_top_k: 50
+  dcor_include_permutation: false
+  dcor_permutations: 0
+  selection_max_rows: 100000
+  vif_threshold: 5.0
+  mi_threshold: 0.3
+  stage3_top_n: 50
+  # Stage 3 wrappers (LightGBM)
+  stage3_task: auto  # auto|regression|classification
+  stage3_random_state: 42
+  stage3_lgbm_enabled: true
+  stage3_lgbm_num_leaves: 31
+  stage3_lgbm_max_depth: -1
+  stage3_lgbm_n_estimators: 200
+  stage3_lgbm_learning_rate: 0.05
+  stage3_lgbm_feature_fraction: 0.8
+  stage3_lgbm_bagging_fraction: 0.8
+  stage3_lgbm_bagging_freq: 0
+  stage3_lgbm_early_stopping_rounds: 0
+  stage3_use_gpu: false
+  stage3_wrapper_backend: lgbm  # lgbm|xgb_gpu
+  dcor_min_threshold: 0.0
+  dcor_min_percentile: 0.0
+  stage1_top_n: 0
+  dcor_fast_1d_enabled: false
+  dcor_fast_1d_bins: 2048
+  dcor_permutation_top_k: 0
+  dcor_pvalue_alpha: 0.05
+  # Stage 1 rolling dCor (exposed)
+  stage1_rolling_enabled: false
+  stage1_rolling_window: 2000
+  stage1_rolling_step: 500
+  stage1_rolling_min_periods: 200
+  stage1_rolling_max_rows: 20000
+  stage1_rolling_max_windows: 20
+  stage1_agg: median  # mean|median|min|max|p25|p75
+  stage1_use_rolling_scores: true
+  # Fractional diff cache/tuning (exposed)
+  fracdiff_cache_max_entries: 32
+  fracdiff_partition_threshold: 4096
+  # MI clustering (Stage 2) scalable options
+  mi_cluster_enabled: true
+  mi_cluster_method: agglo
+  mi_cluster_threshold: 0.3
+  mi_max_candidates: 400
+  mi_chunk_size: 128
+  cpcv_enabled: false
+  cpcv_n_groups: 6
+  cpcv_k_leave_out: 2
+  cpcv_purge: 0
+  cpcv_embargo: 0
+  adf_alpha: 0.05
+
+# Processing Pipeline Configuration
+# Settings for data processing and pipeline execution
+processing:
+  batch_size: 1000
+  chunk_size: "100MB"
+  max_workers: 4
+  timeout: 1800  # 30 minutes
+  continue_on_error: false
+  fail_fast: true
+
 # Logging Configuration
+# Logging settings for monitoring and debugging
 logging:
-  level: ${LOG_LEVEL:INFO}
+  level: INFO
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: ${LOG_FILE:logs/dynamic_stage0.log}
+  file: "pipeline.log"
   max_size: "100MB"
   backup_count: 5
-  
+
 # Monitoring Configuration
+# Performance monitoring and metrics collection
 monitoring:
   metrics_enabled: true
   dashboard_port: 8787
   health_check_interval: 30
-  
+
 # Output Configuration
+# Data output settings and file formats
 output:
-  format: feather
-  compression: lz4
-  partition_size: "1GB"
-  output_path: ${OUTPUT_PATH:data/processed_features/}
-  
+  output_path: "./output"
+  compression: "lz4"
+  format: "feather"
+  version: 2
+
 # Development Configuration
+# Development and debugging options
 development:
-  debug: ${DEBUG:false}
-  profile: ${PROFILE:false}
-  test_mode: ${TEST_MODE:false}
+  debug_mode: false
+  clean_existing_output: false
+  force_reprocessing: false
+  enable_profiling: false
+  log_memory_usage: true
+  validate_data: true
+
+# Pipeline Engine Configuration
+# Individual engine settings and execution order
+pipeline:
+  engines:
+    stationarization:
+      enabled: true
+      order: 1
+      description: "Stationarization techniques including fractional differentiation"
+      timeout: 300
+      retry_count: 3
+    statistical_tests:
+      enabled: true
+      order: 2
+      description: "Statistical tests and analysis"
+      timeout: 300
+      retry_count: 3
+    signal_processing:
+      enabled: true
+      order: 3
+      description: "Signal processing features"
+      timeout: 300
+      retry_count: 3
+    garch_models:
+      enabled: true
+      order: 4
+      description: "GARCH volatility modeling"
+      timeout: 300
+      retry_count: 3
+
+# Error Handling Configuration
+# Error handling and recovery settings
+error_handling:
+  continue_on_error: false
+  max_retries: 3
+  retry_delay: 5
+  critical_error_threshold: 1
+
+# Memory Management Configuration
+# Advanced memory management settings
+memory:
+  # RMM Configuration
+  rmm_pool_size_gb: 8.0
+  rmm_initial_pool_size_gb: 4.0
+  rmm_maximum_pool_size_gb: 16.0
+  rmm_memory_target_fraction: 0.8
+  rmm_memory_spill_threshold: 0.9
+  
+  # Chunked processing settings
+  chunk_size: 10000
+  chunk_overlap: 1000
+  max_memory_gb: 8.0
+  
+  # Spilling configuration
+  enable_spilling: true
+  spill_to_disk: true
+  spill_directory: "/tmp/gpu_spill"
+  
+  # Memory monitoring
+  monitor_memory: true
+  alert_threshold: 0.9
+  check_interval: 10
+
+# Performance Optimization Configuration
+# GPU and computation optimization settings
+optimization:
+  # GPU optimization
+  use_float32: true
+  optimize_column_order: true
+  avoid_cpu_transfers: true
+  
+  # Kernel optimization
+  enable_custom_kernels: true
+  kernel_compilation_timeout: 60
+  
+  # Memory optimization
+  batch_processing: true
+  batch_size: 1000
+  cleanup_after_batch: true
+  
+  # Convolution optimization
+  use_fft_for_large_kernels: true
+  fft_threshold: 129
+
+# Data Validation Configuration
+# Data quality and validation settings
+validation:
+  # Input validation
+  validate_input_data: true
+  required_columns: ["timestamp", "open", "high", "low", "close", "volume"]
+  expected_dtypes:
+    timestamp: "datetime64[ns]"
+    open: "float32"
+    high: "float32"
+    low: "float32"
+    close: "float32"
+    volume: "float32"
+  
+  # Output validation
+  validate_output_data: true
+  max_nan_percentage: 50.0
+  check_infinite_values: true
+  
+  # Data quality thresholds
+  min_rows: 100
+  max_missing_percentage: 20.0
+  outlier_threshold: 3.0
+
+# Security Configuration
+# Security and access control settings
+security:
+  # Database security
+  use_ssl: false
+  verify_ssl: true
+  
+  # R2 security
+  use_encryption: true
+  encryption_algorithm: "AES256"
+  
+  # Access control
+  require_authentication: true
+  session_timeout: 3600
+
+# Backup and Recovery Configuration
+# Data backup and recovery settings
+backup:
+  # Backup settings
+  enable_backup: true
+  backup_interval: 3600  # 1 hour
+  backup_retention_days: 7
+  
+  # Recovery settings
+  enable_auto_recovery: true
+  recovery_checkpoint_interval: 300  # 5 minutes
+  
+  # Storage settings
+  backup_directory: "./backups"
+  compression: "gzip"

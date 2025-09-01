@@ -1,0 +1,617 @@
+"""
+Data Processor for Dynamic Stage 0 Pipeline
+
+This module handles the processing of individual currency pairs through the feature engineering pipeline.
+"""
+
+import logging
+import sys
+import os
+from typing import Optional, Dict, Any
+from pathlib import Path
+
+import cudf
+import cupy as cp
+
+from config.unified_config import get_unified_config as get_settings
+from dask.distributed import Client, wait
+from data_io.db_handler import DatabaseHandler
+from data_io.local_loader import LocalDataLoader
+from features import StationarizationEngine, StatisticalTests, SignalProcessor, GARCHModels
+from features.base_engine import CriticalPipelineError
+
+logger = logging.getLogger(__name__)
+
+
+class DataProcessor:
+    """
+    Handles the processing of individual currency pairs through the feature engineering pipeline.
+    
+    This class encapsulates all the logic for:
+    - Loading data from various sources
+    - Applying feature engineering engines in the correct order
+    - Validating data at each step
+    - Saving processed results
+    - Error handling and recovery
+    """
+    
+    def __init__(self, client: Optional[Client] = None):
+        """Initialize the data processor."""
+        self.settings = get_settings()
+        self.loader = LocalDataLoader()
+        self.db_handler = DatabaseHandler()
+        self.db_connected = False
+        self.client = client
+        
+        # Initialize feature engines (pass client for Dask usage when available)
+        self.station = StationarizationEngine(self.settings, client)
+        self.stats = StatisticalTests(self.settings, client)
+        self.sig = SignalProcessor(self.settings, client)
+        self.garch = GARCHModels(self.settings, client)
+    
+    def process_currency_pair(self, currency_pair: str, r2_path: str) -> bool:
+        """
+        Process a single currency pair through the complete feature engineering pipeline.
+        
+        Args:
+            currency_pair: The currency pair symbol (e.g., 'EURUSD')
+            r2_path: Path to the data file in R2 storage
+            
+        Returns:
+            bool: True if processing was successful, False otherwise
+        """
+        try:
+            logger.info(f"Starting processing for {currency_pair}")
+            
+            # Connect to database for task tracking (non-fatal)
+            if not self.db_connected:
+                self.db_connected = self.db_handler.connect()
+                if not self.db_connected:
+                    logger.warning("Database unavailable; proceeding without task tracking")
+            
+            # Load data
+            gdf = self._load_currency_pair_data(r2_path)
+            if gdf is None:
+                self._register_task_failure(currency_pair, r2_path, "Failed to load data")
+                return False
+            
+            # Validate initial data
+            if not self._validate_initial_data(gdf, currency_pair):
+                self._register_task_failure(currency_pair, r2_path, "Initial data validation failed")
+                return False
+            
+            # Process through feature engines
+            gdf = self._apply_feature_engines(gdf, currency_pair)
+            if gdf is None:
+                self._register_task_failure(currency_pair, r2_path, "Feature engineering failed")
+                return False
+            
+            # Save processed data
+            if not self._save_processed_data(gdf, currency_pair):
+                self._register_task_failure(currency_pair, r2_path, "Data saving failed")
+                return False
+            
+            # Register successful completion
+            self._register_task_success(currency_pair, r2_path)
+            
+            logger.info(f"Successfully completed processing for {currency_pair}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error processing {currency_pair}: {e}", exc_info=True)
+            self._register_task_failure(currency_pair, r2_path, str(e))
+            return False
+        finally:
+            if self.db_connected:
+                try:
+                    self.db_handler.close()
+                except Exception:
+                    pass
+    
+    def _load_currency_pair_data(self, r2_path: str) -> Optional[cudf.DataFrame]:
+        """
+        Load currency pair data from the specified path.
+        
+        Args:
+            r2_path: Path to the data file
+            
+        Returns:
+            cuDF DataFrame if successful, None otherwise
+        """
+        try:
+            # Try loading as cuDF first
+            gdf = self.loader.load_currency_pair_data_feather_sync(r2_path)
+            if gdf is not None:
+                logger.info(f"Loaded data as cuDF: {len(gdf)} rows, {len(gdf.columns)} columns")
+                return gdf
+            
+            # Fallback to regular loading
+            gdf = self.loader.load_currency_pair_data_sync(r2_path)
+            if gdf is not None:
+                logger.info(f"Loaded data with fallback: {len(gdf)} rows, {len(gdf.columns)} columns")
+                return gdf
+            
+            logger.error(f"Failed to load data from {r2_path}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error loading data from {r2_path}: {e}", exc_info=True)
+            return None
+    
+    def _validate_initial_data(self, gdf: cudf.DataFrame, currency_pair: str) -> bool:
+        """
+        Validate the initial data before processing.
+        
+        Args:
+            gdf: The loaded cuDF DataFrame
+            currency_pair: Currency pair for logging
+            
+        Returns:
+            bool: True if validation passes, False otherwise
+        """
+        try:
+            logger.info(f"🔍 Validating initial data for {currency_pair}")
+            logger.info(f"📊 Shape: {gdf.shape}")
+            logger.info(f"📊 Rows: {len(gdf)}")
+            logger.info(f"📊 Columns: {len(gdf.columns)}")
+            logger.info(f"📊 ALL COLUMNS: {list(gdf.columns)}")
+            
+            # Check for empty DataFrame
+            if len(gdf) == 0:
+                logger.error(f"Empty DataFrame for {currency_pair}")
+                return False
+            
+            # Check for required columns
+            required_columns = self._get_required_columns()
+            missing_columns = [col for col in required_columns if col not in gdf.columns]
+            if missing_columns:
+                logger.warning(f"Missing required columns for {currency_pair}: {missing_columns}")
+                # Don't fail, just warn - some engines might work without all columns
+            
+            # Check for NaN values in critical columns
+            price_cols = [col for col in gdf.columns if any(term in col.lower() for term in ['open', 'high', 'low', 'close'])]
+            if price_cols:
+                for col in price_cols:
+                    nan_count = gdf[col].isna().sum()
+                    if nan_count > 0:
+                        logger.warning(f"Found {nan_count} NaN values in {col} for {currency_pair}")
+            
+            # Check data types
+            logger.info(f"📊 Data types: {gdf.dtypes.to_dict()}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating initial data for {currency_pair}: {e}", exc_info=True)
+            return False
+    
+    def _get_required_columns(self) -> list:
+        """Get the list of required columns for processing."""
+        return ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    
+    def _apply_feature_engines(self, gdf: cudf.DataFrame, currency_pair: str) -> Optional[cudf.DataFrame]:
+        """
+        Apply all feature engineering engines in the correct order.
+        
+        Args:
+            gdf: Input cuDF DataFrame
+            currency_pair: Currency pair for logging
+            
+        Returns:
+            Processed cuDF DataFrame if successful, None otherwise
+        """
+        try:
+            initial_cols = len(gdf.columns)
+            logger.info(f"Starting feature engineering for {currency_pair} with {initial_cols} initial columns")
+            
+            # Get engine configuration from settings
+            engine_config = self.settings.pipeline.engines  # dict[name -> PipelineEngineConfig]
+            # Execute engines in the correct order based on configuration (dataclass-friendly)
+            def _enabled(cfg):
+                try:
+                    return bool(getattr(cfg, 'enabled', True))
+                except Exception:
+                    return True
+            def _order(cfg):
+                try:
+                    return int(getattr(cfg, 'order', 999))
+                except Exception:
+                    return 999
+            engine_execution_order = sorted(
+                [(name, cfg) for name, cfg in engine_config.items() if _enabled(cfg)],
+                key=lambda x: _order(x[1])
+            )
+            
+            logger.info(f"🚀 Engine execution order: {[name for name, _ in engine_execution_order]}")
+            
+            # Execute each engine in order
+            for engine_name, engine_config in engine_execution_order:
+                if not engine_config.get('enabled', True):
+                    logger.info(f"⏭️ Skipping disabled engine: {engine_name}")
+                    continue
+                
+                logger.info("=" * 50)
+                logger.info(f"PROCESSING {currency_pair} - STAGE {engine_config.get('order', 0)}: {engine_name.upper()}")
+                logger.info("=" * 50)
+                try:
+                    desc = getattr(engine_config, 'description', 'No description')
+                except Exception:
+                    desc = 'No description'
+                logger.info(f"📝 Description: {desc}")
+                
+                rows_before = len(gdf)
+                cols_before = len(gdf.columns)
+                
+                try:
+                    # Execute the appropriate engine
+                    gdf = self._execute_engine(engine_name, gdf)
+                    if gdf is None:
+                        logger.error(f"Engine {engine_name} returned None for {currency_pair}")
+                        return None
+                    
+                    rows_after = len(gdf)
+                    cols_after = len(gdf.columns)
+                    new_cols = cols_after - cols_before
+                    
+                    logger.info(f"{engine_name.title()} complete: {cols_before} -> {cols_after} cols (+{new_cols} new), "
+                              f"{rows_before} -> {rows_after} rows ({rows_after - rows_before} change)")
+                    
+                    if new_cols > 0:
+                        new_col_names = [col for col in gdf.columns if col not in gdf.columns[:cols_before]]
+                        logger.info(f"New columns: {new_col_names[:10] + ['...'] if len(new_col_names) > 10 else new_col_names}")
+                    else:
+                        logger.warning(f"⚠️ No new columns generated by {engine_name}!")
+                    
+                    # Validate data after each engine
+                    if not self._validate_intermediate_data(gdf, currency_pair, engine_name):
+                        logger.error(f"Data validation failed after {engine_name} for {currency_pair}")
+                        return None
+                    
+                except Exception as e:
+                    logger.error(f"🚨 CRITICAL ERROR in {engine_name} Engine: {e}")
+                    if not self.settings.error_handling.continue_on_error:
+                        logger.error(f"🛑 Stopping pipeline immediately due to critical error in {engine_name}.")
+                        raise CriticalPipelineError(f"Engine {engine_name} failed: {e}")
+                    else:
+                        logger.warning(f"⚠️ Continuing pipeline despite error in {engine_name}")
+            
+            total_new_cols = len(gdf.columns) - initial_cols
+            logger.info("=" * 50)
+            logger.info(f"PROCESSING {currency_pair} - SUMMARY")
+            logger.info("=" * 50)
+            logger.info(f"Final cuDF shape: {len(gdf)} rows, {len(gdf.columns)} cols")
+            logger.info(f"Total new features created: +{total_new_cols} columns")
+            logger.info(f"Feature expansion: {initial_cols} -> {len(gdf.columns)} (+{(total_new_cols/initial_cols)*100:.1f}%)")
+            
+            return gdf
+            
+        except Exception as e:
+            logger.error(f"Error applying feature engines for {currency_pair}: {e}", exc_info=True)
+            return None
+    
+    def _execute_engine(self, engine_name: str, gdf: cudf.DataFrame) -> Optional[cudf.DataFrame]:
+        """
+        Execute a specific feature engineering engine.
+        
+        Args:
+            engine_name: Name of the engine to execute
+            gdf: Input cuDF DataFrame
+            
+        Returns:
+            Processed cuDF DataFrame if successful, None otherwise
+        """
+        try:
+            if engine_name == 'stationarization':
+                return self.station.process_currency_pair(gdf)
+            elif engine_name == 'statistical_tests':
+                return self.stats.process_cudf(gdf)
+            elif engine_name == 'signal_processing':
+                return self.sig.process_cudf(gdf)
+            elif engine_name == 'garch_models':
+                return self.garch.process_cudf(gdf)
+            else:
+                logger.warning(f"⚠️ Unknown engine: {engine_name}")
+                return gdf
+                
+        except Exception as e:
+            logger.error(f"Error executing engine {engine_name}: {e}", exc_info=True)
+            return None
+
+    def _execute_engine_dask(self, engine_name: str, ddf) -> Optional["dask_cudf.DataFrame"]:
+        """Execute a specific feature engineering engine on a dask_cudf DataFrame."""
+        try:
+            if engine_name == 'stationarization':
+                return self.station.process(ddf)
+            elif engine_name == 'statistical_tests':
+                return self.stats.process(ddf)
+            elif engine_name == 'signal_processing':
+                return self.sig.process(ddf)
+            elif engine_name == 'garch_models':
+                return self.garch.process(ddf)
+            else:
+                logger.warning(f"⚠️ Unknown engine: {engine_name}")
+                return ddf
+        except Exception as e:
+            logger.error(f"Error executing Dask engine {engine_name}: {e}", exc_info=True)
+            return None
+
+    def _validate_initial_data_dask(self, ddf, currency_pair: str) -> bool:
+        """Lightweight validation for dask_cudf DataFrame."""
+        try:
+            sample = ddf.head(1)
+            if sample.shape[0] == 0:
+                logger.error(f"Empty Dask DataFrame for {currency_pair}")
+                return False
+            logger.info(f"📊 Sample schema: {list(sample.columns)}")
+            return True
+        except Exception as e:
+            logger.error(f"Error validating initial Dask data for {currency_pair}: {e}")
+            return False
+
+    def _validate_intermediate_data_dask(self, ddf, currency_pair: str, engine_name: str) -> bool:
+        """Lightweight post-engine validation for dask_cudf DataFrame."""
+        try:
+            sample = ddf.head(100)
+            if sample.shape[0] == 0:
+                logger.error(f"Empty Dask DataFrame after {engine_name} for {currency_pair}")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Error validating Dask data for {currency_pair} after {engine_name}: {e}")
+            return False
+
+    def process_currency_pair_dask(self, currency_pair: str, r2_path: str, client: Client) -> bool:
+        """
+        Process a single currency pair using dask_cudf + multi-GPU engines on the driver.
+        """
+        try:
+            logger.info(f"Starting Dask processing for {currency_pair}")
+
+            if not self.db_connected:
+                self.db_connected = self.db_handler.connect()
+                if not self.db_connected:
+                    logger.warning("Database unavailable; proceeding without task tracking")
+
+            # Load Dask DataFrame: choose loader based on extension or availability
+            r2_lower = str(r2_path).lower()
+            ddf = None
+            try:
+                if r2_lower.endswith('.parquet'):
+                    ddf = self.loader.load_currency_pair_data(r2_path, client)
+                elif r2_lower.endswith('.feather'):
+                    ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
+                else:
+                    # Attempt feather (dir or file), then parquet
+                    ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
+                    if ddf is None:
+                        ddf = self.loader.load_currency_pair_data(r2_path, client)
+            except Exception as _e:
+                logger.warning(f"Primary load path failed: {_e}; trying fallbacks")
+                if ddf is None:
+                    ddf = self.loader.load_currency_pair_data(r2_path, client)
+            if ddf is None:
+                self._register_task_failure(currency_pair, r2_path, "Failed to load Dask data")
+                return False
+
+            # Attach context column for downstream engines (e.g., CPCV persistence)
+            try:
+                ddf = ddf.assign(currency_pair=currency_pair)
+            except Exception:
+                logger.debug("Could not attach currency_pair column to Dask DataFrame")
+
+            # Validate initial data
+            if not self._validate_initial_data_dask(ddf, currency_pair):
+                self._register_task_failure(currency_pair, r2_path, "Initial Dask data validation failed")
+                return False
+
+            # Engine execution order from settings
+            engine_config = self.settings.pipeline.engines
+            engine_execution_order = sorted(
+                [(name, config) for name, config in engine_config.items() if config.enabled],
+                key=lambda x: x[1].order
+            )
+            logger.info(f"🚀 Dask Engine execution order: {[name for name, _ in engine_execution_order]}")
+
+            # Execute each engine (Dask)
+            for engine_name, eng_cfg in engine_execution_order:
+                if not eng_cfg.enabled:
+                    logger.info(f"⏭️ Skipping disabled engine: {engine_name}")
+                    continue
+
+                logger.info("=" * 50)
+                logger.info(f"PROCESSING {currency_pair} (Dask) - STAGE {eng_cfg.order}: {engine_name.upper()}")
+                logger.info("=" * 50)
+                logger.info(f"📝 Description: {eng_cfg.description}")
+
+                ddf = self._execute_engine_dask(engine_name, ddf)
+                if ddf is None:
+                    logger.error(f"Engine {engine_name} returned None for {currency_pair}")
+                    return False
+
+                # Stabilize graph/memory between engines
+                ddf = ddf.persist()
+                wait(ddf)
+
+                if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
+                    logger.error(f"Dask data validation failed after {engine_name} for {currency_pair}")
+                    return False
+
+            # Compute to cuDF for saving as single Feather
+            logger.info("Computing final Dask DataFrame to cuDF for saving...")
+            gdf = ddf.compute()
+
+            # Save using existing cuDF saver
+            if not self._save_processed_data(gdf, currency_pair):
+                self._register_task_failure(currency_pair, r2_path, "Data saving failed")
+                return False
+
+            self._register_task_success(currency_pair, r2_path)
+            logger.info(f"Successfully completed Dask processing for {currency_pair}")
+            return True
+        except Exception as e:
+            logger.error(f"Error in Dask processing for {currency_pair}: {e}", exc_info=True)
+            self._register_task_failure(currency_pair, r2_path, str(e))
+            return False
+    
+    def _validate_intermediate_data(self, gdf: cudf.DataFrame, currency_pair: str, engine_name: str) -> bool:
+        """
+        Validate data after each engine execution.
+        
+        Args:
+            gdf: The cuDF DataFrame to validate
+            currency_pair: Currency pair for logging
+            engine_name: Name of the engine that was just executed
+            
+        Returns:
+            bool: True if validation passes, False otherwise
+        """
+        try:
+            # Check for empty DataFrame
+            if len(gdf) == 0:
+                logger.error(f"Empty DataFrame after {engine_name} for {currency_pair}")
+                return False
+            
+            # Check for excessive NaN values
+            nan_counts = gdf.isna().sum()
+            high_nan_cols = nan_counts[nan_counts > len(gdf) * 0.5]  # More than 50% NaN
+            if len(high_nan_cols) > 0:
+                logger.warning(f"High NaN columns after {engine_name} for {currency_pair}: {list(high_nan_cols.index)}")
+            
+            # Check for infinite values
+            inf_counts = gdf.isin([cp.inf, -cp.inf]).sum()
+            high_inf_cols = inf_counts[inf_counts > 0]
+            if len(high_inf_cols) > 0:
+                logger.warning(f"Infinite values found after {engine_name} for {currency_pair}: {list(high_inf_cols.index)}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error validating intermediate data for {currency_pair} after {engine_name}: {e}")
+            return False
+    
+    def _save_processed_data(self, gdf: cudf.DataFrame, currency_pair: str) -> bool:
+        """
+        Save the processed data to the output directory.
+        
+        Args:
+            gdf: The processed cuDF DataFrame
+            currency_pair: Currency pair for file naming
+            
+        Returns:
+            bool: True if saving was successful, False otherwise
+        """
+        try:
+            logger.info(f"Saving processed data with {len(gdf.columns)} columns to Feather v2 files for {currency_pair}")
+            
+            # Get the output path from settings
+            output_path = self.settings.output.output_path
+            compression = "lz4"  # Fast compression for Feather v2
+            
+            # Create output directory structure
+            import pathlib
+            import gc
+            import pyarrow.feather as feather
+            
+            output_dir = pathlib.Path(output_path) / currency_pair
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Log data statistics before saving
+            logger.info(f"Data shape: {gdf.shape}")
+            logger.info(f"Columns: {list(gdf.columns)}")
+            logger.info(f"Data types: {gdf.dtypes.to_dict()}")
+            
+            # Save using Feather v2 directly (cuDF DataFrame)
+            logger.info(f"Saving to: {output_dir} using Feather v2 (Arrow IPC)")
+            
+            # Convert cuDF DataFrame to Arrow and save
+            try:
+                # Convert to Arrow (CPU)
+                table = gdf.to_arrow()
+                
+                # Save as Feather v2
+                consolidated_path = output_dir / f"{currency_pair}.feather"
+                
+                feather.write_feather(
+                    table,
+                    str(consolidated_path),
+                    compression=compression,
+                    version=2  # Ensure Feather v2
+                )
+                
+                logger.info(f"Saved consolidated file: {consolidated_path} ({len(gdf)} rows)")
+                
+                # Clean up GPU memory
+                del table
+                gc.collect()
+                
+            except Exception as save_error:
+                logger.error(f"Error saving data: {save_error}")
+                raise
+            
+            # Verify the saved data
+            saved_files = list(output_dir.glob("*.feather"))
+            total_size_mb = sum(f.stat().st_size for f in saved_files) / (1024 * 1024)
+            
+            logger.info(f"Successfully saved processed data for {currency_pair}")
+            logger.info(f"Files created: {len(saved_files)}")
+            logger.info(f"Total size: {total_size_mb:.2f} MB")
+            
+            return True
+            
+        except Exception as save_error:
+            logger.error(f"Failed to save processed data for {currency_pair}: {save_error}", exc_info=True)
+            return False
+    
+    def _register_task_success(self, currency_pair: str, r2_path: str):
+        """Register successful task completion in the database."""
+        if not self.db_connected:
+            return
+        try:
+            task_id = self.db_handler.register_currency_pair(currency_pair, r2_path)
+            if task_id:
+                self.db_handler.update_task_status(task_id, 'COMPLETED')
+                logger.info(f"Successfully registered task completion for {currency_pair} (Task ID: {task_id})")
+            else:
+                logger.warning(f"Failed to register task in database for {currency_pair}")
+        except Exception as e:
+            logger.error(f"Error registering task success for {currency_pair}: {e}")
+    
+    def _register_task_failure(self, currency_pair: str, r2_path: str, error_message: str):
+        """Register task failure in the database."""
+        if not self.db_connected:
+            return
+        try:
+            task_id = self.db_handler.register_currency_pair(currency_pair, r2_path)
+            if task_id:
+                self.db_handler.update_task_status(task_id, 'FAILED', error_message)
+                logger.info(f"Registered task failure for {currency_pair} (Task ID: {task_id})")
+            else:
+                logger.warning(f"Failed to register task failure in database for {currency_pair}")
+        except Exception as e:
+            logger.error(f"Error registering task failure for {currency_pair}: {e}")
+
+
+def process_currency_pair_worker(currency_pair: str, r2_path: str) -> bool:
+    """
+    Worker function to process a single currency pair.
+    This function is designed to be serializable for Dask workers.
+    
+    Args:
+        currency_pair: Currency pair symbol (e.g., 'EURUSD')
+        r2_path: Path to the data file in R2 storage
+        
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
+    # Set up logging for the worker
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    try:
+        processor = DataProcessor()
+        return processor.process_currency_pair(currency_pair, r2_path)
+    except Exception as e:
+        logger.error(f"Error in worker processing {currency_pair}: {e}", exc_info=True)
+        return False

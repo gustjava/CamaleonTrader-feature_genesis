@@ -17,8 +17,8 @@ from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import QueuePool
 
-from config import get_config
-from config.settings import get_settings
+from config.unified_config import get_unified_config as get_config
+from config.unified_config import get_unified_config as get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,8 @@ class DatabaseHandler:
         """
         try:
             # Create database URL
-            db_url = self.config.get_database_url()
+            # Build DB URL from unified config
+            db_url = self.settings.database.get_url()
             
             # Create engine with connection pooling
             self.engine = create_engine(

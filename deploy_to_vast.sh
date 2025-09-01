@@ -20,6 +20,7 @@ REMOTE_DATA_DIR="/data" # Diretório para os parquets na instância remota
 
 # SSH
 SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/id_ed25519}"
+SSH_USER="root"
 
 # Configurações do Túnel MySQL
 LOCAL_MYSQL_PORT="3010"
@@ -53,10 +54,26 @@ echo "Usando vast CLI: $VAST_BIN"
 
 # --------------------------- SELEÇÃO/CONEXÃO INSTÂNCIA ------------------------------
 echo -e "\n--- Instâncias ativas ---"
-"$VAST_BIN" show instances --raw | jq -r '(["ID","Imagem","GPUs","Status"], (.[] | select(.actual_status=="running") | [.id, .image, .num_gpus, .status_msg])) | @tsv'
+INSTANCES_RAW="$("$VAST_BIN" show instances --raw)"
+echo "$INSTANCES_RAW" | jq -r '(["ID","Imagem","GPUs","Status"], (.[] | select(.actual_status=="running") | [.id, .image, .num_gpus, .status_msg])) | @tsv'
 echo "----------------------------------------------------------------------------------"
 
-read -rp "Digite o ID da instância vast.ai que deseja usar: " INSTANCE_ID
+# Seleciona a primeira instância em execução por padrão, caso o usuário apenas pressione Enter
+FIRST_INSTANCE_ID="$(echo "$INSTANCES_RAW" | jq -r '[.[] | select(.actual_status=="running")][0].id // empty')"
+if [[ -z "$FIRST_INSTANCE_ID" ]]; then
+  echo "❌ Nenhuma instância em execução encontrada."
+  exit 1
+fi
+
+if [[ -n "${AUTO:-}" || ! -t 0 ]]; then
+  # Modo não interativo ou AUTO: usa a primeira instância
+  INSTANCE_ID="${FIRST_INSTANCE_ID}"
+  echo "AUTO=1 ou stdin não interativo: usando a primeira instância ($INSTANCE_ID)"
+else
+  # Prompt com timeout de 5s; default para a primeira instância
+  read -t 5 -rp "Digite o ID da instância vast.ai (Enter para usar a primeira: $FIRST_INSTANCE_ID): " INSTANCE_ID || true
+fi
+INSTANCE_ID="${INSTANCE_ID:-$FIRST_INSTANCE_ID}"
 [[ -z "${INSTANCE_ID}" ]] && { echo "Erro: ID da instância vazio."; exit 1; }
 
 echo "✅ Instância selecionada: $INSTANCE_ID"
@@ -146,6 +163,10 @@ export MYSQL_USERNAME=root
 export MYSQL_PASSWORD=root
 export LOG_LEVEL=INFO
 export DEBUG=false
+# Configurações CUDA para evitar warnings deprecated
+export CUDA_USE_DEPRECATED_API=0
+export RMM_USE_NEW_CUDA_BINDINGS=1
+export CUDF_USE_NEW_CUDA_BINDINGS=1
 EOF
 )
 
@@ -164,80 +185,47 @@ echo \"Memória disponível: \$(free -h | grep Mem | awk '{print \$7}')\"
 echo \"Espaço em disco: \$(df -h / | tail -1 | awk '{print \$4}')\"
 echo \"GPUs disponíveis: \$(nvidia-smi --list-gpus | wc -l 2>/dev/null || echo '0')\"
 
-# Limpar cache do conda se necessário
-echo '--- [REMOTO] Limpando cache do conda...'
-conda clean --all -y || true
+# Verificar e ativar ambiente (já criado pelo onstart.sh)
+echo '--- [REMOTO] Verificando ambiente conda...'
 
-# Verificar se mamba está disponível, se não, instalar
-if ! command -v mamba &> /dev/null; then
-    echo 'Instalando mamba...'
-    conda install mamba -n base -c conda-forge -y
-fi
-
-# Tentar criar/atualizar ambiente com diferentes abordagens
-echo '--- [REMOTO] Criando/atualizando ambiente...'
-
-# Tentar criar/atualizar ambiente com diferentes abordagens
-echo '--- [REMOTO] Criando/atualizando ambiente...'
-
-# Tentar criar/atualizar ambiente
+echo '--- [REMOTO] Verificando ambiente conda...'
 if conda env list | grep -q 'dynamic-stage0'; then
-    echo 'Atualizando ambiente existente...'
-    # Tentar mamba primeiro
-    if mamba env update -f environment.yml --prune; then
-        echo '✅ Mamba atualizou ambiente com sucesso.'
-    else
-        echo 'Mamba falhou, tentando conda...'
-        if conda env update -f environment.yml --prune; then
-            echo '✅ Conda atualizou ambiente com sucesso.'
-        else
-            echo '❌ Falha na atualização do ambiente.'
-        fi
-    fi
+    echo '✅ Ambiente dynamic-stage0 encontrado, ativando...'
+    conda activate dynamic-stage0
 else
-    echo 'Criando novo ambiente...'
-    # Tentar mamba primeiro
-    if mamba env create -f environment.yml; then
-        echo '✅ Mamba criou ambiente com sucesso.'
-    else
-        echo 'Mamba falhou, tentando conda...'
-        if conda env create -f environment.yml; then
-            echo '✅ Conda criou ambiente com sucesso.'
-        else
-            echo '❌ Falha na criação do ambiente. Tentando abordagem alternativa...'
-            # Tentar criar ambiente básico e depois instalar RAPIDS
-            conda create -n dynamic-stage0 python=3.10 -y
-            conda activate dynamic-stage0
-            conda install -c rapidsai -c conda-forge -c nvidia rapids=24.06 cuda-version=12.5 -y
-            conda install -c conda-forge jupyterlab ipykernel pytest black flake8 -y
-            echo '✅ Ambiente criado com abordagem alternativa.'
-        fi
-    fi
+    echo '⚠️  Ambiente dynamic-stage0 não encontrado!'
+    echo 'Usando ambiente base (RAPIDS já instalado)...'
+    # Não ativar nenhum ambiente específico, usar o base
 fi
-
-
-
-
-
-# Ativar ambiente
-conda activate dynamic-stage0
 
 echo '--- [REMOTO] Instalando dependências adicionais...'
-conda install -c conda-forge sqlalchemy pymysql -y
+conda install -c conda-forge sqlalchemy pymysql cryptography lightgbm -y || true
+
+echo '--- [REMOTO] Verificando se rclone está instalado...'
+if ! command -v rclone &> /dev/null; then
+    echo 'rclone não encontrado, instalando...'
+    curl https://rclone.org/install.sh | bash
+else
+    echo 'rclone já está instalado'
+fi
+
+echo '--- [REMOTO] Configurando rclone com credenciais seguras...'
+# Configurar rclone de forma segura
+mkdir -p ~/.config/rclone
+cat > ~/.config/rclone/rclone.conf << 'EOF'
+[R2]
+type = s3
+provider = Cloudflare
+access_key_id = 0e315105695707ca4fe1e5f83a38f807
+secret_access_key = 5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515
+endpoint = https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com
+EOF
 
 echo '--- [REMOTO] Sincronizando dados do R2...'
 $REMOTE_ENV_EXPORTS
 
-# **CORREÇÃO**: Cria o arquivo de config do rclone manualmente.
-# Este método é mais robusto e compatível com versões mais antigas do rclone
-# que não possuem a flag --non-interactive.
-mkdir -p ~/.config/rclone
-echo \"[R2]
-type = s3
-provider = Cloudflare
-access_key_id = \$R2_ACCESS_KEY
-secret_access_key = \$R2_SECRET_KEY
-endpoint = \$R2_ENDPOINT_URL\" > ~/.config/rclone/rclone.conf
+# Criar diretório de dados se não existir
+mkdir -p \"$REMOTE_DATA_DIR\"
 
 # Sync data from R2
 rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress
@@ -248,34 +236,21 @@ ls -la \"$REMOTE_DATA_DIR\" || echo \"Diretório $REMOTE_DATA_DIR não existe\"
 
 # Check for master_features files specifically
 echo '--- [REMOTO] Verificando arquivos master_features...'
-MASTER_FEATURES_FILES=$(find \"$REMOTE_DATA_DIR\" -name \"*_master_features.parquet\" -type f 2>/dev/null | head -10)
-if [[ -n \"$MASTER_FEATURES_FILES\" ]]; then
-    echo \"Arquivos master_features encontrados:\"
-    echo \"$MASTER_FEATURES_FILES\"
-else
-    echo \"Nenhum arquivo master_features encontrado\"
-fi
+find \"$REMOTE_DATA_DIR\" -name \"*_master_features.parquet\" -type f 2>/dev/null | head -10 || echo \"Nenhum arquivo master_features encontrado\"
 
 # If no master_features files found, try to find any parquet files
 echo '--- [REMOTO] Verificando outros arquivos parquet...'
-PARQUET_FILES=$(find \"$REMOTE_DATA_DIR\" -name \"*.parquet\" -type f 2>/dev/null | head -10)
-if [[ -n \"$PARQUET_FILES\" ]]; then
-    echo \"Arquivos parquet encontrados:\"
-    echo \"$PARQUET_FILES\"
-else
-    echo \"Nenhum arquivo parquet encontrado\"
-fi
+find \"$REMOTE_DATA_DIR\" -name \"*.parquet\" -type f 2>/dev/null | head -10 || echo \"Nenhum arquivo parquet encontrado\"
 
-# Check if we have any data files to work with
-if [[ -z \"$MASTER_FEATURES_FILES\" && -z \"$PARQUET_FILES\" ]]; then
+# Simple check if directory has any data files
+echo '--- [REMOTO] Verificando se há arquivos de dados...'
+if ! ls \"$REMOTE_DATA_DIR\"/*.parquet 1>/dev/null 2>&1; then
     echo \"⚠️  AVISO: Nenhum arquivo de dados encontrado. O pipeline pode falhar.\"
     echo \"   Verifique se o R2 bucket contém os arquivos necessários.\"
     echo \"   Arquivos esperados: *_master_features.parquet\"
 fi
 
 echo '--- [REMOTO] Iniciando pipeline...'
-# Suppress CUDA deprecation warnings
-export PYTHONWARNINGS="ignore::FutureWarning:distributed.diagnostics.rmm,ignore::FutureWarning:rmm"
 python orchestration/main.py
 "
 
@@ -296,4 +271,3 @@ echo "   • Ver logs do túnel: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
 echo "   • Gerenciar túneis: ./manage_tunnels.sh list|stop|stop-all"
 echo ""
 echo "⚠️  IMPORTANTE: O túnel continuará rodando mesmo após fechar esta sessão!"
-

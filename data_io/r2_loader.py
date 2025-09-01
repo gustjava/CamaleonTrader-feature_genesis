@@ -12,10 +12,10 @@ from pathlib import Path
 
 import dask_cudf
 import cudf
-from dask.distributed import Client
+from dask.distributed import Client, wait
 
 from config import get_config
-from config.settings import get_settings
+from config.unified_config import get_unified_config as get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +164,7 @@ class R2DataLoader:
                 logger.info("Distributing data across GPU cluster...")
                 df = df.persist()
                 # Wait for data to be loaded and distributed
-                client.wait(df)
+                wait(df)
             
             # Get basic information about the loaded data
             num_partitions = df.npartitions
