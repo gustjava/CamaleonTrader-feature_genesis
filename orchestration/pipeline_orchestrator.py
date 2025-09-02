@@ -65,10 +65,30 @@ class PipelineOrchestrator:
         self.db_handler = DatabaseHandler()
         self.local_loader = LocalDataLoader()
         self.emergency_shutdown = threading.Event()
+        self.current_run_id: Optional[int] = None
         
         # Set up signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+    # ---------------- Run lifecycle ----------------
+    def start_run(self, dashboard_url: Optional[str] = None, hostname: Optional[str] = None) -> Optional[int]:
+        try:
+            if not self.db_handler.connect():
+                logger.warning("Database unavailable; run lifecycle tracking disabled.")
+                return None
+            self.current_run_id = self.db_handler.create_run(hostname=hostname, dashboard_url=dashboard_url)
+            return self.current_run_id
+        except Exception as e:
+            logger.warning(f"Could not start pipeline run: {e}")
+            return None
+
+    def end_run(self, status: str = 'COMPLETED') -> None:
+        try:
+            if self.current_run_id:
+                self.db_handler.end_run(self.current_run_id, status=status)
+        except Exception as e:
+            logger.warning(f"Could not end pipeline run: {e}")
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -229,7 +249,7 @@ class PipelineOrchestrator:
         logger.info("STARTING DRIVER-SIDE PROCESSING (MULTI-GPU PER TASK)")
         logger.info("=" * 60)
 
-        processor = DataProcessor(client)
+        processor = DataProcessor(client, run_id=self.current_run_id)
         successful_tasks = 0
         failed_tasks = 0
 

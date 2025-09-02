@@ -15,7 +15,7 @@
 database:
   host: ${MYSQL_HOST:localhost}
   port: ${MYSQL_PORT:3010}
-  database: ${MYSQL_DATABASE:dynamic_stage0_db}
+  database: ${MYSQL_DATABASE:feature_genesis_db}
   username: ${MYSQL_USERNAME:root}
   password: ${MYSQL_PASSWORD:root}
   charset: utf8mb4
@@ -94,7 +94,7 @@ features:
   
   # Distance correlation configuration
   distance_corr:
-    max_samples: 10000
+    max_samples: 1000
   
   # Empirical Mode Decomposition configuration
   emd:
@@ -103,8 +103,11 @@ features:
     max_iterations: 100
   
   # Statistical tests parameters
+  distance_corr_max_samples: 1000
   distance_corr_tile_size: 2048
-  selection_target_column: y_ret_1m
+  selection_target_column: y_ret_fwd_15m
+  # Optional list to run multi-target sweep (per run, per pair)
+  selection_target_columns: []
   dcor_top_k: 50
   dcor_include_permutation: true
   dcor_permutations: 100
@@ -126,12 +129,13 @@ features:
   stage3_lgbm_early_stopping_rounds: 0
   stage3_use_gpu: true
   stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
-  dcor_min_threshold: 0.0
+  dcor_min_threshold: 0.05
   dcor_min_percentile: 0.0
-  stage1_top_n: 0
+  stage1_top_n: 100
   dcor_fast_1d_enabled: true
   dcor_fast_1d_bins: 2048
-  dcor_permutation_top_k: 20
+  dcor_permutation_top_k: 50
+  dcor_permutations: 100
   dcor_pvalue_alpha: 0.05
   # Stage 1 batching for progress visibility
   dcor_batch_size: 64
@@ -140,10 +144,26 @@ features:
   stage1_rolling_window: 2000
   stage1_rolling_step: 500
   stage1_rolling_min_periods: 200
+  # Minimum pairwise valid observations per rolling window (handles sparse/off-hours data)
+  stage1_rolling_min_valid_pairs: 200
   stage1_rolling_max_rows: 20000
   stage1_rolling_max_windows: 20
   stage1_agg: median  # mean|median|min|max|p25|p75
   stage1_use_rolling_scores: true
+  # Dataset schema/feature gating (leakage control)
+  dataset_target_columns: []         # list of label/target columns present in the dataset
+  dataset_target_prefixes: ["m1_", "m2_", "m3_", "m4_", "m5_", "m6_", "m7_", "m8_", "m9_"]  # model targets m1..m9
+  feature_allowlist: []              # exact feature names allowed (if non-empty, acts as allowlist)
+  feature_allow_prefixes: []         # prefixes allowed (any match passes allowlist)
+  feature_denylist: ["y_tick_volume", "y_total_volume"]  # exclude raw volume features
+  feature_deny_prefixes: ["y_ret_fwd_"]  # exclude all forward-return labels by default
+  feature_deny_regex: []             # regex patterns to exclude (optional)
+  metrics_prefixes: ["dcor_", "dcor_roll_", "dcor_pvalue_", "stage1_", "cpcv_"]
+  # Visibility controls
+  stage1_broadcast_scores: false   # if true, add dcor_* columns (1 per feature)
+  stage1_broadcast_rolling: false  # if true, add dcor_roll_* and dcor_roll_cnt_* columns
+  debug_write_artifacts: true      # persist JSON artifacts for transparency
+  artifacts_dir: artifacts         # subfolder under output_path
   # Fractional diff cache/tuning (exposed)
   fracdiff_cache_max_entries: 32
   fracdiff_partition_threshold: 4096
@@ -159,6 +179,96 @@ features:
   cpcv_purge: 0
   cpcv_embargo: 0
   adf_alpha: 0.05
+  # Stage 1 explicit candidates (no regex)
+  station_candidates_include:
+    # OHLC níveis e derivados de nível
+    - y_open
+    - y_high
+    - y_low
+    - y_close
+    - y_weighted_close
+    - y_typical_price
+    # Médias móveis (nível)
+    - y_sma_20
+    - y_sma_60
+    - y_ema_12
+    - y_ema_26
+    # VWAP e distâncias (nível)
+    - y_vwap_20
+    - y_vwap_distance
+    - y_vwap_60m_distance
+    # Bollinger (nível/largura)
+    - y_bb_lower_20_2
+    - y_bb_upper_20_2
+    - y_bb_width_20
+    # Volatilidade/Range
+    - y_atr_14
+    - y_true_range
+    - y_parkinson_30m
+    - y_garman_klass_vol
+    - y_gk_vol_30m
+    - y_rv_30m
+    - y_tick_volatility
+    # Donchian (nível/largura)
+    - y_donchian_channels_20
+    - y_donchian_lower_20
+    - y_donchian_upper_20
+    - y_donchian_width_20
+    # Spreads (nível)
+    - y_avg_spread
+    - y_max_spread
+    - y_min_spread
+    - y_spread_lvl
+    # Morfologia / preços derivados (nível)
+    - y_body_size
+    - y_range_size
+    - y_range_pct
+    - y_gap_open
+    - y_price_change
+    - y_price_changes_count
+    - y_price_velocity
+  station_candidates_exclude:
+    - y_avg_spread_relative
+    - y_spread_rel
+    - y_spread_rel_z_15m
+    - y_close_z_60m
+    - y_close_z_240m
+    - y_z_60m_close
+    - y_z_240m_close
+    - y_obv_z_60m
+    - y_atr_z_60m
+    - y_tr_z_60m
+    - y_vwap_60m_distance_slope
+    - y_corr_30m
+    - y_corr_60m
+    - y_corr_dxy_1h
+    - y_corr_dxy_4h
+    - y_beta_240m
+    - beta240_y_on_brent
+    - beta240_y_on_dxy
+    - beta240_y_on_spx
+    - corr30_ofi_y_dxy
+    - corr30_ret_ofi_y
+    - corr30_tickvol_y_spx
+    - corr60_y_dxy
+    - corr60_y_spx
+    - y_interaction_spread_ofi
+    - y_interaction_vol_beta
+    # Targets / leakage guard (já cobertos por outras listas de negação)
+    - y_ret_fwd_1m
+    - y_ret_fwd_3m
+    - y_ret_fwd_5m
+    - y_ret_fwd_10m
+    - y_ret_fwd_15m
+    - y_ret_fwd_20m
+    - y_ret_fwd_30m
+    - y_ret_fwd_60m
+    - y_ret_fwd_120m
+    - y_ret_fwd_240m
+  # If true, drops original columns after creating frac_diff_<col>
+  drop_original_after_transform: true
+  # If true, drops features that didn't pass Stage 1 retention gates
+  drop_nonretained_after_stage1: true
 
 # Processing Pipeline Configuration
 # Settings for data processing and pipeline execution

@@ -161,52 +161,14 @@ EOF
 PIPELINE_CMD="
 set -e
 echo '--- [REMOTO] Verificando processos existentes...'
-KILL_EXISTING=\"1\"
-# Verificar se há processos do pipeline rodando
 EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | sed -E 's/^[[:space:]]*([0-9]+).*/\1/')
 if [ -n \"\$EXISTING_PIDS\" ]; then
     COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w)
-    echo \"🚨🚨🚨 ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
+    echo \"⚠️  ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
     ps -fp \$EXISTING_PIDS 2>/dev/null || true
-    if [ \"\$KILL_EXISTING\" = \"1\" ]; then
-        echo '🧹 Encerrando processos antigos antes de iniciar novo pipeline...'
-        for pid in \$EXISTING_PIDS; do
-            kill \"\$pid\" 2>/dev/null || true
-        done
-        sleep 5
-        STILL=\$(ps -p \$EXISTING_PIDS -o pid= 2>/dev/null | tr -s ' ')
-        if [ -n \"\$STILL\" ]; then
-            echo \"⚠️  Forçando encerramento (SIGKILL) dos PIDs: \$STILL\"
-            for pid in \$STILL; do
-                kill -9 \"\$pid\" 2>/dev/null || true
-            done
-            sleep 1
-        fi
-        # Aguarda até que todos os processos antigos terminem de fato
-        WAITED=0
-        while :; do
-            REMAIN=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | sed -E 's/^[[:space:]]*([0-9]+).*/\1/')
-            if [ -z \"\$REMAIN\" ]; then
-                echo '✅ Todos os processos anteriores foram encerrados.'
-                break
-            fi
-            echo \"⏳ Aguardando processos terminarem: \$REMAIN (t=\$WAITED s)\"
-            if [ \"\$WAITED\" -ge 60 ]; then
-                echo '⚠️  Timeout de 60s; reforçando SIGKILL'
-                for pid in \$REMAIN; do
-                    kill -9 \"\$pid\" 2>/dev/null || true
-                done
-                sleep 2
-            else
-                sleep 2
-            fi
-            WAITED=\$((\$WAITED+2))
-        done
-        echo '✅ Processos antigos encerrados.'
-    else
-        echo '🚨🚨🚨 CONTINUANDO EM 5 SEGUNDOS... 🚨🚨🚨'
-        sleep 5
-    fi
+    echo \"⚠️  Processos existentes detectados. Verifique se deseja continuar.\"
+    echo \"Aguardando 10 segundos antes de continuar...\"
+    sleep 10
 else
     echo '✅ Nenhum processo do pipeline detectado. Continuando...'
 fi

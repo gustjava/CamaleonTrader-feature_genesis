@@ -88,16 +88,47 @@ class DaskClusterManager:
         try:
             from rmm import reinitialize
             
-            # Use configuration from unified config
-            initial_pool_size = int(self.config.dask.rmm_initial_pool_size.replace('GB', '')) * 1024**3
-            
-            reinitialize(
-                pool_allocator=True,
-                initial_pool_size=initial_pool_size,
-                managed_memory=False
-            )
-            
-            logger.info(f"✅ RMM configured with {initial_pool_size / (1024**3):.1f}GB pool")
+            # Determine safe pool sizes based on actual device memory
+            def parse_size_gb(val: str) -> float:
+                v = str(val).strip().upper()
+                if v.endswith('GB'):
+                    return float(v[:-2])
+                if v.endswith('MB'):
+                    return float(v[:-2]) / 1024.0
+                return float(v)
+
+            try:
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+                total_gb = total_b / (1024 ** 3)
+            except Exception:
+                total_gb = 8.0  # conservative fallback
+
+            desired_pool_gb = parse_size_gb(self.config.dask.rmm_pool_size)
+            desired_init_gb = parse_size_gb(self.config.dask.rmm_initial_pool_size)
+
+            # Cap to 60% of total GPU memory to avoid pool overallocation
+            cap_gb = max(0.25, total_gb * 0.60)
+            safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb))
+            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb))
+
+            # Persist safe values for cluster kwargs
+            self._safe_rmm_pool_size_str = f"{safe_pool_gb:.2f}GB"
+            initial_pool_size = int(safe_init_gb * (1024 ** 3))
+
+            # Try CUDA malloc async pool first if available, else classic pool
+            try:
+                reinitialize(
+                    pool_allocator=True,
+                    initial_pool_size=initial_pool_size,
+                    managed_memory=False
+                )
+                logger.info(
+                    "✅ RMM configured (pool) with %.2fGB initial (cap=%.2fGB of %.2fGB)",
+                    safe_init_gb, cap_gb, total_gb
+                )
+            except Exception as e_pool:
+                logger.warning("RMM pool init failed (%s). Falling back to default CUDA allocator.", e_pool)
+                os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
             
         except ImportError:
             logger.warning("⚠️ RMM not available, using default CUDA memory management")
@@ -137,7 +168,8 @@ class DaskClusterManager:
             cluster_kwargs = {
                 'n_workers': gpu_count,
                 'threads_per_worker': self.config.dask.threads_per_worker,
-                'rmm_pool_size': self.config.dask.rmm_pool_size,
+                # Use safe pool size string if computed during RMM config
+                'rmm_pool_size': getattr(self, '_safe_rmm_pool_size_str', self.config.dask.rmm_pool_size),
                 'local_directory': self.config.dask.local_directory,
             }
 
@@ -296,6 +328,15 @@ def run_pipeline():
                 logger.error("Failed to get Dask client")
                 raise RuntimeError("Failed to get Dask client.")
             
+            # Start DB-backed run lifecycle (best-effort)
+            try:
+                orchestrator.start_run(
+                    dashboard_url=getattr(client, 'dashboard_link', None),
+                    hostname=cluster_manager.hostname,
+                )
+            except Exception as e:
+                logger.warning(f"Run lifecycle tracking unavailable: {e}")
+
             # Execute the pipeline
             result = orchestrator.execute_pipeline(cluster_manager, client)
             
@@ -308,9 +349,16 @@ def run_pipeline():
             # Check if emergency shutdown was triggered
             if result.emergency_shutdown:
                 logger.critical("🚨 PIPELINE STOPPED DUE TO EMERGENCY SHUTDOWN")
-                return 1
+                try:
+                    orchestrator.end_run(status='ABORTED')
+                finally:
+                    return 1
             
-            return 0 if result.failed_tasks == 0 else 1
+            exit_code = 0 if result.failed_tasks == 0 else 1
+            try:
+                orchestrator.end_run(status='COMPLETED' if exit_code == 0 else 'FAILED')
+            finally:
+                return exit_code
 
     except Exception as e:
         logger.error(f"FATAL PIPELINE ERROR: {e}", exc_info=True)

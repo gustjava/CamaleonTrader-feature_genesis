@@ -35,13 +35,14 @@ class DataProcessor:
     - Error handling and recovery
     """
     
-    def __init__(self, client: Optional[Client] = None):
+    def __init__(self, client: Optional[Client] = None, run_id: Optional[int] = None):
         """Initialize the data processor."""
         self.settings = get_settings()
         self.loader = LocalDataLoader()
         self.db_handler = DatabaseHandler()
         self.db_connected = False
         self.client = client
+        self.run_id = run_id
         
         # Initialize feature engines (pass client for Dask usage when available)
         self.station = StationarizationEngine(self.settings, client)
@@ -226,12 +227,12 @@ class DataProcessor:
             
             # Execute each engine in order
             for engine_name, engine_config in engine_execution_order:
-                if not engine_config.get('enabled', True):
+                if not getattr(engine_config, 'enabled', True):
                     logger.info(f"⏭️ Skipping disabled engine: {engine_name}")
                     continue
                 
                 logger.info("=" * 50)
-                logger.info(f"PROCESSING {currency_pair} - STAGE {engine_config.get('order', 0)}: {engine_name.upper()}")
+                logger.info(f"PROCESSING {currency_pair} - STAGE {getattr(engine_config, 'order', 0)}: {engine_name.upper()}")
                 logger.info("=" * 50)
                 try:
                     desc = getattr(engine_config, 'description', 'No description')
@@ -335,6 +336,63 @@ class DataProcessor:
             logger.error(f"Error executing Dask engine {engine_name}: {e}", exc_info=True)
             return None
 
+    def _save_intermediate_data(self, ddf_or_gdf, currency_pair: str, engine_name: str):
+        """Optionally save an intermediate checkpoint after an engine.
+
+        Applies the same metric-column filtering as the final save when configured.
+        """
+        try:
+            # Check toggle
+            if not bool(getattr(self.settings.output, 'save_intermediate_per_engine', False)):
+                return
+            # Compute to cuDF if needed
+            try:
+                import dask_cudf  # noqa: F401
+                is_dask = hasattr(ddf_or_gdf, 'compute') and not hasattr(ddf_or_gdf, 'to_arrow')
+            except Exception:
+                is_dask = hasattr(ddf_or_gdf, 'compute') and not hasattr(ddf_or_gdf, 'to_arrow')
+            gdf = ddf_or_gdf.compute() if is_dask else ddf_or_gdf
+
+            # Drop metric columns if configured
+            try:
+                if bool(getattr(self.settings.features, 'drop_metric_columns_on_intermediate', True)):
+                    metrics_prefixes = list(getattr(self.settings.features, 'metrics_prefixes', []))
+                    to_drop = [c for c in gdf.columns if any(c.startswith(p) for p in metrics_prefixes)]
+                    if to_drop:
+                        gdf = gdf.drop(columns=to_drop)
+            except Exception:
+                pass
+
+            # Prepare path
+            import pathlib
+            out_dir = pathlib.Path(self.settings.output.output_path) / currency_pair / 'checkpoint'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # File name per engine
+            fname = f"{engine_name}." + ('parquet' if str(getattr(self.settings.output, 'intermediate_format', 'parquet')).lower() == 'parquet' else 'feather')
+
+            # Save
+            fmt = str(getattr(self.settings.output, 'intermediate_format', 'parquet')).lower()
+            if fmt == 'feather':
+                import pyarrow.feather as feather
+                table = gdf.to_arrow()
+                feather.write_feather(
+                    table,
+                    str(out_dir / fname),
+                    compression=str(getattr(self.settings.output, 'intermediate_compression', 'zstd')),
+                    version=int(getattr(self.settings.output, 'intermediate_version', 2)),
+                )
+            else:
+                import pyarrow.parquet as pq
+                table = gdf.to_arrow()
+                pq.write_table(
+                    table,
+                    str(out_dir / fname),
+                    compression=str(getattr(self.settings.output, 'intermediate_compression', 'zstd')),
+                )
+            logger.info(f"Saved intermediate checkpoint: {out_dir / fname}")
+        except Exception as e:
+            logger.warning(f"Could not save intermediate checkpoint for {engine_name}: {e}")
+
     def _validate_initial_data_dask(self, ddf, currency_pair: str) -> bool:
         """Lightweight validation for dask_cudf DataFrame."""
         try:
@@ -367,10 +425,26 @@ class DataProcessor:
         try:
             logger.info(f"Starting Dask processing for {currency_pair}")
 
+            task_id = None
             if not self.db_connected:
                 self.db_connected = self.db_handler.connect()
                 if not self.db_connected:
                     logger.warning("Database unavailable; proceeding without task tracking")
+            # Register task and set RUNNING status (best-effort)
+            if self.db_connected:
+                try:
+                    task_id = self.db_handler.register_currency_pair(currency_pair, r2_path)
+                    if task_id:
+                        self.db_handler.update_task_status(task_id, 'RUNNING')
+                        # Attach context to engines for metrics/artifacts
+                        try:
+                            for eng in (self.station, self.stats, self.sig, self.garch):
+                                if hasattr(eng, 'set_task_context'):
+                                    eng.set_task_context(self.run_id, task_id, self.db_handler)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Could not register task in DB: {e}")
 
             # Load Dask DataFrame: choose loader based on extension or availability
             r2_lower = str(r2_path).lower()
@@ -422,18 +496,64 @@ class DataProcessor:
                 logger.info(f"PROCESSING {currency_pair} (Dask) - STAGE {eng_cfg.order}: {engine_name.upper()}")
                 logger.info("=" * 50)
                 logger.info(f"📝 Description: {eng_cfg.description}")
+                # Stage DB start (schema deltas based on columns only, rows unknown for Dask)
+                stage_id = None
+                try:
+                    cols_before = len(ddf.columns)
+                    cols_before_set = set(list(ddf.columns))
+                except Exception:
+                    cols_before = None
+                    cols_before_set = None
+                if self.db_connected:
+                    try:
+                        stage_id = self.db_handler.start_stage(self.run_id, task_id, engine_name,
+                                                               rows_before=None, cols_before=cols_before,
+                                                               message=f"{currency_pair}")
+                    except Exception:
+                        stage_id = None
 
-                ddf = self._execute_engine_dask(engine_name, ddf)
-                if ddf is None:
-                    logger.error(f"Engine {engine_name} returned None for {currency_pair}")
-                    return False
+                try:
+                    ddf = self._execute_engine_dask(engine_name, ddf)
+                    if ddf is None:
+                        raise RuntimeError(f"Engine {engine_name} returned None")
 
-                # Stabilize graph/memory between engines
-                ddf = ddf.persist()
-                wait(ddf)
+                    # Stabilize graph/memory between engines
+                    ddf = ddf.persist()
+                    wait(ddf)
 
-                if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
-                    logger.error(f"Dask data validation failed after {engine_name} for {currency_pair}")
+                    if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
+                        raise RuntimeError(f"Validation failed after {engine_name}")
+
+                    # Save intermediate checkpoint if enabled
+                    try:
+                        self._save_intermediate_data(ddf, currency_pair, engine_name)
+                    except Exception:
+                        pass
+
+                    # Stage DB end
+                    if self.db_connected and stage_id:
+                        try:
+                            cols_after = len(ddf.columns)
+                            new_cols = (cols_after - cols_before) if (cols_before is not None and cols_after is not None) else None
+                            details = None
+                            try:
+                                if cols_before_set is not None:
+                                    cols_after_set = set(list(ddf.columns))
+                                    added = sorted(list(cols_after_set - cols_before_set))
+                                    import json as _json
+                                    details = _json.dumps({'new_columns': added}, ensure_ascii=False)
+                            except Exception:
+                                details = None
+                            self.db_handler.end_stage(stage_id, rows_after=None, cols_after=cols_after, new_cols=new_cols, details=details)
+                        except Exception:
+                            pass
+                except Exception as eng_err:
+                    logger.error(f"🚨 Engine {engine_name} failed for {currency_pair}: {eng_err}", exc_info=True)
+                    if self.db_connected and stage_id:
+                        try:
+                            self.db_handler.error_stage(stage_id, error_message=str(eng_err))
+                        except Exception:
+                            pass
                     return False
 
             # Compute to cuDF for saving as single Feather
@@ -515,6 +635,17 @@ class DataProcessor:
             output_dir = pathlib.Path(output_path) / currency_pair
             output_dir.mkdir(parents=True, exist_ok=True)
             
+            # Optionally drop internal metrics columns before saving
+            try:
+                if bool(getattr(self.settings.features, 'drop_metric_columns_on_save', True)):
+                    metrics_prefixes = list(getattr(self.settings.features, 'metrics_prefixes', []))
+                    to_drop = [c for c in gdf.columns if any(c.startswith(p) for p in metrics_prefixes)]
+                    if to_drop:
+                        logger.info(f"Dropping {len(to_drop)} metrics columns before save (prefix filter)")
+                        gdf = gdf.drop(columns=to_drop)
+            except Exception as e:
+                logger.warning(f"Could not drop metrics columns: {e}")
+
             # Log data statistics before saving
             logger.info(f"Data shape: {gdf.shape}")
             logger.info(f"Columns: {list(gdf.columns)}")

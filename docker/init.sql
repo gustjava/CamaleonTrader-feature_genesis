@@ -2,11 +2,11 @@
 -- This script creates the database schema for the GPU-accelerated feature stationarization pipeline
 
 -- Create database if it doesn't exist
-CREATE DATABASE IF NOT EXISTS dynamic_stage0_db
+CREATE DATABASE IF NOT EXISTS feature_genesis_db
 CHARACTER SET utf8mb4
 COLLATE utf8mb4_unicode_ci;
 
-USE dynamic_stage0_db;
+USE feature_genesis_db;
 
 -- Table 1: processing_tasks
 -- Serves as the source of truth for work to be done
@@ -92,5 +92,5 @@ INNER JOIN feature_status fs ON pt.task_id = fs.task_id
 WHERE fs.status = 'COMPLETED';
 
 -- Grant permissions (adjust as needed for your setup)
--- GRANT SELECT, INSERT, UPDATE, DELETE ON dynamic_stage0_db.* TO 'dynamic_stage0_user'@'%';
+-- GRANT SELECT, INSERT, UPDATE, DELETE ON feature_genesis_db.* TO 'dynamic_stage0_user'@'%';
 -- FLUSH PRIVILEGES;

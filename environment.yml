@@ -1,4 +1,4 @@
-name: dynamic-stage0
+name: feature-genesis
 channels:
   - rapidsai-nightly
   - conda-forge

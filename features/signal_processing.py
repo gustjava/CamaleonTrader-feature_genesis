@@ -136,14 +136,76 @@ class SignalProcessor(BaseFeatureEngine):
         """
         self._log_info("Starting comprehensive SignalProcessor (cuDF)...")
 
-        # Apply Baxter-King filter
-        col_name = "bk_filter_close"
-        self._log_info("Applying Baxter–King filter to 'y_close'...")
+        # Track columns before
+        cols_before = set(list(gdf.columns))
 
-        gdf[col_name] = self._apply_bk_filter_gpu(gdf["y_close"])
+        # Apply Baxter-King filter
+        # Pick a robust price source
+        cols = set(map(str, gdf.columns))
+        source_col = None
+        for pref in [
+            "y_close",
+            "log_stabilized_y_close",
+        ]:
+            if pref in cols:
+                source_col = pref
+                break
+        if source_col is None:
+            # any column containing 'close'
+            for c in gdf.columns:
+                if 'close' in str(c).lower():
+                    source_col = str(c)
+                    break
+        if source_col is None:
+            self._log_warn("SignalProcessor: no 'close' column found; skipping BK filter")
+            return gdf
+
+        col_name = f"bk_filter_close"
+        self._log_info(f"Applying Baxter–King filter to '{source_col}'...")
+
+        gdf[col_name] = self._apply_bk_filter_gpu(gdf[source_col])
 
         # Calculate secondary metrics for the filtered series
         gdf = self._add_signal_processing_metrics(gdf, col_name)
+
+        # Record metrics and optional artifact summary
+        try:
+            cols_after = set(list(gdf.columns))
+            new_cols = sorted(list(cols_after - cols_before))
+            # Extract scalar metrics from first row for bk_* columns
+            metrics = {'new_columns': new_cols, 'new_columns_count': len(new_cols)}
+            try:
+                head1 = gdf.head(1)
+                for c in new_cols:
+                    if c.startswith('bk_'):
+                        try:
+                            val = head1[c].iloc[0]
+                            metrics[c] = float(val) if val == val else None
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Params used
+            metrics.update({
+                'bk_k': int(self.settings.features.baxter_king_k),
+                'bk_low_period': float(self.settings.features.baxter_king_low_freq),
+                'bk_high_period': float(self.settings.features.baxter_king_high_freq),
+            })
+            self._record_metrics('signal', metrics)
+            # Artifact summary
+            if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):
+                from pathlib import Path
+                import json as _json
+                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))
+                out_dir = out_root / subdir / 'signal'
+                out_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = out_dir / 'summary.json'
+                with open(summary_path, 'w') as f:
+                    _json.dump(metrics, f, indent=2)
+                self._record_artifact('signal', str(summary_path), kind='json')
+        except Exception:
+            pass
 
         self._log_info("Comprehensive SignalProcessor complete.")
         return gdf
@@ -419,8 +481,27 @@ class SignalProcessor(BaseFeatureEngine):
         # (optional) ensure temporal order
         # df = self._ensure_sorted(df, by="ts")
 
-        col_name = "bk_filter_close"
-        self._log_info("Applying Baxter–King filter to 'y_close'...")
+        # Pick a robust price source
+        cols = list(df.columns)
+        source_col = None
+        for pref in [
+            "y_close",
+            "log_stabilized_y_close",
+        ]:
+            if pref in cols:
+                source_col = pref
+                break
+        if source_col is None:
+            for c in cols:
+                if 'close' in str(c).lower():
+                    source_col = str(c)
+                    break
+        if source_col is None:
+            self._log_warn("SignalProcessor: no 'close' column found; skipping BK filter (Dask)")
+            return df
+
+        col_name = f"bk_filter_close"
+        self._log_info(f"Applying Baxter–King filter to '{source_col}'...")
 
         # Parameters as plain values to keep tokenization deterministic
         k = int(self.settings.features.baxter_king_k)
@@ -428,13 +509,37 @@ class SignalProcessor(BaseFeatureEngine):
         high = float(self.settings.features.baxter_king_high_freq)
 
         # meta em f4 para combinar com os pesos f32; mude para 'f8' se preferir
-        df[col_name] = df["y_close"].map_partitions(
+        df[col_name] = df[source_col].map_partitions(
             _apply_bk_filter_gpu_partition,
             k,
             low,
             high,
             meta=(col_name, "f4"),
         )
+
+        # Record minimal metrics (new column and parameters) for Dask path
+        try:
+            metrics = {
+                'new_columns': [col_name],
+                'new_columns_count': 1,
+                'bk_k': k,
+                'bk_low_period': low,
+                'bk_high_period': high,
+            }
+            self._record_metrics('signal', metrics)
+            if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):
+                from pathlib import Path
+                import json as _json
+                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))
+                out_dir = out_root / subdir / 'signal'
+                out_dir.mkdir(parents=True, exist_ok=True)
+                summary_path = out_dir / 'summary.json'
+                with open(summary_path, 'w') as f:
+                    _json.dump(metrics, f, indent=2)
+                self._record_artifact('signal', str(summary_path), kind='json')
+        except Exception:
+            pass
 
         self._log_info("SignalProcessor complete.")
         return df

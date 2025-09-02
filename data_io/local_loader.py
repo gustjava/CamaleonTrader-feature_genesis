@@ -212,8 +212,8 @@ class LocalDataLoader:
             gpu_memory = cp.cuda.runtime.memGetInfo()[0]  # Free memory in bytes
             available_memory_gb = gpu_memory / (1024**3)
             
-            # Get threshold from settings
-            threshold = self.settings.pipeline.memory.max_memory_gb
+            # Get threshold from settings (unified memory config)
+            threshold = self.settings.memory.max_memory_gb
             
             # Use chunked processing if file size exceeds threshold
             should_chunk = file_size_gb > (available_memory_gb * threshold)
@@ -267,9 +267,9 @@ class LocalDataLoader:
         try:
             self._log_info("Starting chunked data processing")
             
-            # Get chunking parameters from settings
-            chunk_size = self.settings.pipeline.memory.chunk_size
-            overlap_size = self.settings.pipeline.memory.chunk_overlap
+            # Get chunking parameters from settings (unified memory config)
+            chunk_size = self.settings.memory.chunk_size
+            overlap_size = self.settings.memory.chunk_overlap
             
             self._log_info(f"Chunk size: {chunk_size}, Overlap: {overlap_size}")
             

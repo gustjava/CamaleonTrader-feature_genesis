@@ -35,7 +35,7 @@ class DatabaseHandler:
         
         # Define table metadata
         self.metadata = MetaData()
-        
+
         # Define processing_tasks table
         self.processing_tasks = Table(
             'processing_tasks',
@@ -58,6 +58,70 @@ class DatabaseHandler:
             Column('hostname', String(255), nullable=True),
             Column('error_message', Text, nullable=True)
         )
+
+        # New: pipeline_runs table
+        self.pipeline_runs = Table(
+            'pipeline_runs',
+            self.metadata,
+            Column('run_id', Integer, primary_key=True, autoincrement=True),
+            Column('started_at', DateTime, nullable=False, default=datetime.utcnow),
+            Column('ended_at', DateTime, nullable=True),
+            Column('hostname', String(255), nullable=True),
+            Column('dashboard_url', String(1024), nullable=True),
+            Column('git_sha', String(64), nullable=True),
+            Column('status', Enum('RUNNING', 'COMPLETED', 'FAILED', 'ABORTED', name='run_status_enum'), nullable=False, default='RUNNING'),
+            Column('config_snapshot', Text, nullable=True)
+        )
+
+        # New: engine_stage_events table
+        self.engine_stage_events = Table(
+            'engine_stage_events',
+            self.metadata,
+            Column('stage_id', Integer, primary_key=True, autoincrement=True),
+            Column('run_id', Integer, nullable=True),
+            Column('task_id', Integer, nullable=True),
+            Column('engine_name', String(64), nullable=False),
+            Column('status', Enum('START', 'END', 'ERROR', name='stage_status_enum'), nullable=False),
+            Column('start_time', DateTime, nullable=True),
+            Column('end_time', DateTime, nullable=True),
+            Column('rows_before', Integer, nullable=True),
+            Column('rows_after', Integer, nullable=True),
+            Column('cols_before', Integer, nullable=True),
+            Column('cols_after', Integer, nullable=True),
+            Column('new_cols', Integer, nullable=True),
+            Column('hostname', String(255), nullable=True),
+            Column('message', String(1024), nullable=True),
+            Column('error_message', Text, nullable=True),
+            Column('details', Text, nullable=True)
+        )
+
+        # New: task_metrics table (key/value by stage)
+        self.task_metrics = Table(
+            'task_metrics',
+            self.metadata,
+            Column('metric_id', Integer, primary_key=True, autoincrement=True),
+            Column('run_id', Integer, nullable=True),
+            Column('task_id', Integer, nullable=True),
+            Column('stage', String(64), nullable=False),
+            Column('key', String(128), nullable=False),
+            Column('value_text', Text, nullable=True),
+            Column('value_float', String(64), nullable=True),
+            Column('created_at', DateTime, nullable=False, default=datetime.utcnow)
+        )
+
+        # New: task_artifacts table (references to saved JSONs/files)
+        self.task_artifacts = Table(
+            'task_artifacts',
+            self.metadata,
+            Column('artifact_id', Integer, primary_key=True, autoincrement=True),
+            Column('run_id', Integer, nullable=True),
+            Column('task_id', Integer, nullable=True),
+            Column('stage', String(64), nullable=False),
+            Column('path', String(1024), nullable=False),
+            Column('kind', String(64), nullable=True),
+            Column('meta', Text, nullable=True),
+            Column('created_at', DateTime, nullable=False, default=datetime.utcnow)
+        )
     
     def connect(self) -> bool:
         """
@@ -68,31 +132,58 @@ class DatabaseHandler:
         """
         try:
             # Create database URL
-            # Build DB URL from unified config
             db_url = self.settings.database.get_url()
-            
-            # Create engine with connection pooling
-            self.engine = create_engine(
-                db_url,
-                poolclass=QueuePool,
-                pool_size=self.settings.database.pool_size,
-                max_overflow=self.settings.database.max_overflow,
-                pool_timeout=self.settings.database.pool_timeout,
-                pool_recycle=self.settings.database.pool_recycle,
-                echo=False  # Set to True for SQL debugging
-            )
-            
-            # Test connection
-            with self.engine.connect() as conn:
-                result = conn.execute(text("SELECT 1"))
-                result.fetchone()
-            
+
+            def _mk_engine(url: str) -> Engine:
+                return create_engine(
+                    url,
+                    poolclass=QueuePool,
+                    pool_size=self.settings.database.pool_size,
+                    max_overflow=self.settings.database.max_overflow,
+                    pool_timeout=self.settings.database.pool_timeout,
+                    pool_recycle=self.settings.database.pool_recycle,
+                    echo=False,
+                )
+
+            # Try connect to target database
+            try:
+                self.engine = _mk_engine(db_url)
+                with self.engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+            except OperationalError as e:
+                msg = str(e).lower()
+                # Unknown database: attempt to create it then reconnect
+                if 'unknown database' in msg or 'does not exist' in msg or '1049' in msg:
+                    logger.warning("Database not found; attempting to create it...")
+                    # Build server-level URL (no database)
+                    db = self.settings.database
+                    server_url = (
+                        f"mysql+pymysql://{db.username}:{db.password}@{db.host}:{db.port}/?charset={db.charset}"
+                    )
+                    server_engine = _mk_engine(server_url)
+                    try:
+                        with server_engine.connect() as sconn:
+                            sconn.execute(text(
+                                f"CREATE DATABASE IF NOT EXISTS `{db.database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            ))
+                            logger.info(f"Database '{db.database}' created/verified.")
+                    finally:
+                        server_engine.dispose()
+                    # Recreate engine to target DB
+                    self.engine = _mk_engine(db_url)
+                    with self.engine.connect() as conn:
+                        conn.execute(text("SELECT 1"))
+                else:
+                    raise
+
             # Create tables if they don't exist
             self.create_tables()
-            
-            logger.info(f"Database connection established to {self.settings.database.host}:{self.settings.database.port}")
+
+            logger.info(
+                f"Database connection established to {self.settings.database.host}:{self.settings.database.port}/{self.settings.database.database}"
+            )
             return True
-            
+
         except OperationalError as e:
             logger.error(f"Database connection failed: {e}")
             return False
@@ -111,6 +202,154 @@ class DatabaseHandler:
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
             raise
+
+    # ------------------ Run lifecycle APIs ------------------
+    def create_run(self, hostname: Optional[str] = None, dashboard_url: Optional[str] = None,
+                   git_sha: Optional[str] = None, config_snapshot: Optional[str] = None) -> Optional[int]:
+        if not self.engine:
+            logger.error("Database not connected. Call connect() first.")
+            return None
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return None
+        try:
+            with self.engine.begin() as conn:
+                stmt = self.pipeline_runs.insert().values(
+                    started_at=datetime.utcnow(), hostname=hostname, dashboard_url=dashboard_url,
+                    git_sha=git_sha, status='RUNNING', config_snapshot=config_snapshot
+                )
+                res = conn.execute(stmt)
+                run_id = int(res.inserted_primary_key[0])
+                logger.info(f"Created pipeline run {run_id}")
+                return run_id
+        except Exception as e:
+            logger.error(f"Error creating pipeline run: {e}")
+            return None
+
+    def end_run(self, run_id: int, status: str = 'COMPLETED') -> bool:
+        if not self.engine:
+            return False
+        if not run_id:
+            return False
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return True
+        try:
+            with self.engine.begin() as conn:
+                stmt = self.pipeline_runs.update().where(self.pipeline_runs.c.run_id == run_id).values(
+                    ended_at=datetime.utcnow(), status=status
+                )
+                conn.execute(stmt)
+                logger.info(f"Ended pipeline run {run_id} with status={status}")
+                return True
+        except Exception as e:
+            logger.error(f"Error ending pipeline run {run_id}: {e}")
+            return False
+
+    # ------------------ Stage events APIs ------------------
+    def start_stage(self, run_id: Optional[int], task_id: Optional[int], engine_name: str,
+                    rows_before: Optional[int] = None, cols_before: Optional[int] = None,
+                    message: Optional[str] = None) -> Optional[int]:
+        if not self.engine:
+            return None
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return None
+        try:
+            with self.engine.begin() as conn:
+                stmt = self.engine_stage_events.insert().values(
+                    run_id=run_id, task_id=task_id, engine_name=engine_name, status='START',
+                    start_time=datetime.utcnow(), rows_before=rows_before, cols_before=cols_before,
+                    hostname=self.hostname, message=message
+                )
+                res = conn.execute(stmt)
+                stage_id = int(res.inserted_primary_key[0])
+                return stage_id
+        except Exception as e:
+            logger.error(f"Error starting stage {engine_name} for task {task_id}: {e}")
+            return None
+
+    def end_stage(self, stage_id: int, rows_after: Optional[int] = None, cols_after: Optional[int] = None,
+                  new_cols: Optional[int] = None, details: Optional[str] = None) -> bool:
+        if not self.engine:
+            return False
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return True
+        try:
+            with self.engine.begin() as conn:
+                stmt = self.engine_stage_events.update().where(self.engine_stage_events.c.stage_id == stage_id).values(
+                    status='END', end_time=datetime.utcnow(), rows_after=rows_after, cols_after=cols_after,
+                    new_cols=new_cols, details=details
+                )
+                conn.execute(stmt)
+                return True
+        except Exception as e:
+            logger.error(f"Error ending stage_id {stage_id}: {e}")
+            return False
+
+    def error_stage(self, stage_id: int, error_message: str, details: Optional[str] = None) -> bool:
+        if not self.engine:
+            return False
+
+    # ------------------ Metrics & Artifacts ------------------
+    def add_metrics(self, run_id: Optional[int], task_id: Optional[int], stage: str, metrics: Dict[str, Any]) -> bool:
+        if not self.engine:
+            return False
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return True
+        try:
+            with self.engine.begin() as conn:
+                rows = []
+                import json as _json
+                for k, v in (metrics or {}).items():
+                    val_text = None
+                    val_float = None
+                    # Coerce
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        val_float = str(float(v))
+                    else:
+                        try:
+                            val_text = _json.dumps(v, ensure_ascii=False)
+                        except Exception:
+                            val_text = str(v)
+                    rows.append({'run_id': run_id, 'task_id': task_id, 'stage': stage, 'key': str(k), 'value_text': val_text, 'value_float': val_float})
+                if rows:
+                    conn.execute(self.task_metrics.insert(), rows)
+            return True
+        except Exception as e:
+            logger.warning(f"add_metrics failed: {e}")
+            return False
+
+    def add_artifact(self, run_id: Optional[int], task_id: Optional[int], stage: str, path: str, kind: str = 'file', meta: Optional[Dict[str, Any]] = None) -> bool:
+        if not self.engine:
+            return False
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return True
+        try:
+            with self.engine.begin() as conn:
+                import json as _json
+                meta_json = None
+                if meta is not None:
+                    try:
+                        meta_json = _json.dumps(meta, ensure_ascii=False)
+                    except Exception:
+                        meta_json = str(meta)
+                conn.execute(self.task_artifacts.insert().values(
+                    run_id=run_id, task_id=task_id, stage=stage, path=path, kind=kind, meta=meta_json
+                ))
+            return True
+        except Exception as e:
+            logger.warning(f"add_artifact failed: {e}")
+            return False
+        if not getattr(self.settings.monitoring, 'metrics_enabled', True):
+            return True
+        try:
+            with self.engine.begin() as conn:
+                stmt = self.engine_stage_events.update().where(self.engine_stage_events.c.stage_id == stage_id).values(
+                    status='ERROR', end_time=datetime.utcnow(), error_message=error_message, details=details
+                )
+                conn.execute(stmt)
+                return True
+        except Exception as e:
+            logger.error(f"Error marking error for stage_id {stage_id}: {e}")
+            return False
 
     def clear_old_records(self):
         """Clear old processing records to start fresh."""

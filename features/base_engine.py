@@ -85,11 +85,51 @@ class BaseFeatureEngine(ABC):
         # Performance tracking
         self.processing_times = {}
         self.memory_usage = {}
+
+        # Optional task/run context for DB-backed metrics
+        self._run_id: Optional[int] = None
+        self._task_id: Optional[int] = None
+        self._db_handler = None
         
         # Validation settings
         self.required_columns = self._get_required_columns()
         self.optional_columns = self._get_optional_columns()
         self.expected_dtypes = self._get_expected_dtypes()
+
+    # ---- Optional task context & metrics helpers ----
+    def set_task_context(self, run_id: Optional[int], task_id: Optional[int], db_handler: Optional[object] = None):
+        """Attach runtime context so engines can persist metrics/artifacts.
+
+        Args:
+            run_id: Current pipeline run id
+            task_id: Current processing task id
+            db_handler: Instance exposing add_metrics/add_artifact methods
+        """
+        self._run_id = run_id
+        self._task_id = task_id
+        self._db_handler = db_handler
+
+    def _record_metrics(self, stage: str, metrics: Dict[str, Any]):
+        try:
+            if not self._db_handler or not hasattr(self._db_handler, 'add_metrics'):
+                return
+            # Guard by monitoring flag if available on settings
+            if hasattr(self.settings, 'monitoring') and not getattr(self.settings.monitoring, 'metrics_enabled', True):
+                return
+            self._db_handler.add_metrics(self._run_id, self._task_id, stage, metrics)
+        except Exception:
+            # Non-fatal
+            pass
+
+    def _record_artifact(self, stage: str, path: str, kind: str = "file", meta: Optional[Dict[str, Any]] = None):
+        try:
+            if not self._db_handler or not hasattr(self._db_handler, 'add_artifact'):
+                return
+            if hasattr(self.settings, 'monitoring') and not getattr(self.settings.monitoring, 'metrics_enabled', True):
+                return
+            self._db_handler.add_artifact(self._run_id, self._task_id, stage, path, kind, meta)
+        except Exception:
+            pass
     
     @abstractmethod
     def process(self, df: Union[cudf.DataFrame, dask_cudf.DataFrame]) -> Union[cudf.DataFrame, dask_cudf.DataFrame]:

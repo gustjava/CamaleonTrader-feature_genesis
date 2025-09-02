@@ -128,6 +128,7 @@ class FeatureConfig:
     distance_corr_tile_size: int = 2048
     # Selection stage (Stage 1) and dCor extras
     selection_target_column: str = "y_ret_1m"
+    selection_target_columns: List[str] = field(default_factory=list)
     dcor_top_k: int = 50
     dcor_include_permutation: bool = True
     dcor_permutations: int = 100
@@ -167,10 +168,26 @@ class FeatureConfig:
     stage1_rolling_window: int = 2000
     stage1_rolling_step: int = 500
     stage1_rolling_min_periods: int = 200
+    # New: minimum pairwise valid (non-NaN) observations required per rolling window
+    stage1_rolling_min_valid_pairs: int = 200
     stage1_rolling_max_rows: int = 20000
     stage1_rolling_max_windows: int = 20
     stage1_agg: str = "median"  # one of: mean, median, min, max, p25, p75
     stage1_use_rolling_scores: bool = True
+    # Dataset schema/feature gating (leakage control)
+    dataset_target_columns: List[str] = field(default_factory=list)
+    dataset_target_prefixes: List[str] = field(default_factory=list)
+    feature_allowlist: List[str] = field(default_factory=list)
+    feature_allow_prefixes: List[str] = field(default_factory=list)
+    feature_denylist: List[str] = field(default_factory=lambda: ["y_tick_volume", "y_total_volume"])
+    feature_deny_prefixes: List[str] = field(default_factory=lambda: ['y_ret_fwd_'])
+    feature_deny_regex: List[str] = field(default_factory=list)
+    metrics_prefixes: List[str] = field(default_factory=lambda: ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_'])
+    # Stage 1 visibility and debugging
+    stage1_broadcast_scores: bool = False     # add dcor_* columns to the frame
+    stage1_broadcast_rolling: bool = False    # add dcor_roll_* and cnt_* columns
+    debug_write_artifacts: bool = True        # persist JSON artifacts per stage
+    artifacts_dir: str = "artifacts"         # subfolder under output_path
     # Stage 2 MI clustering (scalable)
     mi_cluster_enabled: bool = True
     mi_cluster_method: str = "agglo"  # only 'agglo' supported now
@@ -189,6 +206,18 @@ class FeatureConfig:
     # Fractional diff cache/tuning (new)
     fracdiff_cache_max_entries: int = 32
     fracdiff_partition_threshold: int = 4096
+    # Stationarization helpers (basic rolling features)
+    station_basic_rolling_enabled: bool = False
+    # Column filtering controls
+    drop_metric_columns_on_save: bool = True
+    drop_metric_columns_on_intermediate: bool = True
+    # Explicit candidate selection for Stage 1 (no regex)
+    station_candidates_include: List[str] = field(default_factory=list)
+    station_candidates_exclude: List[str] = field(default_factory=list)
+    # Drop original column after creating its stationary counterpart (FFD)
+    drop_original_after_transform: bool = False
+    # Drop non-retained candidates after Stage 1 (based on dCor gates)
+    drop_nonretained_after_stage1: bool = False
 
 
 @dataclass
@@ -243,12 +272,43 @@ class MonitoringConfig:
 
 
 @dataclass
+class MemoryConfig:
+    """Advanced memory management configuration."""
+    # RMM configuration (GB)
+    rmm_pool_size_gb: float = 8.0
+    rmm_initial_pool_size_gb: float = 4.0
+    rmm_maximum_pool_size_gb: float = 16.0
+    rmm_memory_target_fraction: float = 0.8
+    rmm_memory_spill_threshold: float = 0.9
+
+    # Chunked processing (rows)
+    chunk_size: int = 10000
+    chunk_overlap: int = 1000
+    max_memory_gb: float = 8.0
+
+    # Spilling
+    enable_spilling: bool = True
+    spill_to_disk: bool = True
+    spill_directory: str = "/tmp/gpu_spill"
+
+    # Monitoring
+    monitor_memory: bool = True
+    alert_threshold: float = 0.9
+    check_interval: int = 10
+
+
+@dataclass
 class OutputConfig:
     """Output configuration."""
     output_path: str = "./output"
     compression: str = "lz4"
     format: str = "feather"
     version: int = 2
+    # Intermediate checkpoints
+    save_intermediate_per_engine: bool = False
+    intermediate_format: str = "parquet"  # parquet|feather
+    intermediate_compression: str = "zstd"
+    intermediate_version: int = 2
 
 
 @dataclass
@@ -309,6 +369,7 @@ class UnifiedConfig:
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     development: DevelopmentConfig = field(default_factory=DevelopmentConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
@@ -346,6 +407,14 @@ class UnifiedConfig:
             if not self.output.output_path:
                 logger.error("Output path must be specified")
                 return False
+
+            # Validate memory configuration
+            if self.memory.chunk_size <= 0:
+                logger.error("Memory.chunk_size must be > 0")
+                return False
+            if self.memory.chunk_overlap < 0:
+                logger.error("Memory.chunk_overlap must be >= 0")
+                return False
             
             logger.info("Configuration validation passed")
             return True
@@ -364,6 +433,7 @@ class UnifiedConfig:
             'processing': self.processing.__dict__,
             'logging': self.logging.__dict__,
             'monitoring': self.monitoring.__dict__,
+            'memory': self.memory.__dict__,
             'output': self.output.__dict__,
             'development': self.development.__dict__,
             'pipeline': {k: v.__dict__ for k, v in self.pipeline.engines.items()},
@@ -416,6 +486,7 @@ def load_config_from_dict(config_dict: Dict[str, Any]) -> UnifiedConfig:
     processing = ProcessingConfig(**config_dict.get('processing', {}))
     logging = LoggingConfig(**config_dict.get('logging', {}))
     monitoring = MonitoringConfig(**config_dict.get('monitoring', {}))
+    memory = MemoryConfig(**config_dict.get('memory', {}))
     output = OutputConfig(**config_dict.get('output', {}))
     development = DevelopmentConfig(**config_dict.get('development', {}))
     error_handling = ErrorHandlingConfig(**config_dict.get('error_handling', {}))
@@ -437,6 +508,7 @@ def load_config_from_dict(config_dict: Dict[str, Any]) -> UnifiedConfig:
         processing=processing,
         logging=logging,
         monitoring=monitoring,
+        memory=memory,
         output=output,
         development=development,
         pipeline=pipeline,

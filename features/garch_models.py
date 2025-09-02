@@ -20,6 +20,88 @@ from dask.distributed import Client
 logger = logging.getLogger(__name__)
 
 
+def _garch_default_row() -> Dict[str, float]:
+    """Return a default row (NaNs) for meta schema compliance."""
+    return {
+        'garch_omega': np.nan, 'garch_alpha': np.nan, 'garch_beta': np.nan,
+        'garch_persistence': np.nan, 'garch_log_likelihood': np.nan,
+        'garch_aic': np.nan, 'garch_bic': np.nan, 'garch_is_stationary': np.nan,
+    }
+
+
+def _garch_fit_partition_np(part: cudf.DataFrame, price_col: str, max_samples: int, max_iter: int, tolerance: float) -> cudf.DataFrame:
+    """Pure module-level function for Dask map_partitions (deterministic hashing).
+
+    Computes a small set of GARCH(1,1) metrics on a single partition using NumPy/CPU
+    and returns a 1-row cuDF DataFrame matching the meta schema.
+    """
+    try:
+        if price_col not in part.columns:
+            return cudf.DataFrame([_garch_default_row()])
+
+        x = part[price_col].to_pandas().to_numpy()
+        if x.size < 100:
+            return cudf.DataFrame([_garch_default_row()])
+
+        x = x.astype(np.float64, copy=False)
+        if np.isnan(x).any() or np.isinf(x).any():
+            # Replace non-finite with previous value or small positive
+            x = np.where(np.isfinite(x), x, np.nan)
+            # forward fill then back fill then fill with small
+            pd = __import__('pandas')
+            x = pd.Series(x).fillna(method='ffill').fillna(method='bfill').fillna(1e-8).to_numpy()
+
+        # Truncate tail for bounded work
+        if x.size > int(max_samples):
+            x = x[-int(max_samples):]
+
+        # Log returns
+        logx = np.log(np.maximum(x, 1e-8))
+        r = np.diff(logx)
+        r = r[np.isfinite(r)]
+        if r.size < 50:
+            return cudf.DataFrame([_garch_default_row()])
+
+        # GARCH(1,1) negative log-likelihood (CPU)
+        def nll(params):
+            omega, alpha, beta = params
+            # basic constraints
+            if omega <= 0 or alpha < 0 or beta < 0 or (alpha + beta) >= 1.0:
+                return 1e12
+            n = r.size
+            h = np.empty(n, dtype=np.float64)
+            # unconditional variance init
+            h0 = np.var(r) if (1 - alpha - beta) <= 1e-8 else omega / (1 - alpha - beta)
+            h[0] = max(h0, 1e-9)
+            for t in range(1, n):
+                h[t] = omega + alpha * r[t-1] * r[t-1] + beta * h[t-1]
+                if h[t] <= 0:
+                    return 1e12
+            ll = -0.5 * np.sum(np.log(2 * np.pi) + np.log(h) + (r * r) / h)
+            return -float(ll)
+
+        x0 = np.array([0.01, 0.1, 0.8], dtype=np.float64)
+        bounds = [(1e-10, None), (0.0, 1.0), (0.0, 1.0)]
+        res = minimize(nll, x0=x0, method='L-BFGS-B', bounds=bounds, options={'maxiter': int(max_iter), 'ftol': float(tolerance)})
+        if not res.success:
+            return cudf.DataFrame([_garch_default_row()])
+
+        omega, alpha, beta = map(float, res.x)
+        persistence = float(alpha + beta)
+        ll = -float(res.fun)
+        n_obs = int(r.size)
+        aic = 2 * 3 - 2 * ll
+        bic = 3 * np.log(n_obs) - 2 * ll
+        out = {
+            'garch_omega': omega, 'garch_alpha': alpha, 'garch_beta': beta,
+            'garch_persistence': persistence, 'garch_log_likelihood': ll,
+            'garch_aic': float(aic), 'garch_bic': float(bic), 'garch_is_stationary': float(persistence < 1.0),
+        }
+        return cudf.DataFrame([out])
+    except Exception:
+        return cudf.DataFrame([_garch_default_row()])
+
+
 class GARCHModels(BaseFeatureEngine):
     """
     GPU-accelerated GARCH model fitting engine for volatility modeling.
@@ -311,6 +393,19 @@ class GARCHModels(BaseFeatureEngine):
         # fit_garch11 now always returns a dict (either fitted or default values)
         return res
 
+    def _fit_on_partition_wrapper(self, part: cudf.DataFrame) -> cudf.DataFrame:
+        """
+        Wrapper function for Dask map_partitions to avoid lambda hashing issues.
+        
+        Args:
+            part: DataFrame partition with 'y_close' column
+            
+        Returns:
+            cuDF DataFrame with GARCH parameters
+        """
+        result_dict = self._fit_on_partition(part)
+        return cudf.DataFrame([result_dict])
+
     def process(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
         """
         Executes the GARCH modeling pipeline (Dask version).
@@ -320,8 +415,24 @@ class GARCHModels(BaseFeatureEngine):
         # (optional) ensure temporal order
         # df = self._ensure_sorted(df, by="ts")
 
+        # Resolve a robust price source (y_close preferred)
+        cols = list(df.columns)
+        price_col = None
+        for pref in ("y_close", "log_stabilized_y_close"):
+            if pref in cols:
+                price_col = pref
+                break
+        if price_col is None:
+            for c in cols:
+                if 'close' in str(c).lower():
+                    price_col = str(c)
+                    break
+        if price_col is None:
+            self._log_warn("GARCH (Dask): no close-like column found; skipping")
+            return df
+
         # Bring series to single partition in one GPU worker
-        one = self._single_partition(df, cols=["y_close"])
+        one = self._single_partition(df, cols=[price_col])
 
         # Compute model ONCE inside worker and materialize dict in driver
         # (it's small - just scalars)
@@ -331,9 +442,13 @@ class GARCHModels(BaseFeatureEngine):
             'garch_aic': 'f8', 'garch_bic': 'f8', 'garch_is_stationary': 'f8'
         }
 
-        # Generate a Dask DataFrame with 1 row containing metrics
+        # Generate a Dask DataFrame with 1 row containing metrics using module-level function
         params_ddf = one.map_partitions(
-            lambda p: cudf.DataFrame([self._fit_on_partition(p)]),
+            _garch_fit_partition_np,
+            price_col,
+            int(self.max_samples),
+            int(self.max_iter),
+            float(self.tolerance),
             meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in meta.items()})
         )
 
@@ -341,6 +456,23 @@ class GARCHModels(BaseFeatureEngine):
         params = params_pdf.iloc[0].to_dict()
 
         self._log_info("GARCH fitted.", **{k: float(params[k]) if params[k] == params[k] else None for k in params})
+
+        # Record metrics and optional artifact summary
+        try:
+            self._record_metrics('garch', params)
+            if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):
+                from pathlib import Path
+                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))
+                out_dir = out_root / subdir / 'garch'
+                out_dir.mkdir(parents=True, exist_ok=True)
+                import json as _json
+                summary_path = out_dir / 'summary.json'
+                with open(summary_path, 'w') as f:
+                    _json.dump(params, f, indent=2)
+                self._record_artifact('garch', str(summary_path), kind='json')
+        except Exception:
+            pass
 
         # Broadcast scalars to original DataFrame (all rows)
         df = self._broadcast_scalars(df, params)
@@ -374,6 +506,35 @@ class GARCHModels(BaseFeatureEngine):
             garch_result = self._get_default_garch_result()
 
         self._log_info("Comprehensive GARCH fitted successfully")
+
+        # Record metrics and optional artifact summary
+        try:
+            if garch_result:
+                metrics = {
+                    'omega': garch_result.get('garch_omega'),
+                    'alpha': garch_result.get('garch_alpha'),
+                    'beta': garch_result.get('garch_beta'),
+                    'persistence': garch_result.get('garch_persistence'),
+                    'log_likelihood': garch_result.get('garch_log_likelihood'),
+                    'aic': garch_result.get('garch_aic'),
+                    'bic': garch_result.get('garch_bic'),
+                    'converged': garch_result.get('garch_converged'),
+                    'iterations': garch_result.get('garch_iterations'),
+                }
+                self._record_metrics('garch', metrics)
+                if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):
+                    from pathlib import Path
+                    out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                    subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))
+                    out_dir = out_root / subdir / 'garch'
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    import json as _json
+                    summary_path = out_dir / 'summary.json'
+                    with open(summary_path, 'w') as f:
+                        _json.dump(metrics, f, indent=2)
+                    self._record_artifact('garch', str(summary_path), kind='json')
+        except Exception:
+            pass
 
         # Add all GARCH features to DataFrame
         gdf = self._add_comprehensive_garch_features(gdf, garch_result)

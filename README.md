@@ -53,7 +53,7 @@ O design e o roadmap seguem o documento “Um Pipeline Robusto de Seleção de F
 
 ## Entradas e Saídas
 
-- Entrada: Feather/Parquet com colunas mínimas esperadas (detectadas dinamicamente). Exemplos comuns: `y_close`, `y_ret_1m`, `y_tick_volume`, `timestamp`.
+- Entrada: Feather/Parquet com colunas mínimas esperadas (detectadas dinamicamente). Exemplos comuns: `y_close`, `y_ret_1m`, `y_tickvol_z_15m`, `timestamp`.
 - Saída: arquivo Feather v2 por par, contendo as colunas originais + novas features produzidas pelos ENGINES.
 - Caminhos de leitura/gravação: configuráveis em `config` (ver adiante).
 
@@ -88,7 +88,9 @@ Estágio 1 — Filtragem Univariada (Relevância)
 - OK: dCor em GPU (chunked) + caminho rápido 1D (opcional); ranking global (dcor_<feature>), retenção automática (threshold/percentil/top‑N), estágio opcional de permutação para Top‑K com filtro por p‑valor.
 - OK: dCor “rolling por janela” com agregação temporal do ranking (média/mediana/pXX). Quando habilitado, o ranking pode usar os escores agregados por janela (`dcor_roll_<feature>`) em vez do global, conforme configuração.
 - Parâmetros: `distance_corr_*`, `selection_target_column`, `selection_max_rows`, `dcor_min_threshold`, `dcor_min_percentile`, `stage1_top_n`, `dcor_permutation_top_k`, `dcor_permutations`, `dcor_pvalue_alpha`, `dcor_top_k` (logging).
-  - Rolling (via unified_config): `stage1_rolling_enabled`, `stage1_rolling_window`, `stage1_rolling_step`, `stage1_rolling_min_periods`, `stage1_rolling_max_rows`, `stage1_rolling_max_windows`, `stage1_agg` (mean|median|min|max|p25|p75), `stage1_use_rolling_scores`.
+  - Visibilidade: `stage1_broadcast_scores`/`stage1_broadcast_rolling` controlam se colunas `dcor_*` e `dcor_roll_*` são anexadas ao DataFrame (por padrão desativado para evitar “inchar” o schema).
+  - Transparência: `debug_write_artifacts=true` persiste JSONs com escores e seleção em `<output_path>/<par>/artifacts/stage1/<target>/`.
+  - Rolling (via unified_config): `stage1_rolling_enabled`, `stage1_rolling_window`, `stage1_rolling_step`, `stage1_rolling_min_periods`, `stage1_rolling_min_valid_pairs`, `stage1_rolling_max_rows`, `stage1_rolling_max_windows`, `stage1_agg` (mean|median|min|max|p25|p75), `stage1_use_rolling_scores`.
 
 Estágio 2 — Redundância (Linear e Não‑Linear)
 - OK: VIF iterativo (CPU) seguido de clustering por MI (global) com seleção de representante por maior dCor; fallback para MI par‑a‑par quando clusterização não disponível.
@@ -122,7 +124,7 @@ Prevenção de Data Leakage e Validação Temporal
 
 - Suba o cluster Dask‑CUDA (vide `orchestration/main.py`).
 - Rode o pipeline principal (descoberta, processamento por moeda, salvamento). Você pode usar:
-  - `onstart.sh` + `environment.yml`: caminho recomendado. O `onstart` cria/atualiza o ambiente `dynamic-stage0` com as dependências corretas (inclui LightGBM). Recrie a instância se necessário.
+  - `onstart.sh` + `environment.yml`: caminho recomendado. O `onstart` cria/atualiza o ambiente `feature-genesis` com as dependências corretas (inclui LightGBM). Recrie a instância se necessário.
   - `deploy_to_vast.sh`/`run_pipeline_vast.sh`: automatizam sync de código/dados e execução remota. O deploy inclui fallback para instalar `lightgbm` caso o ambiente já exista sem ele. A fonte da verdade continua sendo o `environment.yml`.
 
 ## Notas de Projeto
