@@ -104,8 +104,14 @@ class R2DataLoader:
         """
         # Default parameters
         read_params = {
-            'blocksize': None,  # Let Dask determine optimal block size
-            'aggregate_files': True,  # Group small files
+            # Parquet read tuning for GPU stability
+            # - split_row_groups to create smaller GPU-sized partitions
+            # - aggregate_files False to avoid overly large partitions
+            # - chunksize to bound partition memory
+            'split_row_groups': True,
+            'aggregate_files': False,
+            'chunksize': '128MiB',
+            # I/O specifics
             'filesystem': 'arrow',  # Use PyArrow's optimized S3 interface
             'storage_options': self.storage_options,
             'engine': 'pyarrow',  # Use PyArrow engine for better performance
@@ -153,10 +159,18 @@ class R2DataLoader:
             # Load data using dask_cudf.read_parquet
             logger.info(f"Starting data loading for {currency_pair}...")
             
-            df = dask_cudf.read_parquet(
-                r2_path,
-                **read_params
-            )
+            try:
+                df = dask_cudf.read_parquet(
+                    r2_path,
+                    **read_params
+                )
+            except TypeError:
+                # Fallback for older dask_cudf without chunksize support
+                rp = {k: v for k, v in read_params.items() if k != 'chunksize'}
+                df = dask_cudf.read_parquet(
+                    r2_path,
+                    **rp
+                )
             
             # Trigger computation to verify data is accessible
             # This will also distribute data across GPU workers

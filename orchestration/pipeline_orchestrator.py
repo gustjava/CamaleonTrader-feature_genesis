@@ -121,18 +121,34 @@ class PipelineOrchestrator:
             currency_pair = pair_info['currency_pair']
             
             # Check if output file already exists (idempotent approach)
-            output_path = Path(self.settings.output.output_path) / currency_pair / f"{currency_pair}.feather"
-            if output_path.exists() and not self.settings.development.force_reprocessing:
-                logger.info(f"Skipping {currency_pair} - output already exists")
-                continue
+            out_dir = Path(self.settings.output.output_path) / currency_pair
+            consolidated = out_dir / f"{currency_pair}.feather"
+            if not self.settings.development.force_reprocessing:
+                if consolidated.exists():
+                    logger.info(f"Skipping {currency_pair} - consolidated output exists")
+                    continue
+                # Also skip if partitioned feather outputs exist
+                try:
+                    if out_dir.exists() and any(out_dir.glob("part-*.feather")):
+                        logger.info(f"Skipping {currency_pair} - partitioned output exists")
+                        continue
+                except Exception:
+                    pass
             
             # Remove existing file if force reprocessing is enabled
-            if output_path.exists() and self.settings.development.force_reprocessing:
+            if consolidated.exists() and self.settings.development.force_reprocessing:
                 try:
-                    output_path.unlink()
-                    logger.info(f"Removed existing output file for reprocessing: {output_path}")
+                    consolidated.unlink()
+                    logger.info(f"Removed existing consolidated output for reprocessing: {consolidated}")
                 except Exception as e:
-                    logger.warning(f"Could not remove file {output_path}: {e}")
+                    logger.warning(f"Could not remove file {consolidated}: {e}")
+                # Remove partitioned outputs as well
+                try:
+                    for p in out_dir.glob("part-*.feather"):
+                        p.unlink()
+                    logger.info(f"Removed existing partitioned outputs in {out_dir}")
+                except Exception as e:
+                    logger.warning(f"Could not remove partitioned outputs in {out_dir}: {e}")
             
             task = ProcessingTask(
                 task_id=None,  # Will be assigned after successful processing
@@ -271,6 +287,11 @@ class PipelineOrchestrator:
                     logger.info("=" * 60)
                     logger.info(f"✅ SUCCESS: {task.currency_pair} completed successfully")
                     logger.info("=" * 60)
+                    # Free worker memory proactively between tasks
+                    try:
+                        client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
+                    except Exception as e:
+                        logger.debug(f"Worker memory cleanup skipped: {e}")
                 else:
                     failed_tasks += 1
                     logger.error("=" * 60)

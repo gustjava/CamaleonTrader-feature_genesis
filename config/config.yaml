@@ -94,7 +94,7 @@ features:
   
   # Distance correlation configuration
   distance_corr:
-    max_samples: 1000
+    max_samples: 50000
   
   # Empirical Mode Decomposition configuration
   emd:
@@ -155,7 +155,7 @@ features:
   dataset_target_prefixes: ["m1_", "m2_", "m3_", "m4_", "m5_", "m6_", "m7_", "m8_", "m9_"]  # model targets m1..m9
   feature_allowlist: []              # exact feature names allowed (if non-empty, acts as allowlist)
   feature_allow_prefixes: []         # prefixes allowed (any match passes allowlist)
-  feature_denylist: ["y_tick_volume", "y_total_volume"]  # exclude raw volume features
+  feature_denylist: ["y_tick_volume", "y_total_volume", "y_minutes_since_open"]  # exclude raw volume features and session offset
   feature_deny_prefixes: ["y_ret_fwd_"]  # exclude all forward-return labels by default
   feature_deny_regex: []             # regex patterns to exclude (optional)
   metrics_prefixes: ["dcor_", "dcor_roll_", "dcor_pvalue_", "stage1_", "cpcv_"]
@@ -167,6 +167,8 @@ features:
   # Fractional diff cache/tuning (exposed)
   fracdiff_cache_max_entries: 32
   fracdiff_partition_threshold: 4096
+  # Rolling correlation pair selection: 'first' (order-based) or 'dcor' (top by Stage 1 dCor)
+  rolling_corr_pair_selection: dcor
   # MI clustering (Stage 2) scalable options
   mi_cluster_enabled: true
   mi_cluster_method: agglo
@@ -268,7 +270,7 @@ features:
   # If true, drops original columns after creating frac_diff_<col>
   drop_original_after_transform: true
   # If true, drops features that didn't pass Stage 1 retention gates
-  drop_nonretained_after_stage1: true
+  drop_nonretained_after_stage1: false
 
 # Processing Pipeline Configuration
 # Settings for data processing and pipeline execution

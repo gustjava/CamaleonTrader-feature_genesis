@@ -179,7 +179,11 @@ class FeatureConfig:
     dataset_target_prefixes: List[str] = field(default_factory=list)
     feature_allowlist: List[str] = field(default_factory=list)
     feature_allow_prefixes: List[str] = field(default_factory=list)
-    feature_denylist: List[str] = field(default_factory=lambda: ["y_tick_volume", "y_total_volume"])
+    feature_denylist: List[str] = field(default_factory=lambda: [
+        "y_tick_volume",
+        "y_total_volume",
+        "y_minutes_since_open",
+    ])
     feature_deny_prefixes: List[str] = field(default_factory=lambda: ['y_ret_fwd_'])
     feature_deny_regex: List[str] = field(default_factory=list)
     metrics_prefixes: List[str] = field(default_factory=lambda: ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_'])
@@ -208,6 +212,8 @@ class FeatureConfig:
     fracdiff_partition_threshold: int = 4096
     # Stationarization helpers (basic rolling features)
     station_basic_rolling_enabled: bool = False
+    # Rolling correlation pair selection strategy: 'first' | 'dcor'
+    rolling_corr_pair_selection: str = "first"
     # Column filtering controls
     drop_metric_columns_on_save: bool = True
     drop_metric_columns_on_intermediate: bool = True

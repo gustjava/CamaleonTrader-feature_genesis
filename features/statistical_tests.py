@@ -14,6 +14,7 @@ from numba import cuda
 from typing import List, Tuple, Dict, Any
 from pathlib import Path
 import json
+import re
 
 from .base_engine import BaseFeatureEngine
 
@@ -107,6 +108,21 @@ def _dcor_partition(pdf: cudf.DataFrame, target: str, candidates: List[str], max
         x = pdf[c].to_pandas().to_numpy()
         out[f"dcor_{c}"] = _distance_correlation_cpu(x, t, max_samples=max_samples)
     return cudf.DataFrame([out])
+
+
+def _compute_forward_log_return_partition(pdf: cudf.DataFrame, price_col: str, horizon: int, out_col: str) -> cudf.DataFrame:
+    """Compute forward log-return per partition.
+
+    logret_{h} = log(price[t+h]) - log(price[t])
+    Assumes strictly positive prices.
+    """
+    try:
+        s = pdf[price_col].astype('f8')
+        h = int(horizon)
+        fwd = cp.log(s.shift(-h).to_cupy()) - cp.log(s.to_cupy())
+        return cudf.DataFrame({out_col: cudf.Series(fwd.astype(cp.float32))})
+    except Exception:
+        return cudf.DataFrame({out_col: cudf.Series(cp.full(len(pdf), cp.nan), dtype='f4')})
 
 
 def _perm_pvalues_partition(pdf: cudf.DataFrame, target: str, feat_list: List[str], n_perm: int, max_samples: int) -> cudf.DataFrame:
@@ -2211,7 +2227,7 @@ class StatisticalTests(BaseFeatureEngine):
         """
         self._log_info("Starting StatisticalTests (Dask)...")
 
-        # Fail-fast if primary target configured but missing in data
+        # Validate primary target; support computing log-forward returns if configured
         try:
             primary_target = getattr(self, 'selection_target_column', None)
         except Exception:
@@ -2219,17 +2235,34 @@ class StatisticalTests(BaseFeatureEngine):
         if primary_target:
             try:
                 if primary_target not in df.columns:
-                    # capture a light schema sample for diagnostics
-                    try:
-                        sample_cols = list(df.head(50).columns)
-                    except Exception:
-                        sample_cols = []
-                    self._critical_error(
-                        "Target column not found for dCor ranking",
-                        target=primary_target,
-                        hint="Check config.features.selection_target_column and dataset labeling",
-                        sample_schema=sample_cols[:20]
-                    )
+                    # If target looks like y_logret_fwd_{Nm} and y_close exists, compute it
+                    m = re.match(r"^y_logret_fwd_(\d+)m$", str(primary_target))
+                    if m and ('y_close' in df.columns):
+                        horizon = int(m.group(1))
+                        self._log_info("Primary target missing; computing log-forward return from y_close",
+                                        target=primary_target, horizon=horizon)
+                        meta = cudf.DataFrame({primary_target: cudf.Series([], dtype='f4')})
+                        df = df.assign(**{
+                            primary_target: df[['y_close']].map_partitions(
+                                _compute_forward_log_return_partition,
+                                'y_close',
+                                horizon,
+                                primary_target,
+                                meta=meta
+                            )[primary_target]
+                        })
+                    else:
+                        # Strict error otherwise
+                        try:
+                            sample_cols = list(df.head(50).columns)
+                        except Exception:
+                            sample_cols = []
+                        self._critical_error(
+                            "Target column not found for dCor ranking",
+                            target=primary_target,
+                            hint="Check config.features.selection_target_column and dataset labeling",
+                            sample_schema=sample_cols[:20]
+                        )
             except Exception:
                 # If columns access fails unexpectedly, keep going and let later code raise
                 pass
@@ -2664,6 +2697,16 @@ class StatisticalTests(BaseFeatureEngine):
                         # ---------- Stage 1 (opcional): Permutation test para Top‑K ----------
                         if self.dcor_permutation_top_k and self.dcor_permutations > 0 and retained:
                             perm_top = sorted(retained, key=lambda f: dcor_scores.get(f, 0.0), reverse=True)[: self.dcor_permutation_top_k]
+                            try:
+                                t_perm = _t.time()
+                                self._log_info(
+                                    "Stage 1 permutation test starting",
+                                    top_k=len(perm_top),
+                                    permutations=int(self.dcor_permutations),
+                                    max_samples=int(self.dcor_max_samples),
+                                )
+                            except Exception:
+                                pass
                             # calcula pvalues numa única partição
                             # Check if DataFrame has map_partitions method (Dask DataFrame)
                             if hasattr(one, 'map_partitions'):
@@ -2682,6 +2725,16 @@ class StatisticalTests(BaseFeatureEngine):
                                     {f"dcor_pvalue_{f}": p for f, p in self._compute_permutation_pvalues(one, target, perm_top, self.dcor_permutations).items()}
                                 ])
                                 perm_pdf = perm_result.to_pandas()
+                            try:
+                                elapsed_perm = _t.time() - t_perm
+                                self._log_info(
+                                    "Stage 1 permutation test done",
+                                    elapsed=f"{elapsed_perm:.2f}s",
+                                    top_k=len(perm_top),
+                                    permutations=int(self.dcor_permutations),
+                                )
+                            except Exception:
+                                pass
                             if not perm_pdf.empty:
                                 prow = perm_pdf.iloc[0].to_dict()
                                 df = self._broadcast_scalars(df, prow)
@@ -2734,14 +2787,34 @@ class StatisticalTests(BaseFeatureEngine):
                         t0 = _t.time()
                         max_rows = int(self.selection_max_rows)
                         self._log_info("Stage 2 (VIF+MI) sampling CPU", max_rows=max_rows, candidates=len(retained))
-                        # Sample up to max_rows for CPU-based Stage 2 (VIF/MI)
-                        sample_block = df[[target] + retained].head(max_rows)
-                        if hasattr(sample_block, 'compute'):
-                            # Dask path
-                            sample_pdf = sample_block.compute().to_pandas()
-                        else:
-                            # cuDF path
-                            sample_pdf = sample_block.to_pandas()
+                        # Parallel head sampling: take a small head from each partition to avoid scanning large contiguous chunks
+                        sub = df[[target] + retained]
+                        sample_pdf = None
+                        try:
+                            if hasattr(sub, 'map_partitions'):
+                                # Determine rows per partition
+                                try:
+                                    nparts = int(getattr(sub, 'npartitions', 1))
+                                except Exception:
+                                    nparts = 1
+                                per_part = max(1, int(max_rows // max(1, nparts)))
+                                # Build meta with float dtypes (Stage 1 candidates are floats)
+                                meta = cudf.DataFrame({c: cudf.Series([], dtype='f8') for c in ([target] + retained)})
+                                head_ddf = sub.map_partitions(lambda pdf, k=per_part: pdf.head(int(k)), per_part, meta=meta)
+                                head_cudf = head_ddf.compute()
+                                # Final clip to desired max rows and drop NaNs
+                                sample_pdf = head_cudf.head(max_rows).to_pandas()
+                            else:
+                                # cuDF path
+                                sample_pdf = sub.head(max_rows).to_pandas()
+                        except Exception as _e_head:
+                            # Fallback to original sequential head
+                            self._log_warn("Parallel head sampling failed; falling back", error=str(_e_head))
+                            sample_block = sub.head(max_rows)
+                            if hasattr(sample_block, 'compute'):
+                                sample_pdf = sample_block.compute().to_pandas()
+                            else:
+                                sample_pdf = sample_block.to_pandas()
                         sample_cpu = sample_pdf.dropna()
                         if not sample_cpu.empty and len(retained) >= 2:
                             X_df = sample_cpu[retained]

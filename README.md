@@ -142,3 +142,63 @@ Prevenção de Data Leakage e Validação Temporal
 ---
 
 Este README é a referência única deste módulo. Tarefas listadas como “A IMPLEMENTAR” seguem o documento de referência e constituem o roadmap imediato para completar o pipeline multiestágio de seleção de features.
+
+## Pipeline de Seleção de Features (Plano de Refatoração)
+
+Resumo orientado a performance do pipeline proposto (sem alterar código ainda):
+
+- Estágio 0 — Engenharia de Features
+  - Mover Baxter–King (BK) para a engenharia inicial e generalizar para múltiplas colunas de origem via configuração.
+  - Nomes: `bk_filter_<col_origem>`; casting para `float32`; bordas `NaN` nos `k` extremos.
+  - GPU: `cp.convolve` para kernels curtos; FFT (`cusignal.fftconvolve`) quando `2k+1 > 129`; pesos gerados em CPU e cacheados por worker (L1), copiados 1x para GPU por tamanho.
+  - Config (exemplo):
+    feature_engineering:
+      baxter_king:
+        k: 12
+        low_freq: 32
+        high_freq: 6
+        source_columns:
+          - log_stabilized_y_close
+          - ustbondtrusd_vol_60m
+
+- Estágio 1 — Filtro Univariado (Gating)
+  - Métricas obrigatórias vs. alvo: dCor, Pearson, MI (`mutual_info_regression`) e F‑test (`f_regression` p‑valor).
+  - Regras (YAML): `dcor_min_threshold`, `correlation_min_threshold`, `pvalue_max_alpha`, `stage1_top_n`.
+  - Saída: lista retida + tabela de métricas por feature; artefatos Parquet/JSON opcionais.
+  - Performance: batching de candidatos; amostragem controlada para CPU‑only métricas; evitar broadcast de colunas de métricas (`stage1_broadcast_scores=false`).
+
+- Estágio 2 — Redundância (VIF/MI)
+  - Entrada: lista do Estágio 1; amostrar até `selection_max_rows` em CPU.
+  - VIF iterativo até `vif_threshold`; MI por clusterização (preferencial) limitada por `mi_max_candidates` e `mi_chunk_size`.
+  - Saída: `stage2_features` enxuta para wrappers.
+
+- Estágio 3 — Seleção Multivariada (Wrapper/Embutido)
+  - `SelectFromModel` com LightGBM (`LGBMRegressor`/`Classifier`), `importance_type=gain` e limiar `median` (ou valor configurável).
+  - GPU quando disponível (`device=gpu`); early‑stopping opcional; `TimeSeriesSplit` para validação leve.
+  - Artefatos: importâncias por feature e lista final.
+
+- Estágio 4 — Estabilidade (Bootstrap em Blocos)
+  - Repetir Estágio 3 em amostras temporais (block bootstrap/`TimeSeriesSplit` janelado) e medir frequência de seleção por feature.
+  - Seleção final por limiar de estabilidade (ex.: ≥ 0.7); artefatos com distribuição de frequências.
+
+### Diretrizes de Performance
+
+- Minimizar ida/volta CPU↔GPU: gerar pesos/MI/VIF em CPU sobre amostras; manter convoluções/filtros em GPU.
+- `float32` como padrão; controlar `persist()/wait()` entre engines para estabilizar DAG/memória.
+- Batching para métricas univariadas e MI; limitar candidatos com `stage1_top_n` e `mi_max_candidates`.
+- Em wrappers, limitar `selection_max_rows`, usar `early_stopping_rounds` e `feature_fraction/bagging_fraction` para velocidade.
+
+### Configuração YAML (proposta)
+
+- feature_engineering.baxter_king: parâmetros e `source_columns`.
+- selection.stage1: thresholds (dCor, Pearson, MI, F‑test) e `top_n`.
+- selection.stage3: `model: lgbm`, `importance_threshold: median|float`, `use_gpu: true`.
+- selection.stage4: `n_bootstrap`, `block_size`, `stability_threshold`.
+
+Observação: a estrutura YAML acima será integrada ao `config/config.yaml` numa próxima alteração. Até lá, manter chaves atuais em `features.*` e espelhar novas opções como aliases.
+
+### Artefatos e Persistência
+
+- Salvar métricas de Estágio 1, listas de Estágio 1/2/3 e importâncias do Estágio 3; no Estágio 4, salvar frequências (Parquet) e gráficos de barras (PNG) por par/alvo.
+
+Referências detalhadas: ver `README_STAGE0_FEATURE_ENGINEERING.md`, `README_STATISTICAL_TESTS.md` (atualizado como Estágio 1), `README_STAGE2_VIF_MI.md`, `README_STAGE3_WRAPPER_EMBEDDED.md` e `README_STAGE4_STABILITY.md`.

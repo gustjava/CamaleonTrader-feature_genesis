@@ -77,9 +77,7 @@ class LocalDataLoader:
             # Read the single parquet file
             df = dask_cudf.read_parquet(local_path)
 
-            logger.info("Distributing data across GPU cluster...")
-            df = df.persist()
-            wait(df)
+            # Do not persist here; keep lazy to allow column pruning later
 
             num_partitions = df.npartitions
             logger.info(f"Successfully loaded data from {local_path} with {num_partitions} partitions")
@@ -425,9 +423,7 @@ class LocalDataLoader:
                 logger.warning(f"Unsupported Feather path type: {local_path}")
                 return None
 
-            logger.info("Distributing data across GPU cluster...")
-            df = df.persist()
-            wait(df)
+            # Do not persist here; keep lazy to allow column pruning later
 
             num_partitions = df.npartitions
             logger.info(f"Successfully loaded Feather v2 data from {local_path} with {num_partitions} partitions")

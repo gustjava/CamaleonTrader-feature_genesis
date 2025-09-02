@@ -1,6 +1,6 @@
-StatisticalTests — O Que Executa, Logs e Saídas
+Stage 1 — Filtro Univariado (StatisticalTests)
 
-Este documento explica o comportamento prático do Estágio 2 (módulo StatisticalTests) e seus sub-estágios integrados (ranking, poda de redundância, wrappers e CPCV opcional). Ele mapeia as linhas de log que você vê para as computações reais e lista as chaves de configuração que controlam cada etapa.
+Este documento explica o Estágio 1 do pipeline — a triagem univariada de features (gating) — realizada pelo módulo `StatisticalTests`. Também descreve o dCor rolante opcional para diagnóstico e como os resultados alimentam os estágios seguintes (VIF/MI e wrappers). Logs e chaves de configuração são mapeados para as operações executadas.
 
 Escopo (Caminho Dask)
 
@@ -26,8 +26,8 @@ O módulo StatisticalTests, quando executado em dask_cudf, realiza estas fases:
     - n: número de amostras usadas; tile: tamanho de chunk interno usado.
   - O escalar é transmitido como dcor_returns_volume se bem-sucedido.
 
-3) Estágio 1 — Ranking dCor vs Target (global)
-- Objetivo: ranquear features candidatas por correlação de distância com o target (ex: y_ret_1m).
+3) Estágio 1 — Métricas Univariadas vs Target (global)
+- Objetivo: calcular métricas univariadas por candidata em relação ao alvo e aplicar portões de retenção.
 - Seleção de candidatos:
   - Parte de colunas float (por padrão) e exclui o target.
   - Vazamento e elegibilidade são controlados por listas no config (features):
@@ -36,25 +36,32 @@ O módulo StatisticalTests, quando executado em dask_cudf, realiza estas fases:
     - feature_allowlist / feature_allow_prefixes: se definidos, atuam como allowlist (só entram os permitidos)
     - metrics_prefixes: remove métricas broadcastadas (ex.: dcor_*, dcor_roll_*, stage1_*, cpcv_*)
   - O alvo principal (selection_target_column) e quaisquer selection_target_columns são sempre excluídos.
-- dCor Rolante (opcional): se features.stage1_rolling_enabled é true, computa dCor com janelas e agrega por feature (agg definido por features.stage1_agg; padrão median). Progresso é limitado por features.stage1_rolling_*.
+- Métricas calculadas:
+  - dCor: correlação de distância (dependência geral) — base para ordenação.
+  - Pearson: correlação linear (valor absoluto para gating).
+  - MI: informação mútua (`mutual_info_regression`).
+  - F-test: `f_regression` (usa p‑valor para gating; menor é melhor).
+- dCor Rolante (opcional): se `features.stage1_rolling_enabled` é true, computa dCor com janelas e agrega por feature (agg definido por `features.stage1_agg`; padrão median). Progresso é limitado por `features.stage1_rolling_*`.
   - Para lidar com séries esparsas (ex.: ativos off‑hours), use `features.stage1_rolling_min_valid_pairs` para exigir um número mínimo de observações pareadas (sem NaN) por janela ao calcular o dCor. Se o número de pares válidos for menor que esse mínimo, a janela é ignorada.
 - Lotes e progresso: o conjunto de candidatos é dividido em lotes (features.dcor_batch_size, padrão 64). Após cada lote, uma linha de log é emitida:
   - "dCor batch completed | { 'processed': P, 'total': N, 'batch': B }"
 - Tratamento de features all-NaN (rolante): quando uma feature tem zero janelas com dCor finito, o agregado rolante é NaN. O motor registra e transmite:
   - Log: "Rolling dCor all-NaN features | { 'count': K, 'sample': [...] }"
   - Escalares: dcor_roll_allnan_features (separado por vírgula) e dcor_roll_allnan_count.
-- Retenção (três portões aplicados em ordem):
-  - Threshold: mantém features com dCor >= features.dcor_min_threshold.
-  - Percentil: mantém features acima de features.dcor_min_percentile (0..1) entre as retidas.
-  - Top-N: se features.stage1_top_n > 0, mantém apenas os top N por dCor.
+- Retenção (portões aplicados em ordem):
+  - dCor: `dcor_min_threshold` e/ou `dcor_min_percentile`.
+  - Pearson: `correlation_min_threshold` (valor absoluto).
+  - F-test: `pvalue_max_alpha` (p‑valor máximo aceito).
+  - Top-N: se `stage1_top_n > 0`, manter apenas os top‑N por dCor (ou outra métrica, configurável no futuro).
 - P-valores de permutação (opcional):
   - Se features.dcor_permutation_top_k > 0 e features.dcor_permutations > 0, computa p-valores de permutação nos top-K features por dCor.
   - Filtra por features.dcor_pvalue_alpha.
 - Logs:
-  - "Computing dCor ranking | { 'target': ..., 'n_candidates': N, 'rolling': True|False }"
+  - "Computing Stage 1 metrics | { target, n_candidates, rolling }"
   - "Top-K dCor features | { 'top': [ 'feat:score', ... ], 'agg': 'median|min|max|...', 'source': 'dcor'|'dcor_roll' }"
 - Escalares transmitidos:
   - stage1_features: lista retida separada por vírgula; stage1_features_count.
+  - Opcionalmente: estatísticas agregadas por métrica (médias/medianas) e top‑K por dCor.
 
 4) Estágio 2 — Poda de Redundância (VIF + MI)
 - Objetivo: remover features redundantes após ranking do Estágio 1.
@@ -80,6 +87,12 @@ O módulo StatisticalTests, quando executado em dask_cudf, realiza estas fases:
 - Saída (transmitida): cpcv_splits e cpcv_top_features.
 - Log: "Stage 4 CPCV complete | { splits, top }".
 
+
+Saída do Estágio 1 (artefatos recomendados)
+
+- Tabela Parquet com métricas por feature: `feature`, `dcor`, `pearson_abs`, `mi`, `f_pvalue`, `kept`.
+- JSON de sumário com thresholds utilizados, contagem retida e top‑K por dCor.
+
 Folha de Cola de Configuração (chaves primárias)
 
 - Target e candidatos
@@ -91,6 +104,10 @@ Folha de Cola de Configuração (chaves primárias)
   - features.dcor_batch_size (tamanho do lote para logs de progresso de ranking)
   - features.dcor_top_k (para logging ou filtragem de permutação)
   - features.dcor_min_threshold, features.dcor_min_percentile, features.stage1_top_n (portões de retenção)
+- Outras métricas univariadas (gating)
+  - features.correlation_min_threshold (Pearson absoluto)
+  - features.pvalue_max_alpha (F‑test)
+  - features.stage1_top_n (cap final por dCor)
 - dCor Rolante
   - features.stage1_rolling_enabled, stage1_rolling_window, stage1_rolling_step
   - stage1_rolling_min_periods, stage1_rolling_max_rows, stage1_rolling_max_windows
@@ -123,8 +140,8 @@ Interpretando os Logs de Exemplo (passo-a-passo)
 5) "StatisticalTests complete."
 - Concluiu esta sub-fase (ADF + dCor simples). Em seguida parte para o ranking global.
 
-6) "Computing dCor ranking | { target: 'y_ret_1m', n_candidates: 212, rolling: True }"
-- Vai calcular dCor para 212 candidatos, com rolling habilitado.
+6) "Computing Stage 1 metrics | { target: 'y_ret_1m', n_candidates: 212, rolling: True }"
+- Vai calcular métricas univariadas (dCor, Pearson, MI, F‑test) para 212 candidatos; dCor rolling habilitado.
 
 7) "RuntimeWarning: All-NaN slice encountered"
 - Algumas features tiveram todas as janelas sem dCor finito. O agregador agora filtra NaNs/infinitos e, quando não há valores, retorna NaN sem warning e loga as features all-NaN (com contadores) para facilitar inspeção.

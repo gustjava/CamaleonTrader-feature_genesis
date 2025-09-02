@@ -2,7 +2,7 @@ Stage 2 — Redundância (VIF + MI)
 
 Objetivo
 
-- Remover recursos redundantes depois do ranking do Estágio 1 (dCor). A ideia é reduzir multicolinearidade linear (VIF) e redundância geral (linear e não‑linear) via MI, mantendo um conjunto enxuto de variáveis informativas para wrappers (Estágio 3) e modelos finais.
+- Remover recursos redundantes depois do Estágio 1 (gating univariado por dCor/Pearson/MI/F‑test). A ideia é reduzir multicolinearidade linear (VIF) e redundância geral (linear e não‑linear) via MI, mantendo um conjunto enxuto de variáveis informativas para wrappers (Estágio 3) e modelos finais.
 
 Visão Geral do Fluxo
 
@@ -31,7 +31,7 @@ Por que roda em CPU?
 
 Entradas e Saídas
 
-- Entrada: lista de candidatos retida do Estágio 1 (após thresholds/percentis/top‑N; broadcast em stage1_features).
+- Entrada: lista de candidatos retida do Estágio 1 (após thresholds/percentis/top‑N; broadcast em `stage1_features`).
 - Saída: stage2_features (lista final após VIF + MI) e stage2_features_count (broadcast como scalars no Dask).
 
 Principais Parâmetros
@@ -67,4 +67,3 @@ Integração com Estágios 1 e 3
 
 - Recebe candidatos do Estágio 1 (dCor) já ordenados ou filtrados.
 - Entrega um conjunto enxuto para Estágio 3 (wrappers), onde Lasso/árvores aplica consenso de importância. Menos redundância = wrappers mais estáveis e rápidos.
-

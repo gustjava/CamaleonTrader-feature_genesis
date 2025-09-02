@@ -123,12 +123,16 @@ class DataProcessor:
             # Try loading as cuDF first
             gdf = self.loader.load_currency_pair_data_feather_sync(r2_path)
             if gdf is not None:
+                # Drop denied columns early (never enter any stage)
+                gdf = self._drop_denied_columns(gdf)
                 logger.info(f"Loaded data as cuDF: {len(gdf)} rows, {len(gdf.columns)} columns")
                 return gdf
             
             # Fallback to regular loading
             gdf = self.loader.load_currency_pair_data_sync(r2_path)
             if gdf is not None:
+                # Drop denied columns early
+                gdf = self._drop_denied_columns(gdf)
                 logger.info(f"Loaded data with fallback: {len(gdf)} rows, {len(gdf.columns)} columns")
                 return gdf
             
@@ -189,6 +193,51 @@ class DataProcessor:
     def _get_required_columns(self) -> list:
         """Get the list of required columns for processing."""
         return ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+
+    def _drop_denied_columns(self, df):
+        """Drop columns that must never enter any stage.
+
+        Applies both configured deny lists and the hardcoded 'y_minutes_since_open'.
+        Supports cuDF and dask_cuDF DataFrames.
+        """
+        try:
+            features_cfg = getattr(self.settings, 'features', None)
+            deny_exact = set()
+            deny_prefixes = []
+            dataset_target_prefixes = []
+            protect_exact = set()
+            # Configured lists
+            if features_cfg is not None:
+                deny_exact.update(getattr(features_cfg, 'feature_denylist', []) or [])
+                deny_prefixes = list(getattr(features_cfg, 'feature_deny_prefixes', []) or [])
+                dataset_target_prefixes = list(getattr(features_cfg, 'dataset_target_prefixes', []) or [])
+                # Protect exact targets from being dropped even if they match deny prefixes
+                stc = getattr(features_cfg, 'selection_target_column', None)
+                if stc:
+                    protect_exact.add(str(stc))
+                for t in (getattr(features_cfg, 'selection_target_columns', []) or []):
+                    protect_exact.add(str(t))
+                for t in (getattr(features_cfg, 'dataset_target_columns', []) or []):
+                    protect_exact.add(str(t))
+            # Hard requirement
+            deny_exact.add('y_minutes_since_open')
+
+            cols = list(df.columns)
+            to_drop = [
+                c for c in cols
+                if (
+                    # exact-deny unless protected
+                    ((c in deny_exact) and (c not in protect_exact))
+                    # or any denied prefix unless protected
+                    or (any(c.startswith(p) for p in deny_prefixes + dataset_target_prefixes) and (c not in protect_exact))
+                )
+            ]
+            if to_drop:
+                logger.info(f"Dropping denied columns: {to_drop}")
+                df = df.drop(columns=to_drop)
+        except Exception as e:
+            logger.warning(f"Could not drop denied columns: {e}")
+        return df
     
     def _apply_feature_engines(self, gdf: cudf.DataFrame, currency_pair: str) -> Optional[cudf.DataFrame]:
         """
@@ -473,6 +522,12 @@ class DataProcessor:
             except Exception:
                 logger.debug("Could not attach currency_pair column to Dask DataFrame")
 
+            # Drop denied columns so they never enter any stage
+            try:
+                ddf = self._drop_denied_columns(ddf)
+            except Exception:
+                pass
+
             # Validate initial data
             if not self._validate_initial_data_dask(ddf, currency_pair):
                 self._register_task_failure(currency_pair, r2_path, "Initial Dask data validation failed")
@@ -556,14 +611,26 @@ class DataProcessor:
                             pass
                     return False
 
-            # Compute to cuDF for saving as single Feather
-            logger.info("Computing final Dask DataFrame to cuDF for saving...")
-            gdf = ddf.compute()
-
-            # Save using existing cuDF saver
-            if not self._save_processed_data(gdf, currency_pair):
+            # Save directly from Dask without materializing everything on one GPU
+            if not self._save_processed_data_dask(ddf, currency_pair):
                 self._register_task_failure(currency_pair, r2_path, "Data saving failed")
                 return False
+
+            # Aggressive cleanup to free GPU memory before next task
+            try:
+                try:
+                    ddf = ddf.unpersist()
+                except Exception:
+                    pass
+                del ddf
+            except Exception:
+                pass
+            try:
+                if self.client:
+                    # Free CuPy pools on all workers and run GC
+                    self.client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
+            except Exception:
+                pass
 
             self._register_task_success(currency_pair, r2_path)
             logger.info(f"Successfully completed Dask processing for {currency_pair}")
@@ -691,6 +758,62 @@ class DataProcessor:
             
         except Exception as save_error:
             logger.error(f"Failed to save processed data for {currency_pair}: {save_error}", exc_info=True)
+            return False
+
+    def _save_processed_data_dask(self, ddf, currency_pair: str) -> bool:
+        """Save the processed Dask-cuDF DataFrame as partitioned Feather files.
+
+        Avoids collecting the entire dataset into a single GPU/host memory.
+        Compatible with our loader, which can read directories with part-*.feather.
+        """
+        try:
+            from dask import delayed, compute
+            import pathlib, os
+            import pyarrow.feather as feather
+
+            output_path = self.settings.output.output_path
+            compression = "lz4"
+            output_dir = pathlib.Path(output_path) / currency_pair
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Optionally drop internal metrics columns before saving (pushdown-friendly)
+            try:
+                if bool(getattr(self.settings.features, 'drop_metric_columns_on_save', True)):
+                    metrics_prefixes = list(getattr(self.settings.features, 'metrics_prefixes', []))
+                    to_drop = [c for c in ddf.columns if any(str(c).startswith(p) for p in metrics_prefixes)]
+                    if to_drop:
+                        logger.info(f"Dropping {len(to_drop)} metrics columns before save (prefix filter)")
+                        ddf = ddf.drop(columns=to_drop, errors='ignore')
+            except Exception as e:
+                logger.warning(f"Could not drop metrics columns: {e}")
+
+            # Build delayed write tasks, one per partition
+            parts = ddf.to_delayed()
+
+            def _write_part(pdf, out_dir: str, idx: int, comp: str, cols: list):
+                # pdf is a cuDF DataFrame (computed partition)
+                try:
+                    # Ensure column order is consistent
+                    if cols:
+                        exist = [c for c in cols if c in pdf.columns]
+                        pdf = pdf[exist]
+                    table = pdf.to_arrow()
+                    fname = os.path.join(out_dir, f"part-{idx:05d}.feather")
+                    feather.write_feather(table, fname, compression=comp, version=2)
+                    return fname
+                except Exception as e:
+                    raise e
+
+            cols_order = list(ddf.columns)
+            tasks = [
+                delayed(_write_part)(part, str(output_dir), i, compression, cols_order)
+                for i, part in enumerate(parts)
+            ]
+            written = compute(*tasks)
+            logger.info(f"Saved {len(written)} feather parts to {output_dir}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save Dask data for {currency_pair}: {e}", exc_info=True)
             return False
     
     def _register_task_success(self, currency_pair: str, r2_path: str):

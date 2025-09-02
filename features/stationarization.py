@@ -60,12 +60,17 @@ def _rolling_zscore_partition(series: cudf.Series, window: int, min_periods: int
 
 
 def _variance_log_partition(series: cudf.Series) -> cudf.Series:
-    """Deterministic variance stabilization via log with safe shift."""
+    """Deterministic variance stabilization via log with safe shift (no-leakage version)."""
     try:
         x = series.to_cupy()
-        # shift to positives
-        mn = cp.nanmin(x)
-        shift = (0 - mn) + 1e-8 if cp.isfinite(mn) and mn <= 0 else 1e-8
+        # Use a simple approach: shift by a small constant to ensure positivity
+        # This avoids both data leakage and serialization issues
+        min_val = float(cp.nanmin(x).get())  # Convert to Python float to avoid serialization issues
+        if min_val <= 0:
+            shift = abs(min_val) + 1e-8
+        else:
+            shift = 1e-8
+        
         y = cp.log(x + shift)
         return cudf.Series(y.astype(cp.float32), index=series.index)
     except Exception:
@@ -663,25 +668,72 @@ class StationarizationEngine(BaseFeatureEngine):
         
         # Criar pares de features dinamicamente baseado no que está disponível
         feature_pairs = []
+
+        # Opção: seleção guiada por importância (dCor do Estágio 1)
+        # Estratégia: encontrar, para cada categoria, a feature com maior dCor
+        # Fonte dos scores:
+        # 1) Colunas escalar "dcor_<feature>" presentes no DF (se stage1_broadcast_scores = true e Stationarization vier depois)
+        # 2) Fallback: seleção por ordem (primeiro elemento disponível)
+        selection_mode = str(getattr(self.settings.features, 'rolling_corr_pair_selection', 'first')).lower()
+        dcor_scores: Dict[str, float] = {}
+        if selection_mode == 'dcor':
+            try:
+                # Extrair dCor broadcastado (se presente)
+                dcor_cols = [c for c in available_columns if str(c).startswith('dcor_')]
+                if dcor_cols:
+                    # Para evitar coletar grande amostra, pegue um cabeçalho mínimo
+                    sample = df.head(1)
+                    for dc in dcor_cols:
+                        try:
+                            feat_name = str(dc)[5:]
+                            val = float(sample[dc].iloc[0]) if dc in sample.columns else None
+                            if val is not None and np.isfinite(val):
+                                dcor_scores[feat_name] = val
+                        except Exception:
+                            pass
+                if dcor_scores:
+                    self._log_info("Using dCor-guided pair selection", n_scores=len(dcor_scores))
+            except Exception as e:
+                self._log_warn("Failed to load dCor scores for pair selection; falling back to 'first'", error=str(e))
+                dcor_scores = {}
+                selection_mode = 'first'
         
-        # Pares básicos de correlação
-        if return_features and volume_features:
-            feature_pairs.append((return_features[0], volume_features[0]))  # returns vs volume
-        
-        if return_features and ofi_features:
-            feature_pairs.append((return_features[0], ofi_features[0]))  # returns vs ofi
-        
-        if spread_features and volatility_features:
-            feature_pairs.append((spread_features[0], volatility_features[0]))  # spread vs volatility
-        
-        if price_features and volume_features:
-            feature_pairs.append((price_features[0], volume_features[0]))  # price vs volume
-        
-        if return_features and spread_features:
-            feature_pairs.append((return_features[0], spread_features[0]))  # returns vs spread
-        
-        if volume_features and spread_features:
-            feature_pairs.append((volume_features[0], spread_features[0]))  # volume vs spread
+        def _pick_best(cands: List[str]) -> Optional[str]:
+            if not cands:
+                return None
+            if selection_mode == 'dcor' and dcor_scores:
+                best = None
+                best_score = -np.inf
+                for c in cands:
+                    s = dcor_scores.get(c, None)
+                    if s is not None and s > best_score:
+                        best_score = s
+                        best = c
+                if best is not None:
+                    return best
+            # Fallback: primeiro da lista
+            return cands[0]
+
+        # Pares básicos de correlação (usando melhor por categoria quando disponível)
+        r_best = _pick_best(return_features)
+        v_best = _pick_best(volume_features)
+        o_best = _pick_best(ofi_features)
+        s_best = _pick_best(spread_features)
+        vol_best = _pick_best(volatility_features)
+        p_best = _pick_best(price_features)
+
+        if r_best and v_best:
+            feature_pairs.append((r_best, v_best))  # returns vs volume
+        if r_best and o_best:
+            feature_pairs.append((r_best, o_best))  # returns vs ofi
+        if s_best and vol_best:
+            feature_pairs.append((s_best, vol_best))  # spread vs volatility
+        if p_best and v_best:
+            feature_pairs.append((p_best, v_best))  # price vs volume
+        if r_best and s_best:
+            feature_pairs.append((r_best, s_best))  # returns vs spread
+        if v_best and s_best:
+            feature_pairs.append((v_best, s_best))  # volume vs spread
         
         self._log_info(f"Created {len(feature_pairs)} feature pairs for rolling correlations")
         for pair in feature_pairs:
