@@ -25,6 +25,7 @@ feature_engineering:
     k: 12
     low_freq: 32
     high_freq: 6
+    apply_to_all: true  # se true, aplica BK em todas as colunas numéricas elegíveis
     source_columns:
       - log_stabilized_y_close
       - ustbondtrusd_vol_60m
@@ -37,14 +38,15 @@ Entradas e Saídas
 
 Logs (esperados)
 
-- "Starting SignalProcessor (Dask)…"
-- "Applying Baxter–King filter to '<source_col>'…"
-- "SignalProcessor complete."
+- "Starting FeatureEngineering (Dask)…"
+- "Applied BK (Dask) | { source, out, k, low, high }"
+- "FeatureEngineering complete (Dask)."
 
 Integração
 
 - Roda antes do Estágio 1 (Filtro Univariado). Novas colunas `bk_filter_*` entram como candidatas nas métricas univariadas.
 - Não mover dataset inteiro para CPU; apenas pesos são criados em CPU e copiados para GPU de forma cacheada.
+ - Quando `apply_to_all: true`, BK é aplicado a todas as colunas numéricas elegíveis (exclui targets/deny/metrics prefixes), reduzindo necessidade de listar fontes.
 
 Boas Práticas
 
@@ -54,8 +56,7 @@ Boas Práticas
 
 Referências de Código
 
-- Implementação base: `features/signal_processing.py`
-  - Dask: `SignalProcessor.process`
+- Implementação: `features/feature_engineering.py`
+  - Dask: `FeatureEngineeringEngine.process`
   - Partição: `_apply_bk_filter_gpu_partition`
-  - Pesos: `SignalProcessor._bk_weights_cpu`
-
+  - Pesos: `_bk_weights_cpu` (cacheados)

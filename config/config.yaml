@@ -84,6 +84,50 @@ features:
     low_freq: 6
     high_freq: 32
     k: 12
+  # Stage 0: Feature Engineering (generalized)
+  feature_engineering:
+    baxter_king:
+      k: 12
+      low_freq: 32
+      high_freq: 6
+      apply_to_all: true
+      # Apply BK to these source columns (if present)
+      source_columns:
+        - 'y_close'
+        - 'log_stabilized_y_close'
+        - 'y_open'
+        - 'y_high'
+        - 'y_low'
+        - 'y_weighted_close'
+        - 'y_typical_price'
+        - 'y_vwap_20'
+        - 'y_vwap_distance'
+        - 'y_vwap_60m_distance'
+        - 'y_bb_lower_20_2'
+        - 'y_bb_upper_20_2'
+        - 'y_bb_width_20'
+        - 'y_atr_14'
+        - 'y_true_range'
+        - 'y_parkinson_30m'
+        - 'y_garman_klass_vol'
+        - 'y_gk_vol_30m'
+        - 'y_rv_30m'
+        - 'y_tick_volatility'
+        - 'y_donchian_lower_20'
+        - 'y_donchian_upper_20'
+        - 'y_donchian_width_20'
+        - 'y_donchian_channels_20'
+        - 'y_avg_spread'
+        - 'y_max_spread'
+        - 'y_min_spread'
+        - 'y_spread_lvl'
+        - 'y_body_size'
+        - 'y_range_size'
+        - 'y_range_pct'
+        - 'y_gap_open'
+        - 'y_price_change'
+        - 'y_price_changes_count'
+        - 'y_price_velocity'
   
   # GARCH model configuration
   garch:
@@ -132,6 +176,9 @@ features:
   dcor_min_threshold: 0.05
   dcor_min_percentile: 0.0
   stage1_top_n: 100
+  # Additional Stage 1 gating thresholds
+  correlation_min_threshold: 0.0   # abs(Pearson) minimum; 0.0 disables
+  pvalue_max_alpha: 1.0            # F-test p-value max; 1.0 disables
   dcor_fast_1d_enabled: true
   dcor_fast_1d_bins: 2048
   dcor_permutation_top_k: 50
@@ -159,16 +206,20 @@ features:
   feature_deny_prefixes: ["y_ret_fwd_"]  # exclude all forward-return labels by default
   feature_deny_regex: []             # regex patterns to exclude (optional)
   metrics_prefixes: ["dcor_", "dcor_roll_", "dcor_pvalue_", "stage1_", "cpcv_"]
+  # Always-keep protections (bypass Stage 1 drop and ensure retention)
+  always_keep_features: []
+  always_keep_prefixes: ["garch_"]
   # Visibility controls
   stage1_broadcast_scores: false   # if true, add dcor_* columns (1 per feature)
   stage1_broadcast_rolling: false  # if true, add dcor_roll_* and dcor_roll_cnt_* columns
   debug_write_artifacts: true      # persist JSON artifacts for transparency
   artifacts_dir: artifacts         # subfolder under output_path
+  drop_metric_columns_on_save: true
   # Fractional diff cache/tuning (exposed)
   fracdiff_cache_max_entries: 32
   fracdiff_partition_threshold: 4096
   # Rolling correlation pair selection: 'first' (order-based) or 'dcor' (top by Stage 1 dCor)
-  rolling_corr_pair_selection: dcor
+  rolling_corr_pair_selection: first
   # MI clustering (Stage 2) scalable options
   mi_cluster_enabled: true
   mi_cluster_method: agglo
@@ -270,7 +321,7 @@ features:
   # If true, drops original columns after creating frac_diff_<col>
   drop_original_after_transform: true
   # If true, drops features that didn't pass Stage 1 retention gates
-  drop_nonretained_after_stage1: false
+  drop_nonretained_after_stage1: true
 
 # Processing Pipeline Configuration
 # Settings for data processing and pipeline execution
@@ -326,22 +377,22 @@ pipeline:
       description: "Stationarization techniques including fractional differentiation"
       timeout: 300
       retry_count: 3
-    statistical_tests:
+    feature_engineering:
       enabled: true
       order: 2
-      description: "Statistical tests and analysis"
-      timeout: 300
-      retry_count: 3
-    signal_processing:
-      enabled: true
-      order: 3
-      description: "Signal processing features"
+      description: "Early feature engineering (e.g., Baxter–King over multiple sources)"
       timeout: 300
       retry_count: 3
     garch_models:
       enabled: true
-      order: 4
+      order: 3
       description: "GARCH volatility modeling"
+      timeout: 300
+      retry_count: 3
+    statistical_tests:
+      enabled: true
+      order: 4
+      description: "Statistical tests and analysis"
       timeout: 300
       retry_count: 3
 

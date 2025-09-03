@@ -22,6 +22,11 @@ Visão Geral do Fluxo
   - Redundância par‑a‑par: quando clusterização não está disponível, percorre pares de candidatos e remove o menos informativo (menor dCor) quando MI ≥ features.mi_threshold.
 - Benefícios: remove duplicatas informacionais mesmo quando a relação entre features não é linear.
 
+4) Deduplicação BK vs Original (2.5)
+- O que é: após VIF/MI, quando uma feature `x` e sua contraparte `bk_filter_x` ainda estão na lista, mantemos apenas uma versão.
+- Como usamos: comparamos os escores dCor do Estágio 1 e mantemos a de maior dCor; em empate (ou valores ausentes), preferimos `bk_filter_x`.
+- Resultado: a lista final entregue ao Estágio 3 (`stage2_features`) já vem deduplicada, reduzindo pares redundantes do “mesmo conceito”.
+
 Por que roda em CPU?
 
 - Bibliotecas e algoritmos: a versão robusta e padrão de VIF e de MI (mutual_info_regression) é do scikit‑learn, otimizada para CPU.
@@ -32,7 +37,7 @@ Por que roda em CPU?
 Entradas e Saídas
 
 - Entrada: lista de candidatos retida do Estágio 1 (após thresholds/percentis/top‑N; broadcast em `stage1_features`).
-- Saída: stage2_features (lista final após VIF + MI) e stage2_features_count (broadcast como scalars no Dask).
+- Saída: stage2_features (lista final após VIF + MI + dedup BK/original) e stage2_features_count (broadcast como scalars no Dask).
 
 Principais Parâmetros
 
@@ -61,6 +66,7 @@ Logs Esperados (aprimorados)
 - "Stage 2 (VIF+MI) sampling CPU | { max_rows, candidates }"
 - "Stage 2 VIF starting | { n_features, n_rows }" → "Stage 2 VIF done | { kept, elapsed }"
 - MI: "Stage 2 MI clustering starting | { cand, chunk }" → "Stage 2 MI done | { kept, elapsed, total_elapsed }"
+- Dedup: "Stage 2 BK dedup | { pairs, removed }"
 - Ao final, broadcast: stage2_features, stage2_features_count.
 
 Integração com Estágios 1 e 3

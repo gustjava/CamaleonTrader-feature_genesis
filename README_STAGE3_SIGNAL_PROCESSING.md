@@ -16,8 +16,8 @@ O Que Faz (exato)
   - `y_close`
   - `log_stabilized_y_close`
   - Primeira coluna cujo nome contenha “close” (fallback)
-- Aplica filtro Baxter–King (passa‑banda) sobre a coluna fonte, produzindo a coluna:
-  - `bk_filter_close`
+- Aplica filtro Baxter–King (passa‑banda) sobre a coluna fonte, produzindo colunas (na especificação atual, em Estágio 0):
+  - `bk_filter_<nome_da_coluna_origem>`
 - Bordas do filtro: define `NaN` nos `k` pontos iniciais e finais (propriedade do BK).
 - Persistência de métricas/artifacts (opcional): escreve `artifacts/signal/summary.json` com parâmetros usados e colunas geradas.
 
@@ -40,7 +40,7 @@ Parâmetros (config.features)
 Entradas e Saídas
 
 - Entrada: `dask_cudf.DataFrame` (ou `cudf.DataFrame`) com colunas de preço (idealmente `y_close`).
-- Saída: mesmo DataFrame com coluna adicional `bk_filter_close` (dtype `float32`).
+- Saída (legado): coluna `bk_filter_<...>`; na arquitetura atual, isso é produzido no Estágio 0.
 - Artifacts (opcional): `artifacts/signal/summary.json` com:
   - `new_columns`, `new_columns_count`, `bk_k`, `bk_low_period`, `bk_high_period`.
 
@@ -75,9 +75,10 @@ Integração com Estágios
 - Agora roda no Estágio 0 (Engenharia de Features), antes do Filtro Univariado. As colunas `bk_filter_*` tornam‑se candidatas para o Estágio 1.
 - Não envia dataset inteiro para CPU; opera em GPU via Dask/cuDF. Somente ao salvar/artefatos podem ocorrer conversões controladas.
 
-Referências de Código
+Referências de Código (legado)
 
-- Implementação: `features/signal_processing.py`
-  - Função Dask: `SignalProcessor.process` (aplica BK e registra métricas)
+- Implementação original: `features/signal_processing.py` (BK removido; hoje é pass-through)
+- Implementação atual do BK: `features/feature_engineering.py`
+  - Dask: `FeatureEngineeringEngine.process`
   - Convolução por partição: `_apply_bk_filter_gpu_partition`
-  - Pesos com cache: `SignalProcessor._bk_weights_cpu`
+  - Pesos com cache: `_bk_weights_cpu`

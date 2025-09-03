@@ -20,16 +20,16 @@ O design e o roadmap seguem o documento “Um Pipeline Robusto de Seleção de F
 - `features/base_engine.py`: base comum aos ENGINES (validações leves compatíveis com Dask, monitoramento de memória, logging e utilidades).
 - ENGINES (em `features/`):
   - `stationarization.py` (StationarizationEngine): Diferenciação Fracionária (FFD), variantes de estacionarização e correl. rolantes, com implementações vetorizadas em GPU.
+  - `feature_engineering.py` (FeatureEngineeringEngine): transformações iniciais (ex.: Baxter–King generalizado por múltiplas colunas) aceleradas em GPU.
+  - `garch_models.py` (GARCHModels): ajuste GARCH(1,1) com log‑verossimilhança vetorizada em GPU e extração de métricas/colunas de volatilidade e resíduos para seleção.
   - `statistical_tests.py` (StatisticalTests): ADF e correlação de distância (dCor) em GPU (ver limitações abaixo).
-  - `signal_processing.py` (SignalProcessor): filtros e transformações de sinal no domínio do tempo/estacionário.
-  - `garch_models.py` (GARCHModels): ajuste GARCH(1,1) com log‑verossimilhança vetorizada em GPU e extração de métricas.
 
 ## Fluxo de Execução (por moeda)
 
 1. Descoberta de pares e verificação de saída existente.
 2. Carregamento (`dask_cudf.read_feather`/`read_parquet`) e `persist()`.
 3. Execução dos ENGINES na ordem definida em `config` (cada engine retorna o DataFrame com novas colunas):
-   - StationarizationEngine → StatisticalTests → SignalProcessor → GARCHModels.
+   - StationarizationEngine → FeatureEngineeringEngine → GARCHModels → StatisticalTests.
    - Entre motores: `persist()` + `client.wait(...)` para estabilizar o grafo/memória.
 4. `compute()` para `cudf.DataFrame` e salvamento como Feather v2 (um arquivo por par).
 5. Registro de status em base (quando habilitado).
@@ -45,8 +45,8 @@ O design e o roadmap seguem o documento “Um Pipeline Robusto de Seleção de F
   - ADF vetorizado em GPU usando decomposição QR; versão rolling disponível para séries fracionadas.
   - Correlação de distância (dCor) vetorizada com “centering trick”. Para datasets grandes é usada amostra de cauda (<= 10k). Existe fallback simplificado (correlação Pearson) no caminho single‑fit para contornar limites de memória.
 
-- SignalProcessor (`features/signal_processing.py`)
-  - Transformações/indicadores no domínio da série já estabilizada (e.g., filtros, métricas derivadas). Descrições específicas nas funções do arquivo.
+- FeatureEngineeringEngine (`features/feature_engineering.py`)
+  - Transformações iniciais de sinal (ex.: Baxter–King generalizado para múltiplas colunas) operando em GPU; gera colunas `bk_filter_<col>`.
 
 - GARCHModels (`features/garch_models.py`)
   - Ajuste GARCH(1,1) com log‑likelihood vetorizado em GPU (`cupyx.scipy.signal.lfilter`), parâmetros (ω, α, β), variância condicional, estatísticas de volatilidade e métricas associadas.
@@ -170,7 +170,8 @@ Resumo orientado a performance do pipeline proposto (sem alterar código ainda):
 - Estágio 2 — Redundância (VIF/MI)
   - Entrada: lista do Estágio 1; amostrar até `selection_max_rows` em CPU.
   - VIF iterativo até `vif_threshold`; MI por clusterização (preferencial) limitada por `mi_max_candidates` e `mi_chunk_size`.
-  - Saída: `stage2_features` enxuta para wrappers.
+  - Dedup 2.5: quando existirem pares `x` e `bk_filter_x`, mantém só um (maior dCor; empate → BK).
+  - Saída: `stage2_features` enxuta (após VIF/MI + dedup) para wrappers.
 
 - Estágio 3 — Seleção Multivariada (Wrapper/Embutido)
   - `SelectFromModel` com LightGBM (`LGBMRegressor`/`Classifier`), `importance_type=gain` e limiar `median` (ou valor configurável).

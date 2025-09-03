@@ -13,18 +13,8 @@ O módulo StatisticalTests, quando executado em dask_cudf, realiza estas fases:
   - "ADF rolling on '<col>'…" quando cada coluna fracdiff é processada.
 - Config: features.adf_alpha (usado em outros lugares ao tomar decisões sobre resultados ADF).
 
-2) dCor Single-Fit (verificação de sanidade)
-- Objetivo: computar uma correlação de distância simples entre uma coluna de retornos e y_tickvol_z_15m como métrica rápida de sanidade.
-- Comportamento: 
-  - Seleciona uma coluna de retornos heuristicamente (ex: y_ret_1m ou returns) e a coluna de tick volume.
-  - Amostra a cauda (<= features.distance_corr.max_samples; padrão 10k) e opcionalmente decima para memória.
-  - Computa um escalar dCor único.
-- Logs: 
-  - "Computing single-fit distance correlation using <ret_col> and y_tickvol_z_15m…"
-  - "Using tail sample (<= 10000) rows for dCor calculation"
-  - "dCor computed | { 'n': N, 'tile': T, 'dcor': X, 'elapsed': s }"
-    - n: número de amostras usadas; tile: tamanho de chunk interno usado.
-  - O escalar é transmitido como dcor_returns_volume se bem-sucedido.
+2) (Removido) dCor Single-Fit (sanidade)
+- Este check foi removido por não impactar seleção. O pipeline segue diretamente para o Estágio 1 (métricas univariadas completas).
 
 3) Estágio 1 — Métricas Univariadas vs Target (global)
 - Objetivo: calcular métricas univariadas por candidata em relação ao alvo e aplicar portões de retenção.
@@ -63,6 +53,12 @@ O módulo StatisticalTests, quando executado em dask_cudf, realiza estas fases:
   - stage1_features: lista retida separada por vírgula; stage1_features_count.
   - Opcionalmente: estatísticas agregadas por métrica (médias/medianas) e top‑K por dCor.
 
+7) Estágio 2.5 — Deduplicação BK vs Original
+- Objetivo: quando `x` e `bk_filter_x` sobrevivem ao VIF/MI, manter apenas uma versão para evitar redundância.
+- Regra: comparar dCor do Estágio 1 e manter a de maior dCor; em empate ou ausente, preferir `bk_filter_x`.
+- Efeito: `stage2_features` já vem deduplicado (reflete a lista após VIF/MI + dedup).
+- Logs: "Stage 2 BK dedup | { pairs: P, removed: R }".
+
 4) Estágio 2 — Poda de Redundância (VIF + MI)
 - Objetivo: remover features redundantes após ranking do Estágio 1.
 - Passos:
@@ -99,7 +95,7 @@ Folha de Cola de Configuração (chaves primárias)
   - features.selection_target_column (ex: y_ret_1m)
   - features.selection_max_rows (amostra CPU para Estágios 2/3)
 - Computação dCor
-  - features.distance_corr_max_samples (limite single-fit)
+  - features.distance_corr_max_samples (limite de amostragem para dCor)
   - features.distance_corr_tile_size (tiling)
   - features.dcor_batch_size (tamanho do lote para logs de progresso de ranking)
   - features.dcor_top_k (para logging ou filtragem de permutação)
@@ -108,6 +104,8 @@ Folha de Cola de Configuração (chaves primárias)
   - features.correlation_min_threshold (Pearson absoluto)
   - features.pvalue_max_alpha (F‑test)
   - features.stage1_top_n (cap final por dCor)
+  - features.always_keep_features / always_keep_prefixes (protege colunas de drop no Estágio 1; útil para garantir inclusão de `garch_*`)
+  - features.drop_nonretained_after_stage1 (se true, remove candidatos que não passaram os portões)
 - dCor Rolante
   - features.stage1_rolling_enabled, stage1_rolling_window, stage1_rolling_step
   - stage1_rolling_min_periods, stage1_rolling_max_rows, stage1_rolling_max_windows
@@ -131,11 +129,7 @@ Interpretando os Logs de Exemplo (passo-a-passo)
 2) "ADF rolling on 'frac_diff_…' …" (duas linhas)
 - Executa ADF rolante sobre duas colunas fracdiff detectadas.
 
-3) "Computing single-fit distance correlation …"
-- Faz dCor simples entre uma coluna de retornos e y_tickvol_z_15m.
-
-4) "Using tail sample (<= 10000) …" e "dCor computed | { 'n': 2048, 'tile': 2048, 'dcor': … }"
-- Usou amostra curta para memória; n e tile iguais indica bloco único; dCor próximo de 0 significa fraca dependência distância nessa amostra.
+3) (removido) Logs do single-fit dCor
 
 5) "StatisticalTests complete."
 - Concluiu esta sub-fase (ADF + dCor simples). Em seguida parte para o ranking global.

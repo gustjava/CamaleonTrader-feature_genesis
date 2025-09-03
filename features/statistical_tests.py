@@ -94,12 +94,6 @@ def _distance_correlation_cpu(x: np.ndarray, y: np.ndarray, max_samples: int = 1
     return float(np.sqrt(dcov2_xy) / np.sqrt(np.sqrt(dcov2_xx * dcov2_yy)))
 
 
-def _dcor_single_pair_partition(pdf: cudf.DataFrame, x_col: str, y_col: str, max_samples: int) -> cudf.Series:
-    x = pdf[x_col].to_pandas().to_numpy()
-    y = pdf[y_col].to_pandas().to_numpy()
-    val = _distance_correlation_cpu(x, y, max_samples=max_samples)
-    return cudf.Series([val], index=[0], name="dcor_returns_volume")
-
 
 def _dcor_partition(pdf: cudf.DataFrame, target: str, candidates: List[str], max_samples: int) -> cudf.DataFrame:
     out = {}
@@ -299,6 +293,9 @@ class StatisticalTests(BaseFeatureEngine):
             self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.0))
             self.dcor_min_percentile = float(getattr(uc.features, 'dcor_min_percentile', 0.0))
             self.stage1_top_n = int(getattr(uc.features, 'stage1_top_n', 0))
+            # Additional Stage 1 gates
+            self.correlation_min_threshold = float(getattr(uc.features, 'correlation_min_threshold', 0.0))
+            self.pvalue_max_alpha = float(getattr(uc.features, 'pvalue_max_alpha', 1.0))
             self.dcor_fast_1d_enabled = bool(getattr(uc.features, 'dcor_fast_1d_enabled', False))
             self.dcor_fast_1d_bins = int(getattr(uc.features, 'dcor_fast_1d_bins', 2048))
             self.dcor_permutation_top_k = int(getattr(uc.features, 'dcor_permutation_top_k', 0))
@@ -323,6 +320,9 @@ class StatisticalTests(BaseFeatureEngine):
             self.feature_deny_regex = list(getattr(uc.features, 'feature_deny_regex', []))
             self.metrics_prefixes = list(getattr(uc.features, 'metrics_prefixes', ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_']))
             self.dataset_target_prefixes = list(getattr(uc.features, 'dataset_target_prefixes', []))
+            # Protection lists (always keep)
+            self.always_keep_features = list(getattr(uc.features, 'always_keep_features', []))
+            self.always_keep_prefixes = list(getattr(uc.features, 'always_keep_prefixes', []))
             # Visibility/debug flags
             self.stage1_broadcast_scores = bool(getattr(uc.features, 'stage1_broadcast_scores', False))
             self.stage1_broadcast_rolling = bool(getattr(uc.features, 'stage1_broadcast_rolling', False))
@@ -2304,63 +2304,7 @@ class StatisticalTests(BaseFeatureEngine):
                 meta=(out, "f8"),
             )
 
-        # --- Distance Correlation (single-fit; sem rolling por enquanto) ---
-        # Check for the correct column names that exist in the data
-        returns_col = None
-        tick_volume_col = None
-        
-        # Look for returns column (could be 'returns', 'y_ret_1m', etc.)
-        for col in df.columns:
-            if 'ret' in col.lower() and '1m' in col.lower():
-                returns_col = col
-                break
-            elif col == 'returns':
-                returns_col = col
-                break
-        
-        # Look for normalized tick volume column (prefer z-score versions)
-        for col in df.columns:
-            if 'tickvol_z' in col.lower():
-                tick_volume_col = col
-                break
-            elif 'tick_volume' in col.lower():
-                tick_volume_col = col
-                break
-        
-        if returns_col and tick_volume_col:
-            self._log_info(f"Computing single-fit distance correlation using {returns_col} and {tick_volume_col}...")
-            
-            # Sample data to avoid memory issues (use last up to 1000 rows)
-            # Note: len(ddf) is not supported in Dask; tail(N) will return up to N rows
-            sample_n = 1000
-            sample_df = df[[returns_col, tick_volume_col]].tail(sample_n)
-            # Check if DataFrame has repartition method (Dask DataFrame)
-            if hasattr(sample_df, 'repartition'):
-                sample_df = sample_df.repartition(npartitions=1)
-            self._log_info(f"Using tail sample (<= {sample_n}) rows for dCor calculation")
-            
-            # Check if DataFrame has map_partitions method (Dask DataFrame)
-            if hasattr(sample_df, 'map_partitions'):
-                # map_partitions retorna uma Series de 1 linha com o escalar
-                dcor_ddf = sample_df.map_partitions(
-                    _dcor_single_pair_partition,
-                    returns_col,
-                    tick_volume_col,
-                    int(self.dcor_max_samples),
-                    meta=cudf.Series(name="dcor_returns_volume", dtype="f8"),
-                )
-                dcor_val = float(dcor_ddf.compute().iloc[0])
-            else:
-                # For regular cuDF DataFrame, compute directly
-                dcor_val = float(self._compute_distance_correlation_vectorized(
-                    sample_df[returns_col].to_cupy(), 
-                    sample_df[tick_volume_col].to_cupy(), 
-                    max_samples=self.dcor_max_samples
-                ))
-            df = df.assign(dcor_returns_volume=dcor_val)
-        else:
-            self._log_info(f"Skipping dCor (requires returns and tick_volume columns). Found: returns={returns_col}, tick_volume={tick_volume_col}")
-
+        # Single-fit dCor sanity check removed; proceed to completion.
         self._log_info("StatisticalTests complete.")
         
         # --- Stage 1: dCor ranking vs target (global) ---
@@ -2595,11 +2539,100 @@ class StatisticalTests(BaseFeatureEngine):
                             retained = retained[: self.stage1_top_n]
                             dropped_topn = [f for f in before_topn if f not in retained]
 
+                        # Always-keep protections: ensure protected features are retained if present among candidates
+                        try:
+                            protect_exact = set(getattr(self, 'always_keep_features', []) or [])
+                            protect_prefixes = list(getattr(self, 'always_keep_prefixes', []) or [])
+                        except Exception:
+                            protect_exact, protect_prefixes = set(), []
+                        if protect_exact or protect_prefixes:
+                            protected_present = [
+                                f for f in candidates if (f in protect_exact) or any(f.startswith(p) for p in protect_prefixes)
+                            ]
+                            if protected_present:
+                                # Merge, preserving order by using a stable union
+                                retained_set = set(retained)
+                                for f in protected_present:
+                                    if f not in retained_set:
+                                        retained.append(f)
+                                        retained_set.add(f)
+                                self._log_info("Stage 1 protections applied", added=len(protected_present))
+
                         # Broadcast Stage 1 list (small scalars)
                         df = self._broadcast_scalars(df, {
                             'stage1_features': ','.join(retained),
                             'stage1_features_count': len(retained),
                         })
+
+                        # ---------- Stage 1 (additional) Pearson + F-test gating ----------
+                        dropped_pearson: List[str] = []
+                        dropped_ftest: List[str] = []
+                        try:
+                            need_pearson = float(getattr(self, 'correlation_min_threshold', 0.0)) > 0.0
+                            need_ftest = float(getattr(self, 'pvalue_max_alpha', 1.0)) < 1.0
+                        except Exception:
+                            need_pearson = False
+                            need_ftest = False
+                        if retained and (need_pearson or need_ftest):
+                            # Sample small block for CPU computations
+                            import cudf as _cudf
+                            max_rows = int(getattr(self, 'selection_max_rows', 100000))
+                            sub = df[[target] + retained]
+                            sample_pdf = None
+                            try:
+                                if hasattr(sub, 'map_partitions'):
+                                    try:
+                                        nparts = int(getattr(sub, 'npartitions', 1))
+                                    except Exception:
+                                        nparts = 1
+                                    per_part = max(1, int(max_rows // max(1, nparts)))
+                                    meta = _cudf.DataFrame({c: _cudf.Series([], dtype='f8') for c in ([target] + retained)})
+                                    head_ddf = sub.map_partitions(lambda pdf, k=per_part: pdf.head(int(k)), per_part, meta=meta)
+                                    head_cudf = head_ddf.compute()
+                                    sample_pdf = head_cudf.head(max_rows).to_pandas()
+                                else:
+                                    sample_pdf = sub.head(max_rows).to_pandas()
+                            except Exception as _e_head2:
+                                self._log_warn("Stage 1 sampling for Pearson/F-test failed; skipping extra gates", error=str(_e_head2))
+                                sample_pdf = None
+                            if sample_pdf is not None and not sample_pdf.empty:
+                                sample_cpu = sample_pdf.dropna()
+                                if not sample_cpu.empty and len(retained) >= 1:
+                                    X_df = sample_cpu[retained]
+                                    y_s = sample_cpu[target]
+                                    # Pearson absolute correlation gating
+                                    if need_pearson:
+                                        try:
+                                            pears = X_df.corrwith(y_s).abs().fillna(0.0)
+                                            thr = float(self.correlation_min_threshold)
+                                            before = list(retained)
+                                            retained = [f for f in retained if float(pears.get(f, 0.0)) >= thr]
+                                            dropped_pearson = [f for f in before if f not in retained]
+                                            self._log_info("Stage 1 Pearson gate", threshold=round(thr, 4), kept=len(retained), dropped=len(dropped_pearson))
+                                            # Broadcast Pearson scores (optional artifact table is written below)
+                                        except Exception as e:
+                                            self._log_warn("Pearson gating failed; continuing", error=str(e))
+                                    # F-test p-value gating
+                                    if need_ftest and retained:
+                                        try:
+                                            from sklearn.feature_selection import f_regression
+                                            import numpy as _np
+                                            vals = X_df[retained].values.astype(float)
+                                            yv = y_s.values.astype(float)
+                                            _, pvals = f_regression(vals, yv)
+                                            pmap = {retained[i]: float(p) for i, p in enumerate(pvals)}
+                                            alpha = float(self.pvalue_max_alpha)
+                                            before = list(retained)
+                                            retained = [f for f in retained if pmap.get(f, 1.0) <= alpha]
+                                            dropped_ftest = [f for f in before if f not in retained]
+                                            self._log_info("Stage 1 F-test gate", alpha=round(alpha, 4), kept=len(retained), dropped=len(dropped_ftest))
+                                        except Exception as e:
+                                            self._log_warn("F-test gating failed; continuing", error=str(e))
+                                    # Re-broadcast retained after extra gates
+                                    df = self._broadcast_scalars(df, {
+                                        'stage1_features': ','.join(retained),
+                                        'stage1_features_count': len(retained),
+                                    })
 
                         # Persist dropped lists and reasons (task_metrics + artifact)
                         try:
@@ -2610,6 +2643,11 @@ class StatisticalTests(BaseFeatureEngine):
                                 'stage1_dropped_total': len(dropped_final),
                                 'stage1_dropped_list': dropped_final,
                                 'stage1_retained_total': len(retained),
+                                'stage1_dropped_threshold': dropped_threshold,
+                                'stage1_dropped_percentile': dropped_percentile,
+                                'stage1_dropped_topn': dropped_topn,
+                                'stage1_dropped_pearson': dropped_pearson,
+                                'stage1_dropped_ftest': dropped_ftest,
                             }
                             self._record_metrics('stage1', metrics)
                             # Persist artifact
@@ -2640,7 +2678,16 @@ class StatisticalTests(BaseFeatureEngine):
                             drop_flag = False
                         if drop_flag:
                             try:
-                                to_drop = [c for c in candidates if c not in set(retained)]
+                                # Do not drop protected features even if not in retained
+                                retained_set = set(retained)
+                                to_drop = [
+                                    c for c in candidates
+                                    if (
+                                        (c not in retained_set)
+                                        and (c not in (getattr(self, 'always_keep_features', []) or []))
+                                        and (not any(c.startswith(p) for p in (getattr(self, 'always_keep_prefixes', []) or [])))
+                                    )
+                                ]
                                 if to_drop:
                                     self._log_info("Stage 1 dropping non-retained candidates", count=len(to_drop))
                                     df = df.drop(columns=to_drop, errors='ignore')
@@ -2835,6 +2882,57 @@ class StatisticalTests(BaseFeatureEngine):
                             t_mi_elapsed = _t.time()-t_mi
                             t_s2_total = _t.time()-t0
                             self._log_info("Stage 2 MI done", kept=len(mi_keep), elapsed=f"{t_mi_elapsed:.2f}s", total_elapsed=f"{t_s2_total:.2f}s")
+
+                            # ---------- Stage 2.5: Dedup BK vs original (same base) ----------
+                            try:
+                                pairs_considered = 0
+                                removed_features = []
+                                mi_set = set(mi_keep)
+                                def _choose_keep(orig: str, bk: str) -> str:
+                                    s_orig = float(dcor_scores.get(orig, float('-inf')))
+                                    s_bk = float(dcor_scores.get(bk, float('-inf')))
+                                    # Prefer higher dCor; tie or missing → prefer BK
+                                    if s_bk >= s_orig:
+                                        return bk
+                                    return orig
+                                # Build deduped list preserving order
+                                dedup_keep = []
+                                seen = set()
+                                for f in mi_keep:
+                                    if f in seen:
+                                        continue
+                                    if f.startswith('bk_filter_'):
+                                        base = f[len('bk_filter_'):]
+                                        bk = f
+                                        if base in mi_set:
+                                            keep = _choose_keep(base, bk)
+                                            drop = base if keep == bk else bk
+                                            pairs_considered += 1
+                                            removed_features.append(drop)
+                                            seen.add(keep)
+                                            seen.add(drop)
+                                            dedup_keep.append(keep)
+                                        else:
+                                            seen.add(f)
+                                            dedup_keep.append(f)
+                                    else:
+                                        bk = 'bk_filter_' + f
+                                        if bk in mi_set:
+                                            keep = _choose_keep(f, bk)
+                                            drop = f if keep == bk else bk
+                                            pairs_considered += 1
+                                            removed_features.append(drop)
+                                            seen.add(keep)
+                                            seen.add(drop)
+                                            dedup_keep.append(keep)
+                                        else:
+                                            seen.add(f)
+                                            dedup_keep.append(f)
+                                if pairs_considered > 0:
+                                    self._log_info("Stage 2 BK dedup", pairs=pairs_considered, removed=len([r for r in removed_features if r is not None]))
+                                    mi_keep = dedup_keep
+                            except Exception as _e_dedup:
+                                self._log_warn("Stage 2 BK dedup skipped", error=str(_e_dedup))
 
                             # ---------- Stage 3: Wrappers (Lasso + Árvores) ----------
                             self._log_info("Stage 3 wrappers starting", n_features=len(mi_keep), top_n=int(self.stage3_top_n))

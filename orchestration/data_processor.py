@@ -17,7 +17,7 @@ from config.unified_config import get_unified_config as get_settings
 from dask.distributed import Client, wait
 from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
-from features import StationarizationEngine, StatisticalTests, SignalProcessor, GARCHModels
+from features import StationarizationEngine, StatisticalTests, GARCHModels, FeatureEngineeringEngine
 from features.base_engine import CriticalPipelineError
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ class DataProcessor:
         # Initialize feature engines (pass client for Dask usage when available)
         self.station = StationarizationEngine(self.settings, client)
         self.stats = StatisticalTests(self.settings, client)
-        self.sig = SignalProcessor(self.settings, client)
+        self.feng = FeatureEngineeringEngine(self.settings, client)
         self.garch = GARCHModels(self.settings, client)
     
     def process_currency_pair(self, currency_pair: str, r2_path: str) -> bool:
@@ -353,10 +353,13 @@ class DataProcessor:
         try:
             if engine_name == 'stationarization':
                 return self.station.process_currency_pair(gdf)
+            elif engine_name == 'feature_engineering':
+                return self.feng.process_cudf(gdf)
             elif engine_name == 'statistical_tests':
                 return self.stats.process_cudf(gdf)
             elif engine_name == 'signal_processing':
-                return self.sig.process_cudf(gdf)
+                logger.info("Signal processing engine removed; pass-through (cuDF)")
+                return gdf
             elif engine_name == 'garch_models':
                 return self.garch.process_cudf(gdf)
             else:
@@ -372,10 +375,13 @@ class DataProcessor:
         try:
             if engine_name == 'stationarization':
                 return self.station.process(ddf)
+            elif engine_name == 'feature_engineering':
+                return self.feng.process(ddf)
             elif engine_name == 'statistical_tests':
                 return self.stats.process(ddf)
             elif engine_name == 'signal_processing':
-                return self.sig.process(ddf)
+                logger.info("Signal processing engine removed; pass-through (Dask)")
+                return ddf
             elif engine_name == 'garch_models':
                 return self.garch.process(ddf)
             else:
@@ -487,7 +493,7 @@ class DataProcessor:
                         self.db_handler.update_task_status(task_id, 'RUNNING')
                         # Attach context to engines for metrics/artifacts
                         try:
-                            for eng in (self.station, self.stats, self.sig, self.garch):
+                            for eng in (self.station, self.stats, self.garch):
                                 if hasattr(eng, 'set_task_context'):
                                     eng.set_task_context(self.run_id, task_id, self.db_handler)
                         except Exception:

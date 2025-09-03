@@ -7,14 +7,14 @@ including stationarization techniques, statistical tests, and signal processing.
 
 from .base_engine import BaseFeatureEngine
 from .stationarization import StationarizationEngine
+from .feature_engineering import FeatureEngineeringEngine
 from .statistical_tests import StatisticalTests
-from .signal_processing import SignalProcessor
 from .garch_models import GARCHModels
 
 __all__ = [
     'BaseFeatureEngine',
     'StationarizationEngine',
+    'FeatureEngineeringEngine',
     'StatisticalTests', 
-    'SignalProcessor',
     'GARCHModels'
 ]

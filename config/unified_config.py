@@ -99,6 +99,8 @@ class FeatureConfig:
         'high_freq': 32,
         'k': 12
     })
+    # New nested feature engineering section
+    feature_engineering: Dict[str, Any] = field(default_factory=dict)
     garch: Dict[str, Any] = field(default_factory=lambda: {
         'p': 1,
         'q': 1,
@@ -154,6 +156,9 @@ class FeatureConfig:
     dcor_min_threshold: float = 0.0
     dcor_min_percentile: float = 0.0  # 0.0..1.0
     stage1_top_n: int = 0  # 0 = no cap
+    # Additional Stage 1 gates
+    correlation_min_threshold: float = 0.0  # abs(Pearson)
+    pvalue_max_alpha: float = 1.0           # F-test p-value
     # Stage 0 ADF
     adf_alpha: float = 0.05
     # dCor fast 1D approximation and permutation stage
@@ -187,6 +192,9 @@ class FeatureConfig:
     feature_deny_prefixes: List[str] = field(default_factory=lambda: ['y_ret_fwd_'])
     feature_deny_regex: List[str] = field(default_factory=list)
     metrics_prefixes: List[str] = field(default_factory=lambda: ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_'])
+    # Selection protection (always keep)
+    always_keep_features: List[str] = field(default_factory=list)
+    always_keep_prefixes: List[str] = field(default_factory=list)
     # Stage 1 visibility and debugging
     stage1_broadcast_scores: bool = False     # add dcor_* columns to the frame
     stage1_broadcast_rolling: bool = False    # add dcor_roll_* and cnt_* columns
@@ -343,9 +351,9 @@ class PipelineConfig:
     """Pipeline engine configuration."""
     engines: Dict[str, PipelineEngineConfig] = field(default_factory=lambda: {
         'stationarization': PipelineEngineConfig(enabled=True, order=1, description="Stationarization techniques"),
-        'statistical_tests': PipelineEngineConfig(enabled=True, order=2, description="Statistical tests and analysis"),
-        'signal_processing': PipelineEngineConfig(enabled=True, order=3, description="Signal processing features"),
-        'garch_models': PipelineEngineConfig(enabled=True, order=4, description="GARCH volatility modeling")
+        'feature_engineering': PipelineEngineConfig(enabled=True, order=2, description="Early feature engineering (e.g., BK)"),
+        'garch_models': PipelineEngineConfig(enabled=True, order=3, description="GARCH volatility modeling"),
+        'statistical_tests': PipelineEngineConfig(enabled=True, order=4, description="Statistical tests and analysis"),
     })
 
 
