@@ -4,19 +4,20 @@ Statistical Tests Module for Dynamic Stage 0 Pipeline
 GPU-accelerated statistical tests including ADF and distance correlation.
 """
 
-import logging
-import time
-import numpy as np
-import dask_cudf
-import cudf
-import cupy as cp
-from numba import cuda
-from typing import List, Tuple, Dict, Any
-from pathlib import Path
-import json
-import re
+import logging  # For logging functionality
+import time  # For timing operations
+import numpy as np  # For numerical computations on CPU
+import dask_cudf  # For distributed GPU DataFrames
+import cudf  # For GPU DataFrames
+import cupy as cp  # For GPU array operations
+from numba import cuda  # For CUDA kernel compilation
+from typing import List, Tuple, Dict, Any  # For type hints
+from pathlib import Path  # For path operations
+import json  # For JSON serialization
+import pandas as pd  # For small host-side tables (artifacts, merges)
+import re  # For regular expressions
 
-from .base_engine import BaseFeatureEngine
+from .base_engine import BaseFeatureEngine  # Base class for feature engines
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +26,27 @@ logger = logging.getLogger(__name__)
 def _free_gpu_memory_worker():
     """Free CuPy default memory pool on a Dask worker (best-effort)."""
     try:
-        import cupy as _cp
-        _cp.get_default_memory_pool().free_all_blocks()
+        import cupy as _cp  # Import CuPy locally to avoid tokenization issues
+        _cp.get_default_memory_pool().free_all_blocks()  # Free all GPU memory blocks
     except Exception:
-        pass
+        pass  # Ignore errors if GPU memory cleanup fails
+
+def _adaptive_tile(requested: int) -> int:
+    """Adapt tile size to GPU memory to keep per-block usage within a safe fraction.
+
+    Approximation: per block we hold ~4 tile^2 float64 matrices (dx, dy, A, B):
+    mem_block ≈ 32 * tile^2 bytes. Target ~8% of total device memory.
+    """
+    try:
+        frac = 0.08
+        free_b, total_b = cp.cuda.runtime.memGetInfo()
+        import math as _m
+        tile_dyn = int(_m.sqrt(max(1.0, (frac * float(total_b)) / 32.0)))
+        # Round down to multiple of 256 for better alignment
+        tile_dyn = max(256, (tile_dyn // 256) * 256)
+        return max(256, min(int(requested), tile_dyn))
+    except Exception:
+        return int(requested)
 
 def _hermitian_pinv_gpu(R: cp.ndarray, eps: float = 1e-6) -> cp.ndarray:
     """Pseudo-inverse for symmetric/Hermitian positive semi-definite matrices on GPU.
@@ -39,100 +57,106 @@ def _hermitian_pinv_gpu(R: cp.ndarray, eps: float = 1e-6) -> cp.ndarray:
     try:
         # promote to float64 for numerical stability
         Rw = R.astype(cp.float64, copy=False)
-        # ensure symmetry
+        # ensure symmetry by averaging with transpose
         Rw = 0.5 * (Rw + Rw.T)
-        w, V = cp.linalg.eigh(Rw)
-        w = cp.where(w > eps, w, eps)
-        inv_w = 1.0 / w
+        w, V = cp.linalg.eigh(Rw)  # Eigenvalue decomposition
+        w = cp.where(w > eps, w, eps)  # Clip small eigenvalues for stability
+        inv_w = 1.0 / w  # Compute inverse eigenvalues
         # scale columns of V by inv_w and multiply by V^T
         Rinv = (V * inv_w) @ V.T
-        # symmetrize result
+        # symmetrize result to ensure numerical stability
         Rinv = 0.5 * (Rinv + Rinv.T)
-        return Rinv.astype(R.dtype, copy=False)
+        return Rinv.astype(R.dtype, copy=False)  # Convert back to original dtype
     except Exception:
-        # Fallback to SVD-based pseudoinverse
+        # Fallback to SVD-based pseudoinverse if eigen decomposition fails
         return cp.linalg.pinv(R)
 
 def _adf_tstat_window_host(vals: np.ndarray) -> float:
+    """Compute ADF t-statistic for a time series window on CPU."""
     n = len(vals)
-    if n < 3:
+    if n < 3:  # Need at least 3 points for ADF test
         return np.nan
-    prev = float(vals[0])
-    sum_z = sum_y = sum_zz = sum_yy = sum_zy = 0.0
-    m = n - 1
+    prev = float(vals[0])  # Previous value for differencing
+    sum_z = sum_y = sum_zz = sum_yy = sum_zy = 0.0  # Initialize sums for regression
+    m = n - 1  # Number of differences
     for i in range(1, n):
-        z = prev
-        y = float(vals[i]) - prev
-        prev = float(vals[i])
-        sum_z += z
-        sum_y += y
-        sum_zz += z * z
-        sum_yy += y * y
-        sum_zy += z * y
-    mz = sum_z / m
-    my = sum_y / m
-    Sxx = sum_zz - m * mz * mz
-    Sxy = sum_zy - m * mz * my
-    if Sxx <= 0.0 or m <= 2:
+        z = prev  # Lagged value (x_t-1)
+        y = float(vals[i]) - prev  # First difference (Δx_t)
+        prev = float(vals[i])  # Update previous value
+        sum_z += z  # Sum of lagged values
+        sum_y += y  # Sum of differences
+        sum_zz += z * z  # Sum of squared lagged values
+        sum_yy += y * y  # Sum of squared differences
+        sum_zy += z * y  # Sum of cross products
+    mz = sum_z / m  # Mean of lagged values
+    my = sum_y / m  # Mean of differences
+    Sxx = sum_zz - m * mz * mz  # Sum of squares for x (lagged values)
+    Sxy = sum_zy - m * mz * my  # Sum of cross products
+    if Sxx <= 0.0 or m <= 2:  # Check for valid regression
         return np.nan
-    beta = Sxy / Sxx
-    alpha = my - beta * mz
+    beta = Sxy / Sxx  # Regression coefficient (AR(1) coefficient)
+    alpha = my - beta * mz  # Intercept
+    # Sum of squared errors calculation
     SSE = (sum_yy + m * alpha * alpha + beta * beta * sum_zz - 2.0 * alpha * sum_y - 2.0 * beta * sum_zy + 2.0 * alpha * beta * sum_z)
-    dof = m - 2
+    dof = m - 2  # Degrees of freedom
     if dof <= 0:
         return np.nan
-    sigma2 = SSE / dof
+    sigma2 = SSE / dof  # Error variance
     if sigma2 <= 0.0:
         return np.nan
-    se_beta = (sigma2 / Sxx) ** 0.5
+    se_beta = (sigma2 / Sxx) ** 0.5  # Standard error of beta
     if se_beta == 0.0:
         return np.nan
-    return beta / se_beta
+    return beta / se_beta  # t-statistic for unit root test
 
 
 def _adf_rolling_partition(series: cudf.Series, window: int, min_periods: int) -> cudf.Series:
+    """Apply ADF test to rolling windows of a time series."""
     try:
         # Host rolling apply with host function
         return series.rolling(window=window, min_periods=min_periods).apply(lambda x: _adf_tstat_window_host(np.asarray(x)))
     except Exception:
-        return cudf.Series(cp.full(len(series), cp.nan))
+        return cudf.Series(cp.full(len(series), cp.nan))  # Return NaN series if computation fails
 
 
 def _distance_correlation_cpu(x: np.ndarray, y: np.ndarray, max_samples: int = 10000) -> float:
+    """Compute distance correlation on CPU for small samples."""
     # Basic CPU dCor for small samples
-    x = x.astype(np.float64)
-    y = y.astype(np.float64)
-    mask = np.isfinite(x) & np.isfinite(y)
+    x = x.astype(np.float64)  # Convert to float64 for numerical stability
+    y = y.astype(np.float64)  # Convert to float64 for numerical stability
+    mask = np.isfinite(x) & np.isfinite(y)  # Remove NaN and infinite values
     x = x[mask]
     y = y[mask]
     n = len(x)
-    if n < 3:
+    if n < 3:  # Need at least 3 points for distance correlation
         return float('nan')
-    if n > max_samples:
-        x = x[-max_samples:]
+    if n > max_samples:  # Limit sample size for performance
+        x = x[-max_samples:]  # Take last max_samples points
         y = y[-max_samples:]
         n = max_samples
-    # Distance matrices
-    a = np.abs(x[:, None] - x[None, :])
-    b = np.abs(y[:, None] - y[None, :])
+    # Distance matrices - compute pairwise distances
+    a = np.abs(x[:, None] - x[None, :])  # Distance matrix for x
+    b = np.abs(y[:, None] - y[None, :])  # Distance matrix for y
+    # Double centering: subtract row means, column means, and add grand mean
     A = a - a.mean(axis=0) - a.mean(axis=1)[:, None] + a.mean()
     B = b - b.mean(axis=0) - b.mean(axis=1)[:, None] + b.mean()
-    dcov2_xy = (A * B).mean()
-    dcov2_xx = (A * A).mean()
-    dcov2_yy = (B * B).mean()
-    if dcov2_xx <= 0 or dcov2_yy <= 0:
+    dcov2_xy = (A * B).mean()  # Distance covariance squared
+    dcov2_xx = (A * A).mean()  # Distance variance of x squared
+    dcov2_yy = (B * B).mean()  # Distance variance of y squared
+    if dcov2_xx <= 0 or dcov2_yy <= 0:  # Check for valid variances
         return 0.0
-    return float(np.sqrt(dcov2_xy) / np.sqrt(np.sqrt(dcov2_xx * dcov2_yy)))
+    return float(np.sqrt(dcov2_xy) / np.sqrt(np.sqrt(dcov2_xx * dcov2_yy)))  # Distance correlation
 
 
 
 def _dcor_partition(pdf: cudf.DataFrame, target: str, candidates: List[str], max_samples: int) -> cudf.DataFrame:
+    """Compute distance correlation between target and candidate features for a partition."""
     out = {}
-    t = pdf[target].to_pandas().to_numpy()
-    for c in candidates:
-        x = pdf[c].to_pandas().to_numpy()
-        out[f"dcor_{c}"] = _distance_correlation_cpu(x, t, max_samples=max_samples)
-    return cudf.DataFrame([out])
+    t = pdf[target].to_pandas().to_numpy()  # Convert target to numpy array
+    for c in candidates:  # Iterate through candidate features
+        x = pdf[c].to_pandas().to_numpy()  # Convert candidate to numpy array
+        out[f"dcor_{c}"] = _distance_correlation_cpu(x, t, max_samples=max_samples)  # Compute distance correlation
+    return cudf.DataFrame([out])  # Return results as DataFrame
 
 
 def _distance_correlation_gpu(x: cp.ndarray, y: cp.ndarray, tile: int = 2048, max_n: int = None) -> float:
@@ -141,92 +165,94 @@ def _distance_correlation_gpu(x: cp.ndarray, y: cp.ndarray, tile: int = 2048, ma
     Implements a two-pass algorithm without forming full n×n matrices in memory.
     """
     try:
-        # Remove NaNs
+        # Remove NaNs and invalid values
         mask = ~(cp.isnan(x) | cp.isnan(y))
         x = x[mask]
         y = y[mask]
         n = int(x.size)
-        if n < 2:
+        if n < 2:  # Need at least 2 points for distance correlation
             return float('nan')
-        if max_n is not None and n > int(max_n):
-            x = x[-int(max_n):]
+        if max_n is not None and n > int(max_n):  # Limit sample size for performance
+            x = x[-int(max_n):]  # Take last max_n points
             y = y[-int(max_n):]
             n = int(x.size)
-        tile = int(max(1, tile))
+        tile = int(max(1, tile))  # Ensure tile size is at least 1
 
         # pass 1: row sums and grand means for distance matrices
-        a_row_sums = cp.zeros(n, dtype=cp.float64)
-        b_row_sums = cp.zeros(n, dtype=cp.float64)
-        a_total_sum = cp.float64(0.0)
-        b_total_sum = cp.float64(0.0)
-        for i0 in range(0, n, tile):
+        a_row_sums = cp.zeros(n, dtype=cp.float64)  # Row sums for x distance matrix
+        b_row_sums = cp.zeros(n, dtype=cp.float64)  # Row sums for y distance matrix
+        a_total_sum = cp.float64(0.0)  # Total sum for x distance matrix
+        b_total_sum = cp.float64(0.0)  # Total sum for y distance matrix
+        for i0 in range(0, n, tile):  # Process in tiles to manage memory
             i1 = min(i0 + tile, n)
-            xi = x[i0:i1]
-            yi = y[i0:i1]
-            for j0 in range(0, n, tile):
+            xi = x[i0:i1]  # Current tile of x
+            yi = y[i0:i1]  # Current tile of y
+            for j0 in range(0, n, tile):  # Compare with all other tiles
                 j1 = min(j0 + tile, n)
-                xj = x[j0:j1]
-                yj = y[j0:j1]
-                dx = cp.abs(xi[:, None] - xj[None, :])
-                dy = cp.abs(yi[:, None] - yj[None, :])
-                a_row_sums[i0:i1] += dx.sum(axis=1, dtype=cp.float64)
-                b_row_sums[i0:i1] += dy.sum(axis=1, dtype=cp.float64)
-                if j0 != i0:
-                    a_row_sums[j0:j1] += dx.sum(axis=0, dtype=cp.float64)
-                    b_row_sums[j0:j1] += dy.sum(axis=0, dtype=cp.float64)
-                a_total_sum += cp.sum(dx, dtype=cp.float64)
-                b_total_sum += cp.sum(dy, dtype=cp.float64)
+                xj = x[j0:j1]  # Comparison tile of x
+                yj = y[j0:j1]  # Comparison tile of y
+                dx = cp.abs(xi[:, None] - xj[None, :])  # Distance matrix block for x
+                dy = cp.abs(yi[:, None] - yj[None, :])  # Distance matrix block for y
+                a_row_sums[i0:i1] += dx.sum(axis=1, dtype=cp.float64)  # Add row sums for current tile
+                b_row_sums[i0:i1] += dy.sum(axis=1, dtype=cp.float64)  # Add row sums for current tile
+                if j0 != i0:  # Avoid double counting diagonal blocks
+                    a_row_sums[j0:j1] += dx.sum(axis=0, dtype=cp.float64)  # Add column sums for comparison tile
+                    b_row_sums[j0:j1] += dy.sum(axis=0, dtype=cp.float64)  # Add column sums for comparison tile
+                a_total_sum += cp.sum(dx, dtype=cp.float64)  # Add to total sum
+                b_total_sum += cp.sum(dy, dtype=cp.float64)  # Add to total sum
 
         n_f = float(n)
-        a_row_mean = a_row_sums / n_f
-        b_row_mean = b_row_sums / n_f
-        a_grand = float(a_total_sum / (n_f * n_f))
-        b_grand = float(b_total_sum / (n_f * n_f))
+        a_row_mean = a_row_sums / n_f  # Mean of each row in x distance matrix
+        b_row_mean = b_row_sums / n_f  # Mean of each row in y distance matrix
+        a_grand = float(a_total_sum / (n_f * n_f))  # Grand mean of x distance matrix
+        b_grand = float(b_total_sum / (n_f * n_f))  # Grand mean of y distance matrix
 
         # pass 2: centered blocks and accumulations
-        num = cp.float64(0.0)
-        sumA2 = cp.float64(0.0)
-        sumB2 = cp.float64(0.0)
-        for i0 in range(0, n, tile):
+        num = cp.float64(0.0)  # Numerator for distance covariance
+        sumA2 = cp.float64(0.0)  # Sum of squared centered x distances
+        sumB2 = cp.float64(0.0)  # Sum of squared centered y distances
+        for i0 in range(0, n, tile):  # Process in tiles again
             i1 = min(i0 + tile, n)
-            xi = x[i0:i1]
-            yi = y[i0:i1]
-            a_i_mean = a_row_mean[i0:i1]
-            b_i_mean = b_row_mean[i0:i1]
-            for j0 in range(0, n, tile):
+            xi = x[i0:i1]  # Current tile of x
+            yi = y[i0:i1]  # Current tile of y
+            a_i_mean = a_row_mean[i0:i1]  # Row means for current tile
+            b_i_mean = b_row_mean[i0:i1]  # Row means for current tile
+            for j0 in range(0, n, tile):  # Compare with all other tiles
                 j1 = min(j0 + tile, n)
-                xj = x[j0:j1]
-                yj = y[j0:j1]
-                a_j_mean = a_row_mean[j0:j1]
-                b_j_mean = b_row_mean[j0:j1]
-                dx = cp.abs(xi[:, None] - xj[None, :])
-                dy = cp.abs(yi[:, None] - yj[None, :])
+                xj = x[j0:j1]  # Comparison tile of x
+                yj = y[j0:j1]  # Comparison tile of y
+                a_j_mean = a_row_mean[j0:j1]  # Row means for comparison tile
+                b_j_mean = b_row_mean[j0:j1]  # Row means for comparison tile
+                dx = cp.abs(xi[:, None] - xj[None, :])  # Distance matrix block for x
+                dy = cp.abs(yi[:, None] - yj[None, :])  # Distance matrix block for y
+                # Double centering: subtract row means, column means, and add grand mean
                 A = dx - a_i_mean[:, None] - a_j_mean[None, :] + a_grand
                 B = dy - b_i_mean[:, None] - b_j_mean[None, :] + b_grand
-                num += cp.sum(A * B, dtype=cp.float64)
-                sumA2 += cp.sum(A * A, dtype=cp.float64)
-                sumB2 += cp.sum(B * B, dtype=cp.float64)
-        denom = cp.sqrt(sumA2 * sumB2)
-        if denom == 0:
+                num += cp.sum(A * B, dtype=cp.float64)  # Accumulate distance covariance
+                sumA2 += cp.sum(A * A, dtype=cp.float64)  # Accumulate x distance variance
+                sumB2 += cp.sum(B * B, dtype=cp.float64)  # Accumulate y distance variance
+        denom = cp.sqrt(sumA2 * sumB2)  # Denominator for distance correlation
+        if denom == 0:  # Check for zero denominator
             return 0.0
-        return float(num / denom)
+        return float(num / denom)  # Return distance correlation
     except Exception:
-        return float('nan')
+        return float('nan')  # Return NaN if computation fails
 
 
 def _dcor_partition_gpu(pdf: cudf.DataFrame, target: str, candidates: List[str], max_samples: int, tile: int) -> cudf.DataFrame:
+    """Compute distance correlation between target and candidate features using GPU for a partition."""
     out = {}
     try:
-        y = pdf[target].astype('f8').to_cupy()
+        y = pdf[target].astype('f8').to_cupy()  # Convert target to CuPy array
     except Exception:
-        return cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])
-    for c in candidates:
+        return cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])  # Return NaN if conversion fails
+    for c in candidates:  # Iterate through candidate features
         try:
-            x = pdf[c].astype('f8').to_cupy()
-            out[f"dcor_{c}"] = _distance_correlation_gpu(x, y, tile=tile, max_n=max_samples)
+            x = pdf[c].astype('f8').to_cupy()  # Convert candidate to CuPy array
+            out[f"dcor_{c}"] = _distance_correlation_gpu(x, y, tile=tile, max_n=max_samples)  # Compute GPU distance correlation
         except Exception:
-            out[f"dcor_{c}"] = float('nan')
-    return cudf.DataFrame([out])
+            out[f"dcor_{c}"] = float('nan')  # Return NaN if computation fails
+    return cudf.DataFrame([out])  # Return results as DataFrame
 
 
 def _dcor_rolling_partition_gpu(
@@ -321,6 +347,161 @@ def _dcor_rolling_partition_gpu(
     for c in candidates:
         ordered[f"dcor_roll_cnt_{c}"] = cnt_map.get(f"dcor_roll_cnt_{c}", np.int64(0))
     return cudf.DataFrame([ordered])
+
+
+# ---------------- Dask multi-GPU task helpers (feature-parallel) ----------------
+def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: int, tile: int,
+                          sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
+                          session_auto_mask: Dict = None) -> Dict[str, float]:
+    """Compute dCor for a chunk of features on a single worker/GPU.
+
+    Accepts a pandas DataFrame to ease serialization; converts to cuDF on worker
+    and uses the GPU chunked kernel to compute dCor per feature.
+    """
+    try:
+        import cudf as _cudf
+        gdf = _cudf.from_pandas(pdf_pd)
+        # Apply session masks (driver-based and data-driven)
+        try:
+            if sessions_cfg and feature_prefix_map and ts_col in gdf.columns:
+                from .session_mask import build_driver_masks, driver_for_feature, build_feature_masks_data_driven
+                drivers = list({driver_for_feature(f, feature_prefix_map) for f in feats if driver_for_feature(f, feature_prefix_map)})
+                masks = build_driver_masks(gdf[ts_col], sessions_cfg.get('drivers', {}), drivers) if drivers else {}
+                # data-driven masks per feature
+                feat_masks = {}
+                try:
+                    if session_auto_mask and bool(session_auto_mask.get('enabled', False)):
+                        feat_masks = build_feature_masks_data_driven(
+                            gdf,
+                            feats,
+                            int(session_auto_mask.get('window_rows', 120)),
+                            int(session_auto_mask.get('min_valid', 90)),
+                        )
+                except Exception:
+                    feat_masks = {}
+                for f in feats:
+                    drv = driver_for_feature(f, feature_prefix_map)
+                    m = None
+                    if drv and drv in masks:
+                        m = masks[drv]
+                    if f in feat_masks:
+                        m = (feat_masks[f] if m is None else (m & feat_masks[f]))
+                    if m is not None:
+                        try:
+                            gdf[f] = gdf[f].where(m, np.nan)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        tile = _adaptive_tile(int(tile))
+        res_df = _dcor_partition_gpu(gdf, target, feats, int(max_samples), int(tile))
+        row = res_df.to_pandas().iloc[0].to_dict()
+        return {f: float(row.get(f"dcor_{f}", float("nan"))) for f in feats}
+    except Exception:
+        return {f: float('nan') for f in feats}
+
+
+def _dask_dcor_rolling_chunk_task(pdf_pd, target: str, feats: List[str], window: int, step: int, min_periods: int,
+                                  min_valid_pairs: int, max_rows: int, max_windows: int, agg: str, max_samples: int, tile: int,
+                                  sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
+                                  session_auto_mask: Dict = None) -> Dict[str, Any]:
+    """Compute rolling dCor aggregated scores for a chunk of features on a single worker/GPU."""
+    try:
+        import cudf as _cudf
+        gdf = _cudf.from_pandas(pdf_pd)
+        # Apply session masks (driver-based and data-driven)
+        try:
+            if sessions_cfg and feature_prefix_map and ts_col in gdf.columns:
+                from .session_mask import build_driver_masks, driver_for_feature, build_feature_masks_data_driven
+                drivers = list({driver_for_feature(f, feature_prefix_map) for f in feats if driver_for_feature(f, feature_prefix_map)})
+                masks = build_driver_masks(gdf[ts_col], sessions_cfg.get('drivers', {}), drivers) if drivers else {}
+                feat_masks = {}
+                try:
+                    if session_auto_mask and bool(session_auto_mask.get('enabled', False)):
+                        feat_masks = build_feature_masks_data_driven(
+                            gdf,
+                            feats,
+                            int(session_auto_mask.get('window_rows', 120)),
+                            int(session_auto_mask.get('min_valid', 90)),
+                        )
+                except Exception:
+                    feat_masks = {}
+                for f in feats:
+                    drv = driver_for_feature(f, feature_prefix_map)
+                    m = None
+                    if drv and drv in masks:
+                        m = masks[drv]
+                    if f in feat_masks:
+                        m = (feat_masks[f] if m is None else (m & feat_masks[f]))
+                    if m is not None:
+                        try:
+                            gdf[f] = gdf[f].where(m, np.nan)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        tile = _adaptive_tile(int(tile))
+        res_df = _dcor_rolling_partition_gpu(gdf, target, feats, int(window), int(step), int(min_periods), int(min_valid_pairs),
+                                              int(max_rows), int(max_windows), str(agg), int(max_samples), int(tile))
+        row = res_df.to_pandas().iloc[0].to_dict()
+        # return both scores and counts
+        out: Dict[str, Any] = {}
+        for f in feats:
+            out[f"dcor_roll_{f}"] = float(row.get(f"dcor_roll_{f}", float('nan')))
+            out[f"dcor_roll_cnt_{f}"] = int(row.get(f"dcor_roll_cnt_{f}", 0))
+        return out
+    except Exception:
+        out: Dict[str, Any] = {}
+        for f in feats:
+            out[f"dcor_roll_{f}"] = float('nan')
+            out[f"dcor_roll_cnt_{f}"] = 0
+        return out
+
+
+def _dask_perm_chunk_task(pdf_pd, target: str, feats: List[str], n_perm: int, max_samples: int, tile: int,
+                          sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
+                          session_auto_mask: Dict = None) -> Dict[str, float]:
+    """Compute permutation p-values for a chunk of features on a single worker/GPU."""
+    try:
+        import cudf as _cudf
+        gdf = _cudf.from_pandas(pdf_pd)
+        # Apply session masks (driver-based and data-driven)
+        try:
+            if sessions_cfg and feature_prefix_map and ts_col in gdf.columns:
+                from .session_mask import build_driver_masks, driver_for_feature, build_feature_masks_data_driven
+                drivers = list({driver_for_feature(f, feature_prefix_map) for f in feats if driver_for_feature(f, feature_prefix_map)})
+                masks = build_driver_masks(gdf[ts_col], sessions_cfg.get('drivers', {}), drivers) if drivers else {}
+                feat_masks = {}
+                try:
+                    if session_auto_mask and bool(session_auto_mask.get('enabled', False)):
+                        feat_masks = build_feature_masks_data_driven(
+                            gdf,
+                            feats,
+                            int(session_auto_mask.get('window_rows', 120)),
+                            int(session_auto_mask.get('min_valid', 90)),
+                        )
+                except Exception:
+                    feat_masks = {}
+                for f in feats:
+                    drv = driver_for_feature(f, feature_prefix_map)
+                    m = None
+                    if drv and drv in masks:
+                        m = masks[drv]
+                    if f in feat_masks:
+                        m = (feat_masks[f] if m is None else (m & feat_masks[f]))
+                    if m is not None:
+                        try:
+                            gdf[f] = gdf[f].where(m, np.nan)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        tile = _adaptive_tile(int(tile))
+        res_df = _perm_pvalues_partition_gpu(gdf, target, feats, int(n_perm), int(max_samples), int(tile))
+        row = res_df.to_pandas().iloc[0].to_dict()
+        return {f: float(row.get(f"dcor_pvalue_{f}", float('nan'))) for f in feats}
+    except Exception:
+        return {f: float('nan') for f in feats}
 
 
 def _compute_forward_log_return_partition(pdf: cudf.DataFrame, price_col: str, horizon: int, out_col: str) -> cudf.DataFrame:
@@ -489,78 +670,80 @@ class StatisticalTests(BaseFeatureEngine):
     """
 
     def __init__(self, settings, client):
-        super().__init__(settings, client)
+        """Initialize StatisticalTests with configuration parameters."""
+        super().__init__(settings, client)  # Initialize base class
         # Store settings for consistency with other engines
         self.settings = settings
         # Configurable parameters with safe fallbacks
         try:
-            self.dcor_max_samples = getattr(settings.features, 'distance_corr_max_samples', 10000)
+            self.dcor_max_samples = getattr(settings.features, 'distance_corr_max_samples', 10000)  # Max samples for distance correlation
         except Exception:
-            self.dcor_max_samples = 10000
+            self.dcor_max_samples = 10000  # Default fallback
         try:
             from config.unified_config import get_unified_config
-            uc = get_unified_config()
-            self.dcor_tile_size = getattr(uc.features, 'distance_corr_tile_size', 2048)
-            self.selection_target_column = getattr(uc.features, 'selection_target_column', 'y_ret_1m')
-            self.dcor_top_k = int(getattr(uc.features, 'dcor_top_k', 50))
-            self.dcor_include_permutation = bool(getattr(uc.features, 'dcor_include_permutation', False))
-            self.dcor_permutations = int(getattr(uc.features, 'dcor_permutations', 0))
+            uc = get_unified_config()  # Load unified configuration
+            self.dcor_tile_size = getattr(uc.features, 'distance_corr_tile_size', 2048)  # GPU tile size for distance correlation
+            self.selection_target_column = getattr(uc.features, 'selection_target_column', 'y_ret_1m')  # Target column for feature selection
+            self.dcor_top_k = int(getattr(uc.features, 'dcor_top_k', 50))  # Top K features to select by distance correlation
+            self.dcor_include_permutation = bool(getattr(uc.features, 'dcor_include_permutation', False))  # Whether to include permutation tests
+            self.dcor_permutations = int(getattr(uc.features, 'dcor_permutations', 0))  # Number of permutations for significance testing
         except Exception:
+            # Fallback defaults when unified config is not available
             self.dcor_tile_size = 2048
             self.selection_target_column = 'y_ret_1m'
             self.dcor_top_k = 50
             self.dcor_include_permutation = False
             self.dcor_permutations = 0
             # Gating defaults when unified config missing
-            self.selection_target_columns = []
-            self.dataset_target_columns = []
-            self.feature_allowlist = []
-            self.feature_allow_prefixes = []
-            self.feature_denylist = []
-            self.feature_deny_prefixes = ['y_ret_fwd_']
-            self.feature_deny_regex = []
-            self.metrics_prefixes = ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_']
-            self.dataset_target_prefixes = []
-            self.selection_max_rows = 100000
-            self.vif_threshold = 5.0
-            self.mi_threshold = 0.3
-            self.stage3_top_n = 50
+            self.selection_target_columns = []  # Target columns for feature selection
+            self.dataset_target_columns = []  # Dataset target columns
+            self.feature_allowlist = []  # Features explicitly allowed
+            self.feature_allow_prefixes = []  # Feature prefixes allowed
+            self.feature_denylist = []  # Features explicitly denied
+            self.feature_deny_prefixes = ['y_ret_fwd_']  # Feature prefixes denied (future returns)
+            self.feature_deny_regex = []  # Regex patterns for denied features
+            self.metrics_prefixes = ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_']  # Metric column prefixes
+            self.dataset_target_prefixes = []  # Dataset target prefixes
+            self.selection_max_rows = 100000  # Maximum rows for selection
+            self.vif_threshold = 5.0  # Variance Inflation Factor threshold
+            self.mi_threshold = 0.3  # Mutual Information threshold
+            self.stage3_top_n = 50  # Top N features for stage 3
             # Rolling dCor defaults when unified config missing
-            self.stage1_rolling_enabled = False
-            self.stage1_rolling_window = 2000
-            self.stage1_rolling_step = 500
-            self.stage1_rolling_min_periods = 200
-            self.stage1_rolling_min_valid_pairs = self.stage1_rolling_min_periods
-            self.stage1_rolling_max_rows = 20000
-            self.stage1_rolling_max_windows = 20
-            self.stage1_agg = 'median'
-            self.stage1_use_rolling_scores = True
+            self.stage1_rolling_enabled = False  # Whether rolling distance correlation is enabled
+            self.stage1_rolling_window = 2000  # Rolling window size
+            self.stage1_rolling_step = 500  # Rolling step size
+            self.stage1_rolling_min_periods = 200  # Minimum periods for rolling calculation
+            self.stage1_rolling_min_valid_pairs = self.stage1_rolling_min_periods  # Minimum valid pairs
+            self.stage1_rolling_max_rows = 20000  # Maximum rows for rolling calculation
+            self.stage1_rolling_max_windows = 20  # Maximum number of rolling windows
+            self.stage1_agg = 'median'  # Aggregation method for rolling scores
+            self.stage1_use_rolling_scores = True  # Whether to use rolling scores
         else:
-            # Defaults when config present
-            self.selection_max_rows = int(getattr(uc.features, 'selection_max_rows', 100000))
-            self.vif_threshold = float(getattr(uc.features, 'vif_threshold', 5.0))
-            self.mi_threshold = float(getattr(uc.features, 'mi_threshold', 0.3))
-            self.stage3_top_n = int(getattr(uc.features, 'stage3_top_n', 50))
-            self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.0))
-            self.dcor_min_percentile = float(getattr(uc.features, 'dcor_min_percentile', 0.0))
-            self.stage1_top_n = int(getattr(uc.features, 'stage1_top_n', 0))
+            # Defaults when config present - load from unified configuration
+            self.selection_max_rows = int(getattr(uc.features, 'selection_max_rows', 100000))  # Max rows for selection
+            self.vif_threshold = float(getattr(uc.features, 'vif_threshold', 5.0))  # VIF threshold for multicollinearity
+            self.mi_threshold = float(getattr(uc.features, 'mi_threshold', 0.3))  # MI threshold for redundancy
+            self.stage3_top_n = int(getattr(uc.features, 'stage3_top_n', 50))  # Top N for stage 3
+            self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.0))  # Min distance correlation threshold
+            self.dcor_min_percentile = float(getattr(uc.features, 'dcor_min_percentile', 0.0))  # Min percentile threshold
+            self.stage1_top_n = int(getattr(uc.features, 'stage1_top_n', 0))  # Top N for stage 1
             # Additional Stage 1 gates
-            self.correlation_min_threshold = float(getattr(uc.features, 'correlation_min_threshold', 0.0))
-            self.pvalue_max_alpha = float(getattr(uc.features, 'pvalue_max_alpha', 1.0))
-            self.dcor_fast_1d_enabled = bool(getattr(uc.features, 'dcor_fast_1d_enabled', False))
-            self.dcor_fast_1d_bins = int(getattr(uc.features, 'dcor_fast_1d_bins', 2048))
-            self.dcor_permutation_top_k = int(getattr(uc.features, 'dcor_permutation_top_k', 0))
-            self.dcor_pvalue_alpha = float(getattr(uc.features, 'dcor_pvalue_alpha', 0.05))
+            self.correlation_min_threshold = float(getattr(uc.features, 'correlation_min_threshold', 0.0))  # Min correlation threshold
+            self.pvalue_max_alpha = float(getattr(uc.features, 'pvalue_max_alpha', 1.0))  # Max p-value alpha
+            self.dcor_fast_1d_enabled = bool(getattr(uc.features, 'dcor_fast_1d_enabled', False))  # Fast 1D distance correlation
+            self.dcor_fast_1d_bins = int(getattr(uc.features, 'dcor_fast_1d_bins', 2048))  # Bins for fast 1D dCor
+            self.dcor_permutation_top_k = int(getattr(uc.features, 'dcor_permutation_top_k', 0))  # Top K for permutation tests
+            self.dcor_pvalue_alpha = float(getattr(uc.features, 'dcor_pvalue_alpha', 0.05))  # Alpha for p-value tests
             # Rolling dCor params
-            self.stage1_rolling_enabled = bool(getattr(uc.features, 'stage1_rolling_enabled', False))
-            self.stage1_rolling_window = int(getattr(uc.features, 'stage1_rolling_window', 2000))
-            self.stage1_rolling_step = int(getattr(uc.features, 'stage1_rolling_step', 500))
-            self.stage1_rolling_min_periods = int(getattr(uc.features, 'stage1_rolling_min_periods', 200))
-            self.stage1_rolling_min_valid_pairs = int(getattr(uc.features, 'stage1_rolling_min_valid_pairs', self.stage1_rolling_min_periods))
-            self.stage1_rolling_max_rows = int(getattr(uc.features, 'stage1_rolling_max_rows', 20000))
-            self.stage1_rolling_max_windows = int(getattr(uc.features, 'stage1_rolling_max_windows', 20))
-            self.stage1_agg = str(getattr(uc.features, 'stage1_agg', 'median')).lower()
-            self.stage1_use_rolling_scores = bool(getattr(uc.features, 'stage1_use_rolling_scores', True))
+            self.stage1_rolling_enabled = bool(getattr(uc.features, 'stage1_rolling_enabled', False))  # Enable rolling distance correlation
+            self.stage1_rolling_window = int(getattr(uc.features, 'stage1_rolling_window', 2000))  # Rolling window size
+            self.stage1_rolling_step = int(getattr(uc.features, 'stage1_rolling_step', 500))  # Rolling step size
+            self.stage1_rolling_min_periods = int(getattr(uc.features, 'stage1_rolling_min_periods', 200))  # Min periods for rolling
+            self.stage1_rolling_min_valid_pairs = int(getattr(uc.features, 'stage1_rolling_min_valid_pairs', self.stage1_rolling_min_periods))  # Min valid pairs
+            self.stage1_rolling_max_rows = int(getattr(uc.features, 'stage1_rolling_max_rows', 20000))  # Max rows for rolling
+            self.stage1_rolling_max_windows = int(getattr(uc.features, 'stage1_rolling_max_windows', 20))  # Max rolling windows
+            self.stage1_agg = str(getattr(uc.features, 'stage1_agg', 'median')).lower()  # Aggregation method
+            self.stage1_use_rolling_scores = bool(getattr(uc.features, 'stage1_use_rolling_scores', True))  # Use rolling scores
             # Gating and leakage control
             self.selection_target_columns = list(getattr(uc.features, 'selection_target_columns', []))
             self.dataset_target_columns = list(getattr(uc.features, 'dataset_target_columns', []))
@@ -610,65 +793,65 @@ class StatisticalTests(BaseFeatureEngine):
 
     # ---------- Stage 2: Redundância (VIF + MI) e Stage 3: Wrappers ----------
     def _compute_vif_iterative(self, X: np.ndarray, cols: List[str], threshold: float) -> List[str]:
-        """Remove colunas com VIF acima do limiar usando matriz de correlação (CPU)."""
-        keep = cols.copy()
-        it = 0
+        """Remove columns with VIF above threshold using correlation matrix (CPU)."""
+        keep = cols.copy()  # Start with all columns
+        it = 0  # Iteration counter
         self._log_info("VIF iterative start", features=len(keep), threshold=round(float(threshold), 3))
         while True:
-            if len(keep) < 2:
+            if len(keep) < 2:  # Need at least 2 features for VIF calculation
                 break
-            # Correlação e VIF a partir da matriz de correlação
+            # Compute correlation matrix for remaining features
             corr = np.corrcoef(X[:, [cols.index(c) for c in keep]].T)
             try:
-                inv = np.linalg.pinv(corr)
+                inv = np.linalg.pinv(corr)  # Pseudo-inverse of correlation matrix
             except Exception:
+                break  # Stop if matrix inversion fails
+            vifs = np.diag(inv)  # VIF values are diagonal elements of inverse correlation matrix
+            vmax = float(np.max(vifs))  # Find maximum VIF
+            if vmax <= threshold or not np.isfinite(vmax):  # Stop if VIF is below threshold or invalid
                 break
-            vifs = np.diag(inv)
-            vmax = float(np.max(vifs))
-            if vmax <= threshold or not np.isfinite(vmax):
-                break
-            idx = int(np.argmax(vifs))
-            removed = keep.pop(idx)
+            idx = int(np.argmax(vifs))  # Find index of feature with highest VIF
+            removed = keep.pop(idx)  # Remove feature with highest VIF
             it += 1
             self._log_info("VIF removal", iter=it, feature=removed, vif=round(vmax, 3), remaining=len(keep))
         self._log_info("VIF iterative done", kept=len(keep))
-        return keep
+        return keep  # Return remaining features
 
     def _compute_mi_redundancy(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
-        """Remove redundância não-linear via MI par-a-par (mantém maior dCor no par)."""
+        """Remove non-linear redundancy via pairwise MI (keeps higher dCor in pair)."""
         try:
-            from sklearn.feature_selection import mutual_info_regression
+            from sklearn.feature_selection import mutual_info_regression  # Import MI computation
         except Exception as e:
             self._log_warn("MI not available, skipping redundancy MI", error=str(e))
-            return candidates
+            return candidates  # Return all candidates if MI not available
 
-        keep = set(candidates)
-        # Cap no número de pares (quadrático); se grande, limita candidatos
-        max_cands = min(len(candidates), 200)
-        cand_limited = candidates[:max_cands]
-        X = X_df[cand_limited].values
+        keep = set(candidates)  # Start with all candidates
+        # Cap number of pairs (quadratic); if large, limit candidates
+        max_cands = min(len(candidates), 200)  # Limit to 200 candidates for performance
+        cand_limited = candidates[:max_cands]  # Take first max_cands candidates
+        X = X_df[cand_limited].values  # Convert to numpy array
         n = len(cand_limited)
         # Compute pairwise MI approx: MI(X_i, X_j) by treating one as target
-        for i in range(n):
-            if cand_limited[i] not in keep:
+        for i in range(n):  # For each feature as target
+            if cand_limited[i] not in keep:  # Skip if already removed
                 continue
             try:
-                y = X[:, i]
-                mi = mutual_info_regression(X, y, discrete_features=False)
+                y = X[:, i]  # Target feature
+                mi = mutual_info_regression(X, y, discrete_features=False)  # Compute MI with all features
             except Exception as e:
                 self._log_warn("MI row failed", feature=cand_limited[i], error=str(e))
-                continue
-            for j in range(i + 1, n):
+                continue  # Skip this feature if MI computation fails
+            for j in range(i + 1, n):  # Compare with remaining features
                 f_i, f_j = cand_limited[i], cand_limited[j]
-                if f_i in keep and f_j in keep and mi[j] >= mi_threshold:
-                    # Remove o de menor dCor
+                if f_i in keep and f_j in keep and mi[j] >= mi_threshold:  # If both features still exist and MI above threshold
+                    # Remove the one with lower dCor
                     if dcor_scores.get(f_i, 0.0) >= dcor_scores.get(f_j, 0.0):
-                        keep.discard(f_j)
+                        keep.discard(f_j)  # Remove feature with lower dCor
                         self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi[j]), 4))
                     else:
-                        keep.discard(f_i)
+                        keep.discard(f_i)  # Remove feature with lower dCor
                         self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
-        return list(keep)
+        return list(keep)  # Return remaining features
 
     def _compute_mi_cluster_representatives(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
         """Clustering global por MI para reduzir redundância (escalável).
@@ -794,51 +977,51 @@ class StatisticalTests(BaseFeatureEngine):
 
         VIF_i is taken as the ith diagonal of inv(corr(X)). Uses pinvh for stability.
         """
-        keep = list(features)
-        idx = cp.arange(X.shape[1])
+        keep = list(features)  # Start with all features
+        idx = cp.arange(X.shape[1])  # Feature indices
         # Pre-standardize to unit variance (robust corr computation)
         try:
             Xw = X
             # Remove rows with NaNs
             if cp.isnan(Xw).any():
-                mask = cp.all(~cp.isnan(Xw), axis=1)
+                mask = cp.all(~cp.isnan(Xw), axis=1)  # Keep rows without any NaN values
                 Xw = Xw[mask]
-            if Xw.shape[0] < 5 or Xw.shape[1] < 2:
+            if Xw.shape[0] < 5 or Xw.shape[1] < 2:  # Need sufficient data for VIF calculation
                 return keep
-            # Standardize columns
-            mu = cp.nanmean(Xw, axis=0)
-            sd = cp.nanstd(Xw, axis=0)
-            sd = cp.where(sd == 0, 1.0, sd)
-            Z = (Xw - mu) / sd
+            # Standardize columns to unit variance
+            mu = cp.nanmean(Xw, axis=0)  # Column means
+            sd = cp.nanstd(Xw, axis=0)  # Column standard deviations
+            sd = cp.where(sd == 0, 1.0, sd)  # Avoid division by zero
+            Z = (Xw - mu) / sd  # Standardized data
         except Exception:
-            return keep
+            return keep  # Return all features if standardization fails
 
-        while True:
+        while True:  # Iterative VIF removal loop
             try:
                 # Correlation matrix via dot product (faster than corrcoef for standardized Z)
-                n = Z.shape[0]
-                R = (Z.T @ Z) / cp.float32(max(1, n - 1))
-                # Numerical guard
+                n = Z.shape[0]  # Number of samples
+                R = (Z.T @ Z) / cp.float32(max(1, n - 1))  # Correlation matrix computation
+                # Numerical guard for stability
                 eps = cp.float32(1e-6)
-                R = (R + R.T) * 0.5
-                R += eps * cp.eye(R.shape[0], dtype=R.dtype)
+                R = (R + R.T) * 0.5  # Ensure symmetry
+                R += eps * cp.eye(R.shape[0], dtype=R.dtype)  # Add small diagonal for numerical stability
                 # Use Hermitian pseudo-inverse for stability (eigh-based)
-                Rinv = _hermitian_pinv_gpu(R)
-                vif_diag = cp.diag(Rinv)
-                vmax = float(cp.max(vif_diag).item())
-                if vmax <= float(threshold) or len(keep) <= 2:
+                Rinv = _hermitian_pinv_gpu(R)  # Compute pseudo-inverse
+                vif_diag = cp.diag(Rinv)  # Extract VIF values from diagonal
+                vmax = float(cp.max(vif_diag).item())  # Find maximum VIF
+                if vmax <= float(threshold) or len(keep) <= 2:  # Stop if VIF below threshold or too few features
                     break
-                imax = int(cp.argmax(vif_diag).item())
-                removed = keep.pop(imax)
-                # Drop column from Z
+                imax = int(cp.argmax(vif_diag).item())  # Find index of feature with highest VIF
+                removed = keep.pop(imax)  # Remove feature with highest VIF
+                # Drop column from Z to update for next iteration
                 cols = [i for i in range(Z.shape[1]) if i != imax]
-                Z = Z[:, cols]
+                Z = Z[:, cols]  # Remove corresponding column from standardized data
                 self._log_info("VIF removal (GPU)", feature=removed, vif=round(vmax, 3), remaining=len(keep))
             except Exception as e:
                 self._log_warn("VIF GPU failed; keeping current set", error=str(e))
-                break
+                break  # Stop if computation fails
         self._log_info("VIF iterative done (GPU)", kept=len(keep))
-        return keep
+        return keep  # Return remaining features
 
     def _mi_nmi_gpu(self, x: cp.ndarray, y: cp.ndarray, bins: int = 64) -> float:
         """Compute normalized mutual information on GPU via 2D histograms.
@@ -884,38 +1067,38 @@ class StatisticalTests(BaseFeatureEngine):
         Keeps the feature with higher Stage 1 dCor within each redundant pair.
         """
         p = len(features)
-        if p < 2:
+        if p < 2:  # Need at least 2 features for redundancy analysis
             return list(features)
-        keep = set(features)
-        order = list(range(p))
-        # Pre-extract columns to speed up
+        keep = set(features)  # Start with all features
+        order = list(range(p))  # Feature order
+        # Pre-extract columns to speed up access
         cols = [X[:, i] for i in range(p)]
         # Iterate in blocks to bound memory usage
-        for i0 in range(0, p, chunk):
+        for i0 in range(0, p, chunk):  # Process features in chunks
             i1 = min(i0 + chunk, p)
-            for i in range(i0, i1):
-                if features[i] not in keep:
+            for i in range(i0, i1):  # For each feature in current chunk
+                if features[i] not in keep:  # Skip if already removed
                     continue
-                xi = cols[i]
-                for j in range(i + 1, p):
-                    if features[j] not in keep:
+                xi = cols[i]  # Current feature
+                for j in range(i + 1, p):  # Compare with remaining features
+                    if features[j] not in keep:  # Skip if already removed
                         continue
-                    xj = cols[j]
-                    nmi = self._mi_nmi_gpu(xi, xj, bins=bins)
-                    if nmi >= float(threshold):
+                    xj = cols[j]  # Comparison feature
+                    nmi = self._mi_nmi_gpu(xi, xj, bins=bins)  # Compute normalized mutual information
+                    if nmi >= float(threshold):  # If MI above threshold, features are redundant
                         fi = features[i]
                         fj = features[j]
                         # Choose by Stage 1 dCor, fallback to keep first
                         if dcor_scores.get(fi, 0.0) >= dcor_scores.get(fj, 0.0):
                             if fj in keep:
-                                keep.remove(fj)
+                                keep.remove(fj)  # Remove feature with lower dCor
                                 self._log_info("MI redundancy (GPU)", pair=f"{fi},{fj}", kept=fi, removed=fj, nmi=round(float(nmi), 4))
                         else:
                             if fi in keep:
-                                keep.remove(fi)
+                                keep.remove(fi)  # Remove feature with lower dCor
                                 self._log_info("MI redundancy (GPU)", pair=f"{fi},{fj}", kept=fj, removed=fi, nmi=round(float(nmi), 4))
         # Preserve original order
-        kept_ordered = [f for f in features if f in keep]
+        kept_ordered = [f for f in features if f in keep]  # Return features in original order
         return kept_ordered
 
     # ---------------- Stage 3: Embedded selector (SelectFromModel) ----------------
@@ -941,18 +1124,19 @@ class StatisticalTests(BaseFeatureEngine):
 
         Returns: (selected_features, importances_map, backend_used)
         """
-        # Determine task
+        # Determine task type (classification vs regression)
         task = str(getattr(self, 'stage3_task', 'auto')).lower()
         if task == 'auto':
             try:
                 y_vals = y_series.values
                 uniq = np.unique(y_vals)
+                # Classify as classification if <= 10 unique integer values, otherwise regression
                 task = 'classification' if (len(uniq) <= 10 and np.allclose(uniq, uniq.astype(int))) else 'regression'
             except Exception:
-                task = 'regression'
+                task = 'regression'  # Default to regression if auto-detection fails
 
-        backend_used = 'lgbm'
-        importances: dict = {}
+        backend_used = 'lgbm'  # Use LightGBM as the embedded model
+        importances: dict = {}  # Store feature importances
         model = None
         
         # Optimize data types for performance - convert to float32 for GPU acceleration
@@ -967,7 +1151,7 @@ class StatisticalTests(BaseFeatureEngine):
             indices = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
             X = X[indices]
             y = y[indices]
-        esr = int(getattr(self, 'stage3_lgbm_early_stopping_rounds', 0))
+        esr = int(getattr(self, 'stage3_lgbm_early_stopping_rounds', 0))  # Early stopping rounds
         eval_set = None
         # Build TimeSeriesSplit for validation and early stopping if requested
         if esr and esr > 0 and X.shape[0] >= 10:
@@ -975,12 +1159,12 @@ class StatisticalTests(BaseFeatureEngine):
                 from sklearn.model_selection import TimeSeriesSplit
                 # Use more splits for better validation, minimum data size per split
                 min_samples_per_split = max(50, X.shape[0] // 10)  # At least 50 samples per split
-                n_splits = max(3, min(5, X.shape[0] // min_samples_per_split - 1))
+                n_splits = max(3, min(5, X.shape[0] // min_samples_per_split - 1))  # 3-5 splits
                 tss = TimeSeriesSplit(n_splits=n_splits)
                 tr_idx, va_idx = list(tss.split(X))[-1]  # Use last split for validation
-                X_tr, y_tr = X[tr_idx], y[tr_idx]
-                X_va, y_va = X[va_idx], y[va_idx]
-                eval_set = (X_tr, y_tr, X_va, y_va)
+                X_tr, y_tr = X[tr_idx], y[tr_idx]  # Training data
+                X_va, y_va = X[va_idx], y[va_idx]  # Validation data
+                eval_set = (X_tr, y_tr, X_va, y_va)  # Evaluation set for early stopping
                 self._log_info(f"Stage 3 TimeSeriesSplit | {{ splits: {n_splits}, train: {len(X_tr)}, val: {len(X_va)} }}")
             except Exception as e_ts:
                 eval_set = None
@@ -990,20 +1174,20 @@ class StatisticalTests(BaseFeatureEngine):
         try:
             import lightgbm as lgb
             params = {
-                'num_leaves': int(getattr(self, 'stage3_lgbm_num_leaves', 31)),
-                'max_depth': int(getattr(self, 'stage3_lgbm_max_depth', -1)),
-                'n_estimators': int(getattr(self, 'stage3_lgbm_n_estimators', 200)),
-                'learning_rate': float(getattr(self, 'stage3_lgbm_learning_rate', 0.05)),
-                'subsample': float(getattr(self, 'stage3_lgbm_bagging_fraction', 0.8)),
-                'colsample_bytree': float(getattr(self, 'stage3_lgbm_feature_fraction', 0.8)),
-                'random_state': int(getattr(self, 'stage3_random_state', 42)),
-                'n_jobs': -1,
+                'num_leaves': int(getattr(self, 'stage3_lgbm_num_leaves', 31)),  # Number of leaves
+                'max_depth': int(getattr(self, 'stage3_lgbm_max_depth', -1)),  # Maximum depth
+                'n_estimators': int(getattr(self, 'stage3_lgbm_n_estimators', 200)),  # Number of trees
+                'learning_rate': float(getattr(self, 'stage3_lgbm_learning_rate', 0.05)),  # Learning rate
+                'subsample': float(getattr(self, 'stage3_lgbm_bagging_fraction', 0.8)),  # Subsample ratio
+                'colsample_bytree': float(getattr(self, 'stage3_lgbm_feature_fraction', 0.8)),  # Feature fraction
+                'random_state': int(getattr(self, 'stage3_random_state', 42)),  # Random seed
+                'n_jobs': -1,  # Use all available cores
             }
             # Optional GPU device param (supported in some versions)
             use_gpu = bool(getattr(self, 'stage3_use_gpu', False))
             try:
                 if use_gpu:
-                    params['device'] = 'gpu'
+                    params['device'] = 'gpu'  # Enable GPU acceleration
             except Exception:
                 use_gpu = False  # fallback if GPU not available
                 
@@ -1011,22 +1195,22 @@ class StatisticalTests(BaseFeatureEngine):
             self._log_info(f"Stage 3 wrapper fit | {{ model: 'lgbm', use_gpu: {str(use_gpu).lower()}, rows: {X.shape[0]}, cols: {X.shape[1]} }}")
             
             if task == 'classification':
-                model = lgb.LGBMClassifier(**params)
+                model = lgb.LGBMClassifier(**params)  # Create classifier
             else:
-                model = lgb.LGBMRegressor(**params)
-            if eval_set is not None and esr and esr > 0:
+                model = lgb.LGBMRegressor(**params)  # Create regressor
+            if eval_set is not None and esr and esr > 0:  # Use early stopping if configured
                 X_tr, y_tr, X_va, y_va = eval_set
                 model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], early_stopping_rounds=esr, verbose=False)
             else:
-                model.fit(X, y)
+                model.fit(X, y)  # Fit without early stopping
             # Prefer booster_.feature_importance with configured importance_type
             importance_type = str(getattr(self, 'stage3_importance_type', 'gain')).lower()
             try:
                 booster = model.booster_
-                imp = booster.feature_importance(importance_type=importance_type)
-                importances = {f: float(w) for f, w in zip(candidates, list(imp))}
+                imp = booster.feature_importance(importance_type=importance_type)  # Get feature importance
+                importances = {f: float(w) for f, w in zip(candidates, list(imp))}  # Map to feature names
             except Exception:
-                fi = getattr(model, 'feature_importances_', None)
+                fi = getattr(model, 'feature_importances_', None)  # Fallback to sklearn-style importance
                 if fi is not None and len(fi) == len(candidates):
                     importances = {f: float(w) for f, w in zip(candidates, list(fi))}
             backend_used = 'lgbm'
@@ -1097,6 +1281,149 @@ class StatisticalTests(BaseFeatureEngine):
             
         # Log Stage 3 selected features details
         self._log_info(f"Stage 3 selected features | {{ kept: {len(selected)}, threshold: {thr_val:.6f} }}")
+        return selected, importances, backend_used
+
+    def _stage3_selectfrommodel_cv(self, X_df, y_series, candidates: List[str]) -> (List[str], dict, str):
+        """Leakage-safe Stage 3 using TimeSeriesSplit to aggregate importances over folds.
+
+        - Splits the time series into increasing folds (train -> val) without shuffling
+        - Fits the model on train only; collects feature importances per fold
+        - Aggregates (mean) importances across folds and applies threshold/top-N
+        """
+        try:
+            n_splits = int(getattr(self, 'stage3_cv_splits', 3))
+        except Exception:
+            n_splits = 3
+        if n_splits <= 1:
+            return self._stage3_selectfrommodel(X_df, y_series, candidates)
+
+        # Determine task
+        task = str(getattr(self, 'stage3_task', 'auto')).lower()
+        if task == 'auto':
+            try:
+                y_vals = y_series.values
+                uniq = np.unique(y_vals)
+                task = 'classification' if (len(uniq) <= 10 and np.allclose(uniq, uniq.astype(int))) else 'regression'
+            except Exception:
+                task = 'regression'
+
+        X = X_df[candidates].values.astype(np.float32)
+        y = y_series.values.astype(np.float32)
+
+        # Optional downsampling to control cost
+        max_rows = int(getattr(self, 'selection_max_rows', 100000))
+        if X.shape[0] > max_rows:
+            idx = np.linspace(0, X.shape[0]-1, max_rows, dtype=int)
+            X, y = X[idx], y[idx]
+
+        # Prepare CV
+        try:
+            from sklearn.model_selection import TimeSeriesSplit
+            tss = TimeSeriesSplit(n_splits=max(2, n_splits))
+        except Exception as e:
+            self._log_warn("Stage 3 CV unavailable; falling back to single fit", error=str(e))
+            return self._stage3_selectfrommodel(X_df, y_series, candidates)
+
+        # Importances accumulator
+        agg = np.zeros(len(candidates), dtype=np.float64)
+        cnt = np.zeros(len(candidates), dtype=np.int32)
+        backend_used = 'lgbm'
+
+        # Model params (LightGBM primary, XGBoost fallback, then RF)
+        use_gpu = bool(getattr(self, 'stage3_use_gpu', False))
+        esr = int(getattr(self, 'stage3_lgbm_early_stopping_rounds', 0))
+        for fold_id, (tr_idx, va_idx) in enumerate(tss.split(X)):
+            try:
+                X_tr, y_tr = X[tr_idx], y[tr_idx]
+                X_va, y_va = X[va_idx], y[va_idx]
+                # Ensure minimum train size
+                if X_tr.shape[0] < int(getattr(self, 'stage3_cv_min_train', 200)):
+                    continue
+                # LightGBM first choice
+                import lightgbm as lgb
+                params = {
+                    'num_leaves': int(getattr(self, 'stage3_lgbm_num_leaves', 31)),
+                    'max_depth': int(getattr(self, 'stage3_lgbm_max_depth', -1)),
+                    'n_estimators': int(getattr(self, 'stage3_lgbm_n_estimators', 200)),
+                    'learning_rate': float(getattr(self, 'stage3_lgbm_learning_rate', 0.05)),
+                    'subsample': float(getattr(self, 'stage3_lgbm_bagging_fraction', 0.8)),
+                    'colsample_bytree': float(getattr(self, 'stage3_lgbm_feature_fraction', 0.8)),
+                    'random_state': int(getattr(self, 'stage3_random_state', 42)),
+                    'n_jobs': -1,
+                }
+                if use_gpu:
+                    try:
+                        params['device'] = 'gpu'
+                    except Exception:
+                        pass
+                model = lgb.LGBMClassifier(**params) if task == 'classification' else lgb.LGBMRegressor(**params)
+                if esr and esr > 0:
+                    try:
+                        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], early_stopping_rounds=esr, verbose=False)
+                    except TypeError:
+                        model.fit(X_tr, y_tr)
+                else:
+                    model.fit(X_tr, y_tr)
+                try:
+                    booster = model.booster_
+                    imp = booster.feature_importance(importance_type=str(getattr(self, 'stage3_importance_type', 'gain')).lower())
+                except Exception:
+                    fi = getattr(model, 'feature_importances_', None)
+                    imp = fi if fi is not None else np.zeros(len(candidates))
+                agg += np.asarray(imp, dtype=np.float64)
+                cnt += 1
+                backend_used = 'lgbm'
+            except Exception as e_lgbm:
+                self._log_warn("Stage 3 CV fold LGBM failed; trying XGB/RF", error=str(e_lgbm))
+                try:
+                    import xgboost as xgb
+                    params = {
+                        'max_depth': 7,
+                        'n_estimators': int(getattr(self, 'stage3_lgbm_n_estimators', 200)),
+                        'learning_rate': float(getattr(self, 'stage3_lgbm_learning_rate', 0.05)),
+                        'subsample': float(getattr(self, 'stage3_lgbm_bagging_fraction', 0.8)),
+                        'colsample_bytree': float(getattr(self, 'stage3_lgbm_feature_fraction', 0.8)),
+                        'random_state': int(getattr(self, 'stage3_random_state', 42)),
+                        'n_jobs': -1,
+                        'tree_method': 'gpu_hist' if use_gpu else 'hist',
+                    }
+                    model = xgb.XGBClassifier(**params) if task == 'classification' else xgb.XGBRegressor(**params)
+                    model.fit(X_tr, y_tr)
+                    fi = getattr(model, 'feature_importances_', None)
+                    if fi is not None and len(fi) == len(candidates):
+                        agg += np.asarray(fi, dtype=np.float64)
+                        cnt += 1
+                        backend_used = 'xgb'
+                except Exception as e_xgb:
+                    self._log_warn("Stage 3 CV fold XGB failed; trying RF", error=str(e_xgb))
+                    try:
+                        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+                        model = RandomForestClassifier(n_estimators=200, random_state=int(getattr(self, 'stage3_random_state', 42)), n_jobs=-1) if task == 'classification' else RandomForestRegressor(n_estimators=200, random_state=int(getattr(self, 'stage3_random_state', 42)), n_jobs=-1)
+                        model.fit(X_tr, y_tr)
+                        fi = getattr(model, 'feature_importances_', None)
+                        if fi is not None and len(fi) == len(candidates):
+                            agg += np.asarray(fi, dtype=np.float64)
+                            cnt += 1
+                            backend_used = 'rf'
+                    except Exception as e_rf:
+                        self._log_warn("Stage 3 CV fold RF failed", error=str(e_rf))
+
+        # Aggregate importances
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mean_imp = np.where(cnt > 0, agg / np.maximum(cnt, 1), 0.0)
+        importances = {f: float(mean_imp[i]) for i, f in enumerate(candidates)}
+
+        thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
+        thr_val = self._parse_importance_threshold(thr_cfg, list(importances.values()))
+        selected = [f for f, w in importances.items() if float(w) >= float(thr_val)]
+        try:
+            top_n = int(getattr(self, 'stage3_top_n', 0))
+        except Exception:
+            top_n = 0
+        if top_n and len(selected) > top_n:
+            ordered = sorted(selected, key=lambda f: importances.get(f, 0.0), reverse=True)
+            selected = ordered[:top_n]
+        self._log_info("Stage 3 CV selected features", kept=len(selected), folds=int(n_splits), threshold=float(thr_val))
         return selected, importances, backend_used
 
     def _stage3_wrappers(self, X_df, y_series, candidates: List[str], top_n: int) -> List[str]:
@@ -1822,6 +2149,11 @@ class StatisticalTests(BaseFeatureEngine):
                         continue
                     d = self._compute_distance_correlation_vectorized(xw, yw, max_samples=self.dcor_max_samples)
                     w_scores.append(float(d))
+                    # Diagnostic logging for NaN values
+                    if not np.isfinite(d):
+                        valid_count = int(valid.sum())
+                        total_count = len(xw)
+                        self._log_info(f"dCor NaN diagnostic", feature=c, window_start=s, valid_pairs=valid_count, total_pairs=total_count, valid_ratio=valid_count/total_count)
                 scores[c] = self._aggregate_scores(w_scores, agg)
             return scores
         except Exception as e:
@@ -2848,22 +3180,22 @@ class StatisticalTests(BaseFeatureEngine):
 
         # Validate primary target; support computing log-forward returns if configured
         try:
-            primary_target = getattr(self, 'selection_target_column', None)
+            primary_target = getattr(self, 'selection_target_column', None)  # Get primary target column
         except Exception:
             primary_target = None
         if primary_target:
             try:
-                if primary_target not in df.columns:
+                if primary_target not in df.columns:  # Check if target column exists
                     # If target looks like y_logret_fwd_{Nm} and y_close exists, compute it
-                    m = re.match(r"^y_logret_fwd_(\d+)m$", str(primary_target))
-                    if m and ('y_close' in df.columns):
-                        horizon = int(m.group(1))
+                    m = re.match(r"^y_logret_fwd_(\d+)m$", str(primary_target))  # Match log return pattern
+                    if m and ('y_close' in df.columns):  # If pattern matches and close price exists
+                        horizon = int(m.group(1))  # Extract horizon from pattern
                         self._log_info("Primary target missing; computing log-forward return from y_close",
                                         target=primary_target, horizon=horizon)
-                        meta = cudf.DataFrame({primary_target: cudf.Series([], dtype='f4')})
-                        df = df.assign(**{
+                        meta = cudf.DataFrame({primary_target: cudf.Series([], dtype='f4')})  # Define metadata
+                        df = df.assign(**{  # Add computed target column
                             primary_target: df[['y_close']].map_partitions(
-                                _compute_forward_log_return_partition,
+                                _compute_forward_log_return_partition,  # Function to compute forward returns
                                 'y_close',
                                 horizon,
                                 primary_target,
@@ -2873,7 +3205,7 @@ class StatisticalTests(BaseFeatureEngine):
                     else:
                         # Strict error otherwise
                         try:
-                            sample_cols = list(df.head(50).columns)
+                            sample_cols = list(df.head(50).columns)  # Get sample columns for error message
                         except Exception:
                             sample_cols = []
                         self._critical_error(
@@ -2888,39 +3220,39 @@ class StatisticalTests(BaseFeatureEngine):
 
         # Multi-target sweep (if configured): run selection per target and persist comparison
         try:
-            mt_list = list(getattr(self, 'selection_target_columns', []))
+            mt_list = list(getattr(self, 'selection_target_columns', []))  # Get multi-target list
         except Exception:
             mt_list = []
         if mt_list:
             self._log_info("[MT] Multi-target sweep enabled", targets=mt_list)
-            results: Dict[str, Any] = {}
-            ccy = self._mt_currency_pair(df)
-            for tgt in mt_list:
+            results: Dict[str, Any] = {}  # Store results for each target
+            ccy = self._mt_currency_pair(df)  # Get currency pair identifier
+            for tgt in mt_list:  # Run selection for each target
                 res = self._mt_run_for_target(df, tgt)
                 results[tgt] = res
             # Persist comparison report per currency pair
             try:
                 out_root = Path(getattr(self.settings.output, 'output_path', './output'))
-                out_dir = out_root / ccy / 'targets'
+                out_dir = out_root / ccy / 'targets'  # Create output directory
                 out_dir.mkdir(parents=True, exist_ok=True)
                 with open(out_dir / 'comparison.json', 'w') as f:
-                    json.dump(results, f, indent=2)
+                    json.dump(results, f, indent=2)  # Save comparison results
                 self._log_info("[MT] Comparison persisted", path=str(out_dir / 'comparison.json'))
             except Exception as e:
                 self._log_warn("[MT] Persist comparison failed", error=str(e))
 
-        # --- ADF por janela em colunas de fracdiff ---
-        # seu padrão de nomes parecia 'frac_diff_*'; ajustei aqui:
-        adf_cols = [c for c in df.columns if "frac_diff" in c]
+        # --- ADF rolling window on fractional difference columns ---
+        # Pattern looks like 'frac_diff_*'; adjusted here:
+        adf_cols = [c for c in df.columns if "frac_diff" in c]  # Find fractional difference columns
 
-        for col in adf_cols:
+        for col in adf_cols:  # Apply ADF test to each fractional difference column
             self._log_info(f"ADF rolling on '{col}'...")
-            out = f"adf_stat_{col.split('_')[-1]}"  # e.g., 'close' de 'frac_diff_close'
-            df[out] = df[col].map_partitions(
+            out = f"adf_stat_{col.split('_')[-1]}"  # e.g., 'close' from 'frac_diff_close'
+            df[out] = df[col].map_partitions(  # Apply ADF test to each partition
                 _adf_rolling_partition,
-                252,
-                200,
-                meta=(out, "f8"),
+                252,  # Window size (1 year of trading days)
+                200,  # Minimum periods
+                meta=(out, "f8"),  # Output metadata
             )
 
         # Single-fit dCor sanity check removed; proceed to completion.
@@ -2931,11 +3263,11 @@ class StatisticalTests(BaseFeatureEngine):
             target = self.selection_target_column
             if target in df.columns:
                 import time as _t
-                s1_t0 = _t.time()
+                s1_t0 = _t.time()  # Start timing Stage 1
                 # Identify candidate columns (floats) and exclude target/leakage columns via config
                 # Use a small head() to infer dtypes and filter columns
-                sample = df.head(100)
-                float_cols = [c for c, t in sample.dtypes.items() if 'float' in str(t).lower()]
+                sample = df.head(100)  # Get sample for dtype inference
+                float_cols = [c for c, t in sample.dtypes.items() if 'float' in str(t).lower()]  # Find float columns
 
                 # Load gating config
                 try:
@@ -2999,115 +3331,289 @@ class StatisticalTests(BaseFeatureEngine):
                 if candidates:
                     self._log_info("Computing dCor ranking", target=target, n_candidates=len(candidates), rolling=self.stage1_rolling_enabled)
 
-                    one = self._single_partition(df[[target] + candidates])
-
-                    # Optionally compute rolling aggregated dCor
+                    # Build a bounded sample (host) for Stage 1 and distribute by feature chunks across GPUs
                     roll_scores = {}
-                    if self.stage1_rolling_enabled:
-                        # Compute rolling dCor scores on GPU via module-level partition function
-                        w = int(self.stage1_rolling_window)
-                        st = int(self.stage1_rolling_step)
-                        mp = int(self.stage1_rolling_min_periods)
-                        mvp = int(getattr(self, 'stage1_rolling_min_valid_pairs', mp))
-                        mr = int(self.stage1_rolling_max_rows)
-                        mw = int(self.stage1_rolling_max_windows)
-                        ag = str(self.stage1_agg).lower()
-                        tile = int(getattr(self, 'dcor_tile_size', 2048))
-                        # Define metadata in the exact order that _dcor_rolling_partition_gpu returns
-                        roll_meta = {}
-                        for c in candidates:
-                            roll_meta[f"dcor_roll_{c}"] = 'f8'
-                        for c in candidates:
-                            roll_meta[f"dcor_roll_cnt_{c}"] = 'i8'
-                        # Debug: log expected meta order and dtypes
+                    tile = int(getattr(self, 'dcor_tile_size', 2048))
+                    max_rows = int(getattr(self, 'selection_max_rows', 100000))
+                    try:
+                        sub = df[[target] + candidates]
+                        head_ddf = sub.head(max_rows)
+                        sample_pdf = head_ddf.compute().to_pandas() if hasattr(head_ddf, 'compute') else head_ddf.to_pandas()
+                    except Exception as _e_s1:
+                        self._log_warn("Stage 1 sampling failed", error=str(_e_s1))
+                        sample_pdf = None
+
+                    all_scores: Dict[str, float] = {}
+                    if sample_pdf is not None and not sample_pdf.empty:
+                        # Initialize exclusion counters for final summary
+                        excl_counts = {
+                            'low_coverage': 0,
+                            'low_variance': 0,
+                            'low_unique': 0,
+                            'rolling_min_windows': 0,
+                            'nan_scores': 0,
+                        }
+                        # Pre-gate features by coverage and variance to reduce NaNs and useless work
                         try:
-                            meta_df_dbg = cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in roll_meta.items()})
-                            self._log_info(
-                                "Rolling dCor meta prepared",
-                                n_candidates=len(candidates),
-                                n_meta_cols=len(roll_meta),
-                                meta_cols_first10=list(roll_meta.keys())[:10],
-                                meta_dtypes_first10={k: str(meta_df_dbg.dtypes[k]) for k in list(roll_meta.keys())[:10]}
-                            )
+                            total_rows = int(len(sample_pdf))
+                            min_cov = float(getattr(self, 'stage1_min_coverage_ratio', 0.30))
+                            min_var = float(getattr(self, 'stage1_min_variance', 1e-12))
+                            min_uniq = int(getattr(self, 'stage1_min_unique_values', 2))
+                            tmask = np.isfinite(sample_pdf[target].to_numpy())
+                            F = sample_pdf[candidates]
+                            fmask = np.isfinite(F.to_numpy())
+                            valid_pairs = (fmask & tmask[:, None]).sum(axis=0)
+                            var_f = np.nanvar(F.to_numpy(), axis=0)
+                            # approximate unique counts using pandas nunique
+                            nunique = F.apply(lambda s: s.dropna().nunique(), axis=0).to_numpy()
+                            keep_idx = []
+                            cov_excl = []
+                            var_excl = []
+                            uniq_excl = []
+                            for i, f in enumerate(candidates):
+                                ratio = float(valid_pairs[i]) / max(1, total_rows)
+                                if ratio < min_cov:
+                                    cov_excl.append((f, int(valid_pairs[i]), ratio))
+                                    continue
+                                if float(var_f[i]) <= min_var:
+                                    var_excl.append((f, float(var_f[i])))
+                                    continue
+                                if int(nunique[i]) < min_uniq:
+                                    uniq_excl.append((f, int(nunique[i])))
+                                    continue
+                                keep_idx.append(i)
+                            if keep_idx and len(keep_idx) < len(candidates):
+                                old = list(candidates)
+                                candidates = [old[i] for i in keep_idx]
+                                # Update exclusion counters
+                                try:
+                                    excl_counts['low_coverage'] += int(len(cov_excl))
+                                    excl_counts['low_variance'] += int(len(var_excl))
+                                    excl_counts['low_unique'] += int(len(uniq_excl))
+                                except Exception:
+                                    pass
+                                self._log_info(
+                                    "Stage 1 pre-gating",
+                                    removed=len(old) - len(candidates),
+                                    low_coverage=len(cov_excl),
+                                    low_variance=len(var_excl),
+                                    low_unique=len(uniq_excl),
+                                )
+                                # Persist small artifact with reasons
+                                try:
+                                    if bool(getattr(self, 'debug_write_artifacts', True)):
+                                        from pathlib import Path
+                                        out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                        subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                        ccy = None
+                                        try:
+                                            ccy = self._mt_currency_pair(df)
+                                        except Exception:
+                                            ccy = None
+                                        out_dir = (out_root / ccy / subdir / 'stage1' / target) if ccy else (out_root / subdir / 'stage1' / target)
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        import json as _json
+                                        with open(out_dir / 'pregate_exclusions.json', 'w') as f:
+                                            _json.dump({
+                                                'low_coverage': [{'feature': n, 'valid_pairs': int(v), 'ratio': float(r)} for n, v, r in cov_excl[:50]],
+                                                'low_variance': [{'feature': n, 'variance': float(v)} for n, v in var_excl[:50]],
+                                                'low_unique': [{'feature': n, 'unique': int(u)} for n, u in uniq_excl[:50]],
+                                            }, f, indent=2)
+                                        self._record_artifact('stage1', str(out_dir / 'pregate_exclusions.json'), kind='json')
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
-                        
-                        if hasattr(one, 'map_partitions'):
-                            roll_ddf = one.map_partitions(
-                                _dcor_rolling_partition_gpu,
-                                target,
-                                candidates,
-                                w,
-                                st,
-                                mp,
-                                mvp,
-                                mr,
-                                mw,
-                                ag,
-                                int(self.dcor_max_samples),
-                                int(tile),
-                                meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in roll_meta.items()})
-                            )
-                            roll_pdf = roll_ddf.compute().to_pandas()
+                        if self.client is not None:
                             try:
-                                self._log_info(
-                                    "Rolling dCor computed (sample)",
-                                    out_cols_first10=list(roll_pdf.columns)[:10],
-                                    n_out_cols=len(roll_pdf.columns)
-                                )
+                                sched = self.client.scheduler_info()
+                                workers_list = list(sched.get('workers', {}).keys())
+                                n_workers = max(1, len(workers_list))  # Detecta número de workers disponíveis
+                            except Exception:
+                                workers_list = []
+                                n_workers = 1
+                            # Scatter the sample once to all workers (reduz envio de grafos grandes)
+                            try:
+                                sp = self.client.scatter(sample_pdf, broadcast=True)
+                            except Exception:
+                                sp = sample_pdf
+                            # Rolling scores (if enabled): distribute feature chunks
+                            if self.stage1_rolling_enabled:
+                                w = int(self.stage1_rolling_window)  # Tamanho da janela rolling
+                                st = int(self.stage1_rolling_step)  # Passo entre janelas
+                                mp = int(self.stage1_rolling_min_periods)  # Mínimo de períodos válidos
+                                mvp = int(getattr(self, 'stage1_rolling_min_valid_pairs', mp))  # Mínimo de pares válidos
+                                mr = int(self.stage1_rolling_max_rows)  # Máximo de linhas por janela
+                                mw = int(self.stage1_rolling_max_windows)  # Máximo de janelas
+                                ag = str(self.stage1_agg).lower()  # Função de agregação (max, min, mean)
+                                chunks = np.array_split(np.array(candidates, dtype=object), n_workers)  # Divide features em chunks para distribuir entre workers
+                                futs = []
+                                for i, arr in enumerate(chunks):
+                                    feats = [str(x) for x in arr.tolist()]  # Converte features para string
+                                    if not feats:
+                                        continue
+                                    try:
+                                        prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                                    except Exception:
+                                        prefix_map = {}
+                                    target_worker = workers_list[i % len(workers_list)] if workers_list else None
+                                    futs.append(self.client.submit(
+                                        _dask_dcor_rolling_chunk_task,
+                                        sp,
+                                        target,
+                                        feats,
+                                        w,
+                                        st,
+                                        mp,
+                                        mvp,
+                                        mr,
+                                        mw,
+                                        ag,
+                                        int(self.dcor_max_samples),
+                                        int(tile),
+                                        getattr(self.settings.features, 'sessions', None),
+                                        prefix_map,
+                                        'timestamp',
+                                        getattr(self.settings.features, 'session_auto_mask', None),
+                                        workers=target_worker,
+                                    ))
+                                parts = self.client.gather(futs) if futs else []  # Coleta resultados de todos os workers
+                                roll_counts = {}
+                                for part in parts:
+                                    for k, v in part.items():
+                                        if k.startswith('dcor_roll_cnt_'):  # Contadores de janelas válidas por feature
+                                            roll_counts[k] = int(v)
+                                        elif k.startswith('dcor_roll_'):  # Scores rolling agregados por feature
+                                            roll_scores[k.replace('dcor_roll_', '')] = float(v)
+                                # Gating by minimum rolling windows
+                                try:
+                                    min_win = int(getattr(self, 'stage1_min_rolling_windows', 5))
+                                except Exception:
+                                    min_win = 5
+                                try:
+                                    removed = []
+                                    for f in list(roll_scores.keys()):
+                                        cnt_key = f"dcor_roll_cnt_{f}"
+                                        if int(roll_counts.get(cnt_key, 0)) < int(min_win):
+                                            removed.append(f)
+                                    if removed:
+                                        for f in removed:
+                                            roll_scores[f] = float('nan')
+                                        try:
+                                            excl_counts['rolling_min_windows'] += int(len(removed))
+                                        except Exception:
+                                            pass
+                                        self._log_info("Stage 1 rolling gating", removed=len(removed), min_windows=int(min_win))
+                                except Exception:
+                                    pass
+
+                                if bool(getattr(self, 'stage1_broadcast_rolling', False)) and roll_scores:
+                                    row_brd = {}
+                                    for f, s in list(roll_scores.items())[:min(10, len(roll_scores))]:
+                                        row_brd[f"dcor_roll_{f}"] = s
+                                    row_brd.update({k: v for k, v in list(roll_counts.items())[:min(10, len(roll_counts))]})
+                                    df = self._broadcast_scalars(df, row_brd)
+                            # Global dCor per feature - Calcula dCor para toda a série temporal
+                            chunks = np.array_split(np.array(candidates, dtype=object), n_workers)  # Divide features em chunks
+                            futs = []
+                            for i, arr in enumerate(chunks):
+                                feats = [str(x) for x in arr.tolist()]  # Lista de features para este chunk
+                                if not feats:
+                                    continue
+                                try:
+                                    prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                                except Exception:
+                                    prefix_map = {}
+                                target_worker = workers_list[i % len(workers_list)] if workers_list else None
+                                futs.append(self.client.submit(
+                                    _dask_dcor_chunk_task,
+                                    sp,
+                                    target,
+                                    feats,
+                                    int(self.dcor_max_samples),
+                                    int(tile),
+                                    getattr(self.settings.features, 'sessions', None),
+                                    prefix_map,
+                                    'timestamp',
+                                    getattr(self.settings.features, 'session_auto_mask', None),
+                                    workers=target_worker,
+                                ))
+                            results = self.client.gather(futs) if futs else []
+                            for part in results:
+                                all_scores.update({k: float(v) for k, v in part.items() if v == v})
+                        else:
+                            # Single-GPU fallback on driver - Quando não há cluster Dask disponível
+                            gdf = cudf.from_pandas(sample_pdf)  # Converte pandas para cuDF (GPU)
+                            res_df = _dcor_partition_gpu(gdf, target, candidates, int(self.dcor_max_samples), int(tile))  # Calcula dCor em GPU
+                            row_b = res_df.to_pandas().iloc[0].to_dict()  # Converte resultado para dicionário
+                            all_scores = {c: float(row_b.get(f"dcor_{c}", float('nan'))) for c in candidates}  # Extrai scores dCor por feature
+
+                    # Diagnose NaN scores: compute coverage per feature (pairs with finite target)
+                    try:
+                        nan_feats = [f for f in candidates if (f not in all_scores) or not (all_scores[f] == all_scores[f])]
+                        cov_summary = None
+                        if sample_pdf is not None and not sample_pdf.empty and nan_feats:
+                            tvals = np.isfinite(sample_pdf[target].to_numpy())
+                            cover_items = []
+                            total_rows = int(len(sample_pdf))
+                            for f in nan_feats[: min(2000, len(nan_feats))]:  # cap for speed
+                                try:
+                                    fvals = np.isfinite(sample_pdf[f].to_numpy())
+                                    valid = int(np.sum(tvals & fvals))
+                                    cover_items.append((f, valid, valid / max(1, total_rows)))
+                                except Exception:
+                                    cover_items.append((f, 0, 0.0))
+                            # sort by coverage ascending
+                            cover_items.sort(key=lambda x: (x[1], x[2]))
+                            cov_summary = {
+                                'total_candidates': int(len(candidates)),
+                                'nan_count': int(len(nan_feats)),
+                                'total_rows': total_rows,
+                                'worst_coverage': [
+                                    {'feature': n, 'valid_pairs': int(v), 'ratio': float(r)} for n, v, r in cover_items[: min(20, len(cover_items))]
+                                ],
+                            }
+                            # Persist small artifact for audit
+                            try:
+                                if bool(getattr(self, 'debug_write_artifacts', True)):
+                                    from pathlib import Path
+                                    out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                    subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                    ccy = None
+                                    try:
+                                        ccy = self._mt_currency_pair(df)
+                                    except Exception:
+                                        ccy = None
+                                    out_dir = (out_root / ccy / subdir / 'stage1' / target) if ccy else (out_root / subdir / 'stage1' / target)
+                                    out_dir.mkdir(parents=True, exist_ok=True)
+                                    import json as _json
+                                    with open(out_dir / 'nan_report.json', 'w') as f:
+                                        _json.dump(cov_summary, f, indent=2)
+                                    self._record_artifact('stage1', str(out_dir / 'nan_report.json'), kind='json')
                             except Exception:
                                 pass
-                        else:
-                            roll_result = _dcor_rolling_partition_gpu(one, target, candidates, w, st, mp, mvp, mr, mw, ag, int(self.dcor_max_samples), int(tile))
-                            roll_pdf = roll_result.to_pandas()
-                        if not roll_pdf.empty:
-                            roll_row = roll_pdf.iloc[0].to_dict()
-                            if bool(getattr(self, 'stage1_broadcast_rolling', False)):
-                                df = self._broadcast_scalars(df, roll_row)
-                            # Build score map and detect all-NaN features (no finite windows)
-                            roll_scores = {c: float(roll_row.get(f"dcor_roll_{c}", np.nan)) for c in candidates if np.isfinite(roll_row.get(f"dcor_roll_{c}", np.nan))}
-                            all_nan_feats = [c for c in candidates if int(roll_row.get(f"dcor_roll_cnt_{c}", 0)) == 0]
-                            if all_nan_feats:
-                                self._log_warn("Rolling dCor all-NaN features", count=len(all_nan_feats), sample=all_nan_feats[:10])
-                                # Broadcast as scalar for downstream inspection
-                                df = self._broadcast_scalars(df, {
-                                    'dcor_roll_allnan_features': ','.join(all_nan_feats),
-                                    'dcor_roll_allnan_count': len(all_nan_feats),
-                                })
+                        if cov_summary:
+                            try:
+                                excl_counts['nan_scores'] = int(cov_summary['nan_count'])
+                            except Exception:
+                                pass
+                            self._log_info("Stage 1 NaN score report", nan=int(cov_summary['nan_count']), total=int(cov_summary['total_candidates']), worst=cov_summary['worst_coverage'])
+                    except Exception:
+                        pass
 
-                    # Use module-level deterministic partition function for dCor
-
-                    # Batch computation for progress visibility
-                    batch_size = int(getattr(self, 'dcor_batch_size', 64))
-                    all_scores: Dict[str, float] = {}
-                    total = len(candidates)
-                    processed = 0
-                    tile = int(getattr(self, 'dcor_tile_size', 2048))
-                    for start in range(0, total, max(1, batch_size)):
-                        batch = candidates[start:start + batch_size]
-                        meta_cols = {f"dcor_{c}": 'f8' for c in batch}
-                        if hasattr(one, 'map_partitions'):
-                            res_ddf = one.map_partitions(
-                                _dcor_partition_gpu,
-                                target,
-                                batch,
-                                int(self.dcor_max_samples),
-                                int(tile),
-                                meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in meta_cols.items()})
+                    # Final exclusion summary log (compact)
+                    try:
+                        if 'excl_counts' in locals():
+                            self._log_info(
+                                "Stage 1 exclusion summary",
+                                low_coverage=int(excl_counts.get('low_coverage', 0)),
+                                low_variance=int(excl_counts.get('low_variance', 0)),
+                                low_unique=int(excl_counts.get('low_unique', 0)),
+                                rolling_min_windows=int(excl_counts.get('rolling_min_windows', 0)),
+                                nan_scores=int(excl_counts.get('nan_scores', 0)),
                             )
-                            res_pdf = res_ddf.compute().to_pandas()
-                        else:
-                            res_result = _dcor_partition_gpu(one, target, batch, int(self.dcor_max_samples), int(tile))
-                            res_pdf = res_result.to_pandas()
-                        if not res_pdf.empty:
-                            row_b = res_pdf.iloc[0].to_dict()
-                            # accumulate
-                            for c in batch:
-                                val = row_b.get(f"dcor_{c}")
-                                if val is not None:
-                                    all_scores[c] = float(val)
-                        processed = min(total, start + len(batch))
-                        self._log_info("dCor batch completed", processed=processed, total=total, batch=len(batch))
+                    except Exception:
+                        pass
 
                     # Broadcast the aggregated dCor scores as scalars (optional)
                     if all_scores:
@@ -3123,10 +3629,46 @@ class StatisticalTests(BaseFeatureEngine):
                             dcor_scores = {k: float(v) for k, v in ((f, row.get(f"dcor_{f}", np.nan)) for f in candidates) if np.isfinite(v)}
                             label_prefix = 'dcor'
 
-                        # Log top‑K features by chosen scores
+                        # Log top‑K features by chosen scores (configurable)
                         score_items = sorted(dcor_scores.items(), key=lambda kv: kv[1], reverse=True)
-                        topk = score_items[:max(1, self.dcor_top_k)]
-                        self._log_info("Top‑K dCor features", top=[f"{k}:{v:.4f}" for k, v in topk[:10]], agg=self.stage1_agg, source=label_prefix)
+                        log_k = int(getattr(self, 'stage1_log_top_k', 20))
+                        topk = score_items[:max(1, log_k)]
+                        # Basic summary
+                        try:
+                            import math as _math
+                            finite_vals = [float(v) for _, v in score_items if v == v and _math.isfinite(v)]
+                            self._log_info(
+                                "Top‑K dCor features",
+                                top=[f"{k}:{(v if v==v else float('nan')):.4f}" for k, v in topk],
+                                agg=self.stage1_agg,
+                                source=label_prefix,
+                                total=len(score_items),
+                                finite=len(finite_vals),
+                                nan=len(score_items) - len(finite_vals),
+                                min=(min(finite_vals) if finite_vals else None),
+                                median=(np.median(finite_vals) if finite_vals else None),
+                                max=(max(finite_vals) if finite_vals else None),
+                            )
+                        except Exception:
+                            self._log_info(
+                                "Top‑K dCor features",
+                                top=[f"{k}:{v}" for k, v in topk],
+                                agg=self.stage1_agg,
+                                source=label_prefix,
+                            )
+                        # Optional: log all scores in chunks for debugging
+                        if bool(getattr(self, 'stage1_log_all_scores', False)):
+                            try:
+                                chunk = 50
+                                for i in range(0, len(score_items), chunk):
+                                    seg = score_items[i:i+chunk]
+                                    self._log_info(
+                                        "dCor scores",
+                                        batch=f"{i}-{i+len(seg)-1}",
+                                        items=[f"{k}:{(v if v==v else float('nan')):.4f}" for k, v in seg],
+                                    )
+                            except Exception:
+                                pass
 
                         # Log informativo sobre próximos passos
                         self._log_info("Stage 1 complete - proceeding to Stage 2", 
@@ -3339,10 +3881,12 @@ class StatisticalTests(BaseFeatureEngine):
                                     json.dump({ 'source': label_prefix, 'scores': dcor_scores }, f, indent=2)
                                 # Save rolling stats if available
                                 if roll_scores:
-                                    # Derive counts per feature from roll_row if present
-                                    roll_counts = {c: int(roll_row.get(f"dcor_roll_cnt_{c}", 0)) for c in candidates}
+                                    try:
+                                        counts_obj = roll_counts if 'roll_counts' in locals() and isinstance(roll_counts, dict) else {c: 0 for c in roll_scores.keys()}
+                                    except Exception:
+                                        counts_obj = {c: 0 for c in roll_scores.keys()}
                                     with open(out_dir / 'rolling.json', 'w') as f:
-                                        json.dump({ 'agg': self.stage1_agg, 'scores': roll_scores, 'counts': roll_counts }, f, indent=2)
+                                        json.dump({ 'agg': self.stage1_agg, 'scores': roll_scores, 'counts': counts_obj }, f, indent=2)
                                 # Save selection summary
                                 sel_path = out_dir / 'selection.json'
                                 with open(sel_path, 'w') as f:
@@ -3377,24 +3921,61 @@ class StatisticalTests(BaseFeatureEngine):
                                 )
                             except Exception:
                                 pass
-                            # calcula pvalues numa única partição
-                            # Check if DataFrame has map_partitions method (Dask DataFrame)
-                            if hasattr(one, 'map_partitions'):
-                                tile = int(getattr(self, 'dcor_tile_size', 2048))
-                                perm_ddf = one.map_partitions(
-                                    _perm_pvalues_partition_gpu,
-                                    target,
-                                    perm_top,
-                                    int(self.dcor_permutations),
-                                    int(self.dcor_max_samples),
-                                    int(tile),
-                                    meta=cudf.DataFrame({f"dcor_pvalue_{f}": cudf.Series([], dtype='f8') for f in perm_top})
-                                )
-                                perm_pdf = perm_ddf.compute().to_pandas()
+                            # Distribute permutation test by feature chunks across GPUs
+                            tile = int(getattr(self, 'dcor_tile_size', 2048))
+                            try:
+                                sched = self.client.scheduler_info() if self.client is not None else None
+                                workers_list = list(sched.get('workers', {}).keys()) if sched else []
+                                n_workers = max(1, len(workers_list))
+                            except Exception:
+                                workers_list = []
+                                n_workers = 1
+                            perm_pdf = None
+                            if self.client is not None and sample_pdf is not None and not sample_pdf.empty:
+                                # reuse scattered sample if available
+                                try:
+                                    sp_perm = sp if 'sp' in locals() else self.client.scatter(sample_pdf, broadcast=True)
+                                except Exception:
+                                    sp_perm = sample_pdf
+                                # Increase granularity to improve load-balance across GPUs
+                                n_chunks = int(min(len(perm_top), max(1, n_workers * 4)))
+                                chunks = np.array_split(np.array(perm_top, dtype=object), n_chunks)
+                                futs = []
+                                for i, arr in enumerate(chunks):
+                                    feats = [str(x) for x in arr.tolist()]
+                                    if not feats:
+                                        continue
+                                    try:
+                                        prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                                    except Exception:
+                                        prefix_map = {}
+                                    target_worker = workers_list[i % len(workers_list)] if workers_list else None
+                                    futs.append(self.client.submit(
+                                        _dask_perm_chunk_task,
+                                        sp_perm,
+                                        target,
+                                        feats,
+                                        int(self.dcor_permutations),
+                                        int(self.dcor_max_samples),
+                                        int(tile),
+                                        getattr(self.settings.features, 'sessions', None),
+                                        prefix_map,
+                                        'timestamp',
+                                        getattr(self.settings.features, 'session_auto_mask', None),
+                                        workers=target_worker,
+                                    ))
+                                parts = self.client.gather(futs) if futs else []
+                                # Build a single-row DataFrame from dicts
+                                merged = {}
+                                for part in parts:
+                                    for f, p in part.items():
+                                        merged[f"dcor_pvalue_{f}"] = float(p)
+                                perm_pdf = pd.DataFrame([merged]) if merged else pd.DataFrame()
                             else:
-                                # For regular cuDF DataFrame, compute directly on GPU
-                                tile = int(getattr(self, 'dcor_tile_size', 2048))
-                                perm_result = _perm_pvalues_partition_gpu(one, target, perm_top, int(self.dcor_permutations), int(self.dcor_max_samples), int(tile))
+                                # Single-GPU fallback
+                                import cudf as _cudf
+                                gdf = _cudf.from_pandas(sample_pdf[[target] + perm_top]) if sample_pdf is not None else df[[target] + perm_top].head(int(self.selection_max_rows)).compute()
+                                perm_result = _perm_pvalues_partition_gpu(gdf, target, perm_top, int(self.dcor_permutations), int(self.dcor_max_samples), int(tile))
                                 perm_pdf = perm_result.to_pandas()
                             try:
                                 elapsed_perm = _t.time() - t_perm
@@ -3584,31 +4165,31 @@ class StatisticalTests(BaseFeatureEngine):
                             # ---------- Stage 3: Selection (Embedded or Wrappers) ----------
                             # Free GPU memory across workers before sampling to avoid UCXX OOM on tiny buffers
                             try:
-                                self._cleanup_memory()
+                                self._cleanup_memory()  # Limpa memória GPU no driver
                                 if self.client is not None:
-                                    self.client.run(_free_gpu_memory_worker)
+                                    self.client.run(_free_gpu_memory_worker)  # Limpa memória GPU em todos os workers
                             except Exception:
                                 pass
                             # Build a small CPU sample for Stage 3 models (LightGBM/XGBoost/Sklearn consume host arrays)
                             X_df = None
                             y_s = None
                             try:
-                                max_rows_s3 = int(min(getattr(self, 'selection_max_rows', 100000), 4096))
-                                cols_s3 = [target] + (mi_keep if mi_keep else [])
-                                sub3 = self._single_partition(df[cols_s3]) if cols_s3 else None
+                                max_rows_s3 = int(min(getattr(self, 'selection_max_rows', 100000), 4096))  # Limita amostra para Stage 3 (máx 4096 linhas)
+                                cols_s3 = [target] + (mi_keep if mi_keep else [])  # Colunas: target + features selecionadas do Stage 2
+                                sub3 = self._single_partition(df[cols_s3]) if cols_s3 else None  # Pega uma partição específica
                                 if sub3 is not None:
                                     # Prefer a very small head to minimize device->host transfer
-                                    sample3 = sub3.head(max_rows_s3)
+                                    sample3 = sub3.head(max_rows_s3)  # Pega apenas as primeiras linhas para minimizar transferência GPU->CPU
                                     if hasattr(sample3, 'compute'):
-                                        sample3 = sample3.compute()
+                                        sample3 = sample3.compute()  # Executa computação se for Dask
                                     # Do not drop NaNs globally; ensure only y has finite values (LightGBM/XGB handle NaNs in X)
-                                    pdf3 = sample3.to_pandas()
+                                    pdf3 = sample3.to_pandas()  # Converte para pandas (CPU)
                                     if not pdf3.empty and mi_keep:
-                                        y_mask = np.isfinite(pdf3[target].to_numpy())
-                                        pdf3 = pdf3.loc[y_mask]
+                                        y_mask = np.isfinite(pdf3[target].to_numpy())  # Máscara para valores finitos no target
+                                        pdf3 = pdf3.loc[y_mask]  # Remove linhas com target NaN
                                         if not pdf3.empty:
-                                            X_df = pdf3[mi_keep]
-                                            y_s = pdf3[target]
+                                            X_df = pdf3[mi_keep]  # Features para treinar modelo
+                                            y_s = pdf3[target]  # Target para treinar modelo
                             except Exception as _e_s3:
                                 self._log_warn("Stage 3 sampling failed; attempting with minimal sample", error=str(_e_s3))
                                 # Second attempt: try a single-row head
@@ -3629,7 +4210,15 @@ class StatisticalTests(BaseFeatureEngine):
                             if method == 'selectfrommodel':
                                 self._log_info("Stage 3 embedded selector starting", n_features=len(mi_keep))
                                 t_wr = _t.time()
-                                selected, importances, used_backend = self._stage3_selectfrommodel(X_df, y_s, mi_keep)
+                                # Leakage-safe CV selection when enabled
+                                try:
+                                    cv_splits = int(getattr(self, 'stage3_cv_splits', 3))
+                                except Exception:
+                                    cv_splits = 3
+                                if cv_splits and cv_splits > 1:
+                                    selected, importances, used_backend = self._stage3_selectfrommodel_cv(X_df, y_s, mi_keep)
+                                else:
+                                    selected, importances, used_backend = self._stage3_selectfrommodel(X_df, y_s, mi_keep)
                                 t_wr_elapsed = _t.time() - t_wr
                                 final_sel = selected
                                 self._log_info("Stage 3 embedded selector done", selected=len(final_sel), backend=used_backend, elapsed=f"{t_wr_elapsed:.2f}s")
@@ -3827,7 +4416,14 @@ class StatisticalTests(BaseFeatureEngine):
                 X_win = X_df[candidates].iloc[start:end]
                 y_win = y_s.iloc[start:end]
                 try:
-                    sel, imps, used_backend = self._stage3_selectfrommodel(X_win, y_win, candidates)
+                    try:
+                        cv_splits = int(getattr(self, 'stage3_cv_splits', 3))
+                    except Exception:
+                        cv_splits = 3
+                    if cv_splits and cv_splits > 1:
+                        sel, imps, used_backend = self._stage3_selectfrommodel_cv(X_win, y_win, candidates)
+                    else:
+                        sel, imps, used_backend = self._stage3_selectfrommodel(X_win, y_win, candidates)
                 except Exception:
                     sel = []
                 for f in sel:

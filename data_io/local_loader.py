@@ -83,7 +83,7 @@ class LocalDataLoader:
             logger.info(f"Successfully loaded data from {local_path} with {num_partitions} partitions")
 
             sample_df = df.head()
-            logger.info(f"Data schema: {sample_df.columns.tolist()}")
+            logger.info(f"Data schema: {len(sample_df.columns)} columns")
             # Removed verbose data types log
 
             return df
@@ -429,7 +429,7 @@ class LocalDataLoader:
             logger.info(f"Successfully loaded Feather v2 data from {local_path} with {num_partitions} partitions")
 
             sample_df = df.head()
-            logger.info(f"Data schema: {sample_df.columns.tolist()}")
+            logger.info(f"Data schema: {len(sample_df.columns)} columns")
             logger.info(f"Data types: {sample_df.dtypes.to_dict()}")
 
             return df

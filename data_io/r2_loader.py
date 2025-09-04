@@ -186,7 +186,7 @@ class R2DataLoader:
             
             # Log data schema
             sample_df = df.head()
-            logger.info(f"Data schema: {sample_df.columns.tolist()}")
+            logger.info(f"Data schema: {len(sample_df.columns)} columns")
             logger.info(f"Data types: {sample_df.dtypes.to_dict()}")
             
             return df

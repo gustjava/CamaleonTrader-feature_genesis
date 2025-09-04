@@ -68,6 +68,10 @@ class DaskConfig:
     rmm_pool_size: str = "8GB"
     rmm_initial_pool_size: str = "8GB"
     rmm_maximum_pool_size: str = "16GB"
+    # New: proportional pool sizing (fractions of device total). If > 0, these override fixed sizes.
+    rmm_pool_fraction: float = 0.0                 # e.g., 0.60 -> 60% of device total
+    rmm_initial_pool_fraction: float = 0.0         # e.g., 0.50 -> 50% of rmm_pool (or total)
+    rmm_maximum_pool_fraction: float = 0.0         # optional cap; if 0.0, default safety cap is used
     spilling_enabled: bool = True
     spilling_target: float = 0.9
     spilling_max_spill: str = "32GB"
@@ -105,7 +109,11 @@ class FeatureConfig:
         'p': 1,
         'q': 1,
         'max_iter': 1000,
-        'tolerance': 1e-6
+        'tolerance': 1e-6,
+        'max_samples': 10000,
+        'min_price_rows': 200,
+        'min_return_rows': 100,
+        'log_price': True,
     })
     distance_corr: Dict[str, Any] = field(default_factory=lambda: {
         'max_samples': 10000
@@ -126,6 +134,10 @@ class FeatureConfig:
     garch_q: int = 1
     garch_max_iter: int = 1000
     garch_tolerance: float = 1e-6
+    garch_max_samples: int = 10000
+    garch_min_price_rows: int = 200
+    garch_min_return_rows: int = 100
+    garch_log_price: bool = True
     distance_corr_max_samples: int = 10000
     distance_corr_tile_size: int = 2048
     # Selection stage (Stage 1) and dCor extras
@@ -157,6 +169,9 @@ class FeatureConfig:
     stage3_importance_type: str = "gain"      # gain|split|weight (backend-dependent)
     stage3_importance_threshold: str = "median"  # 'median' or float as string
     stage3_save_importances_format: str = "json"  # json|parquet
+    # Stage 3 CV (leakage-safe) selection
+    stage3_cv_splits: int = 3               # TimeSeriesSplit folds for aggregated importances (>=2 -> enabled)
+    stage3_cv_min_train: int = 200          # Minimum train rows per split
     # Stage 1 retention controls
     dcor_min_threshold: float = 0.0
     dcor_min_percentile: float = 0.0  # 0.0..1.0
@@ -184,6 +199,14 @@ class FeatureConfig:
     stage1_rolling_max_windows: int = 20
     stage1_agg: str = "median"  # one of: mean, median, min, max, p25, p75
     stage1_use_rolling_scores: bool = True
+    # Logging controls for Stage 1
+    stage1_log_top_k: int = 20
+    stage1_log_all_scores: bool = False
+    # Stage 1 quality gates
+    stage1_min_coverage_ratio: float = 0.30   # min fraction of valid (target & feature finite) pairs
+    stage1_min_variance: float = 1e-12        # variance threshold to avoid constant features
+    stage1_min_unique_values: int = 2         # require at least 2 unique finite values
+    stage1_min_rolling_windows: int = 5       # min finite rolling windows required per feature
     # Dataset schema/feature gating (leakage control)
     dataset_target_columns: List[str] = field(default_factory=list)
     dataset_target_prefixes: List[str] = field(default_factory=list)
@@ -245,6 +268,17 @@ class FeatureConfig:
     drop_original_after_transform: bool = False
     # Drop non-retained candidates after Stage 1 (based on dCor gates)
     drop_nonretained_after_stage1: bool = False
+    # GPU usage control
+    force_gpu_usage: bool = True  # Force GPU usage for all stages
+    gpu_fallback_enabled: bool = False  # Disable CPU fallbacks to force GPU usage
+    # Session auto-mask configuration
+    session_auto_mask: Dict[str, Any] = field(default_factory=lambda: {
+        'enabled': True,
+        'window_rows': 120,
+        'min_valid': 90
+    })
+    # Session configuration for external drivers
+    sessions: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass 

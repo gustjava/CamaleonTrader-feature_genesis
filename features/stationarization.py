@@ -8,19 +8,19 @@ This module implements GPU-accelerated stationarization techniques including:
 - Rolling correlations for dynamic relationship analysis
 """
 
-import logging
-import numpy as np
-import cupy as cp
-from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
-import dask_cudf
-import cudf
-from functools import lru_cache
-from itertools import product
+import logging  # Logging para debug e monitoramento
+import numpy as np  # Computação numérica CPU para operações matemáticas
+import cupy as cp  # Computação numérica GPU para aceleração
+from typing import Optional, Dict, Any, List, Tuple  # Type hints para melhor documentação
+from dataclasses import dataclass  # Para classes de dados estruturados
+import dask_cudf  # DataFrames distribuídos com cuDF
+import cudf  # DataFrames GPU para processamento rápido
+from functools import lru_cache  # Cache para otimização de funções
+from itertools import product  # Para combinações de parâmetros
 
-from config.unified_config import UnifiedConfig
-from dask.distributed import Client
-from .base_engine import BaseFeatureEngine
+from config.unified_config import UnifiedConfig  # Configuração unificada do sistema
+from dask.distributed import Client  # Cliente Dask para computação distribuída
+from .base_engine import BaseFeatureEngine  # Classe base para engines de features
 
 logger = logging.getLogger(__name__)
 
@@ -28,76 +28,76 @@ logger = logging.getLogger(__name__)
 def _fracdiff_series_partition(series: cudf.Series, d: float, max_lag: int, tol: float) -> cudf.Series:
     """Deterministic partition function: fractional diff of a single series."""
     try:
-        x = series.to_cupy()
-        if len(x) < 3:
-            return cudf.Series(cp.full(len(series), cp.nan), index=series.index)
-        max_lag = max(1, min(int(max_lag), len(x) - 1))
-        w = StationarizationEngine._fracdiff_weights_gpu(float(d), max_lag, float(tol))
-        if w.size <= 129:
-            y = cp.convolve(x, w, mode="full")[: len(x)]
-        else:
+        x = series.to_cupy()  # Converte para CuPy array (GPU)
+        if len(x) < 3:  # Mínimo de 3 pontos para diferenciação
+            return cudf.Series(cp.full(len(series), cp.nan), index=series.index)  # Retorna NaN se insuficiente
+        max_lag = max(1, min(int(max_lag), len(x) - 1))  # Ajusta lag máximo para não exceder dados
+        w = StationarizationEngine._fracdiff_weights_gpu(float(d), max_lag, float(tol))  # Gera pesos da diferenciação fracionária
+        if w.size <= 129:  # Para kernels pequenos, usa convolução direta
+            y = cp.convolve(x, w, mode="full")[: len(x)]  # Convolução direta para eficiência
+        else:  # Para kernels grandes, usa FFT
             try:
-                from cusignal import fftconvolve
-                y = fftconvolve(x, w, mode="full")[: len(x)]
+                from cusignal import fftconvolve  # Tenta GPU FFT primeiro
+                y = fftconvolve(x, w, mode="full")[: len(x)]  # FFT convolução GPU
             except Exception:
-                from scipy.signal import fftconvolve as scipy_fftconvolve
-                y = cp.asarray(scipy_fftconvolve(cp.asnumpy(x), cp.asnumpy(w), mode="full")[: len(x)])
-        return cudf.Series(y.astype(cp.float32), index=series.index)
+                from scipy.signal import fftconvolve as scipy_fftconvolve  # Fallback para CPU FFT
+                y = cp.asarray(scipy_fftconvolve(cp.asnumpy(x), cp.asnumpy(w), mode="full")[: len(x)])  # FFT convolução CPU
+        return cudf.Series(y.astype(cp.float32), index=series.index)  # Retorna série estacionarizada
     except Exception:
-        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)
+        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)  # Retorna NaN em caso de erro
 
 
 def _rolling_zscore_partition(series: cudf.Series, window: int, min_periods: int) -> cudf.Series:
     """Deterministic rolling z-score for a series."""
     try:
-        s = series
-        mean = s.rolling(window=window, min_periods=min_periods).mean()
-        std = s.rolling(window=window, min_periods=min_periods).std()
-        z = (s - mean) / (std.replace(0, np.nan))
-        return z.astype('f4')
+        s = series  # Série de entrada
+        mean = s.rolling(window=window, min_periods=min_periods).mean()  # Média móvel
+        std = s.rolling(window=window, min_periods=min_periods).std()  # Desvio padrão móvel
+        z = (s - mean) / (std.replace(0, np.nan))  # Z-score: (valor - média) / desvio_padrão
+        return z.astype('f4')  # Converte para float32
     except Exception:
-        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)
+        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)  # Retorna NaN em caso de erro
 
 
 def _variance_log_partition(series: cudf.Series) -> cudf.Series:
     """Deterministic variance stabilization via log with safe shift (no-leakage version)."""
     try:
-        x = series.to_cupy()
+        x = series.to_cupy()  # Converte para CuPy array
         # Use a simple approach: shift by a small constant to ensure positivity
         # This avoids both data leakage and serialization issues
-        min_val = float(cp.nanmin(x).get())  # Convert to Python float to avoid serialization issues
-        if min_val <= 0:
-            shift = abs(min_val) + 1e-8
+        min_val = float(cp.nanmin(x).get())  # Convert to Python float to avoid serialization issues  # Valor mínimo da série
+        if min_val <= 0:  # Se há valores negativos ou zero
+            shift = abs(min_val) + 1e-8  # Shift para garantir positividade
         else:
-            shift = 1e-8
+            shift = 1e-8  # Shift mínimo para estabilidade numérica
         
-        y = cp.log(x + shift)
-        return cudf.Series(y.astype(cp.float32), index=series.index)
+        y = cp.log(x + shift)  # Logaritmo com shift para estabilização de variância
+        return cudf.Series(y.astype(cp.float32), index=series.index)  # Retorna série transformada
     except Exception:
-        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)
+        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)  # Retorna NaN em caso de erro
 
 def _rolling_corr_simple_partition(pdf: cudf.DataFrame, col1: str, col2: str, window: int, min_periods: int, new_col: str) -> cudf.DataFrame:
     """Deterministic simple rolling relationship metric as proxy for correlation."""
     try:
-        s1 = pdf[col1]
-        s2 = pdf[col2]
-        m1 = s1.rolling(window=window, min_periods=min_periods).mean()
-        m2 = s2.rolling(window=window, min_periods=min_periods).mean()
-        rel = (m1 * m2) / (m1.abs() + m2.abs() + 1e-8)
-        rel = rel.clip(-1, 1).astype('f4')
-        out = cudf.DataFrame({new_col: rel})
-        return out
+        s1 = pdf[col1]  # Primeira série
+        s2 = pdf[col2]  # Segunda série
+        m1 = s1.rolling(window=window, min_periods=min_periods).mean()  # Média móvel da primeira série
+        m2 = s2.rolling(window=window, min_periods=min_periods).mean()  # Média móvel da segunda série
+        rel = (m1 * m2) / (m1.abs() + m2.abs() + 1e-8)  # Métrica de relacionamento simples
+        rel = rel.clip(-1, 1).astype('f4')  # Limita entre -1 e 1, converte para float32
+        out = cudf.DataFrame({new_col: rel})  # Cria DataFrame com nova coluna
+        return out  # Retorna DataFrame com métrica de correlação
     except Exception:
-        return cudf.DataFrame({new_col: cudf.Series(cp.full(len(pdf), cp.nan))})
+        return cudf.DataFrame({new_col: cudf.Series(cp.full(len(pdf), cp.nan))})  # Retorna NaN em caso de erro
 
 
 @dataclass
 class FracDiffConfig:
     """Configuration for fractional differentiation parameters."""
-    d_values: List[float] = None  # Fractional differentiation orders
-    threshold: float = 1e-5       # Threshold for stationarity
-    max_lag: int = 1000          # Maximum lag for computation
-    min_periods: int = 50        # Minimum periods required
+    d_values: List[float] = None  # Fractional differentiation orders  # Ordem de diferenciação fracionária
+    threshold: float = 1e-5       # Threshold for stationarity  # Limiar para estacionariedade
+    max_lag: int = 1000          # Maximum lag for computation  # Lag máximo para computação
+    min_periods: int = 50        # Minimum periods required  # Períodos mínimos necessários
 
 
 class StationarizationEngine(BaseFeatureEngine):
@@ -110,76 +110,76 @@ class StationarizationEngine(BaseFeatureEngine):
     
     def __init__(self, settings: UnifiedConfig, client: Client):
         """Initialize the stationarization engine with configuration."""
-        super().__init__(settings, client)
-        self.config = FracDiffConfig(
-            d_values=self.settings.features.frac_diff_values,
-            threshold=self.settings.features.frac_diff_threshold,
-            max_lag=self.settings.features.frac_diff_max_lag
+        super().__init__(settings, client)  # Inicializa classe base com configurações e cliente Dask
+        self.config = FracDiffConfig(  # Configuração para diferenciação fracionária
+            d_values=self.settings.features.frac_diff_values,  # Valores de d para testar
+            threshold=self.settings.features.frac_diff_threshold,  # Limiar para estacionariedade
+            max_lag=self.settings.features.frac_diff_max_lag  # Lag máximo para computação
         )
         # ADF significance level for selecting optimal d
         try:
             from config.unified_config import get_unified_config
             uc = get_unified_config()
-            self.adf_alpha = float(getattr(uc.features, 'adf_alpha', 0.05))
+            self.adf_alpha = float(getattr(uc.features, 'adf_alpha', 0.05))  # Nível de significância ADF
         except Exception:
-            self.adf_alpha = 0.05
+            self.adf_alpha = 0.05  # Fallback para 5%
 
         # Cache de pesos da FFD (para evitar recomputo ao varrer d_grid)
         # chave: (round(d,6), max_lag, round(tol,8)) -> cp.ndarray (GPU)
-        self._w_cache: Dict[Tuple[float, int, float], cp.ndarray] = {}
-        self._w_cache_order: List[Tuple[float, int, float]] = []
+        self._w_cache: Dict[Tuple[float, int, float], cp.ndarray] = {}  # Cache de pesos GPU
+        self._w_cache_order: List[Tuple[float, int, float]] = []  # Ordem do cache para LRU
         # Limites configuráveis com fallbacks seguros
         try:
             from config.unified_config import get_unified_config
             uc = get_unified_config()
-            self._w_cache_max_entries = int(getattr(uc.features, 'fracdiff_cache_max_entries', 32))
-            self._w_partition_threshold = int(getattr(uc.features, 'fracdiff_partition_threshold', 4096))
+            self._w_cache_max_entries = int(getattr(uc.features, 'fracdiff_cache_max_entries', 32))  # Máximo de entradas no cache
+            self._w_partition_threshold = int(getattr(uc.features, 'fracdiff_partition_threshold', 4096))  # Limiar para particionamento
         except Exception:
-            self._w_cache_max_entries = 32
-            self._w_partition_threshold = 4096
+            self._w_cache_max_entries = 32  # Fallback para 32 entradas
+            self._w_partition_threshold = 4096  # Fallback para 4096
 
         # Parâmetros de validação de qualidade de série (dinâmicos)
         try:
             from config.unified_config import get_unified_config
             uc = get_unified_config()
-            self._min_rows = int(getattr(uc.validation, 'min_rows', 100))
-            self._max_missing_pct = float(getattr(uc.validation, 'max_missing_percentage', 20.0))
-            self._outlier_z = float(getattr(uc.validation, 'outlier_threshold', 3.0))
+            self._min_rows = int(getattr(uc.validation, 'min_rows', 100))  # Mínimo de linhas para validação
+            self._max_missing_pct = float(getattr(uc.validation, 'max_missing_percentage', 20.0))  # Máximo de dados faltantes (%)
+            self._outlier_z = float(getattr(uc.validation, 'outlier_threshold', 3.0))  # Limiar Z-score para outliers
         except Exception:
-            self._min_rows = 100
-            self._max_missing_pct = 20.0
-            self._outlier_z = 3.0
+            self._min_rows = 100  # Fallback para 100 linhas
+            self._max_missing_pct = 20.0  # Fallback para 20%
+            self._outlier_z = 3.0  # Fallback para Z=3
 
         # Lista explícita de candidatas (sem regex): incluir/excluir
         try:
             from config.unified_config import get_unified_config
             uc = get_unified_config()
-            self._station_include = list(getattr(uc.features, 'station_candidates_include', []))
-            self._station_exclude = set(getattr(uc.features, 'station_candidates_exclude', []))
-            self._drop_after_fd = bool(getattr(uc.features, 'drop_original_after_transform', False))
+            self._station_include = list(getattr(uc.features, 'station_candidates_include', []))  # Colunas para incluir
+            self._station_exclude = set(getattr(uc.features, 'station_candidates_exclude', []))  # Colunas para excluir
+            self._drop_after_fd = bool(getattr(uc.features, 'drop_original_after_transform', False))  # Remover originais após transformação
         except Exception:
-            self._station_include = []
-            self._station_exclude = set()
-            self._drop_after_fd = False
+            self._station_include = []  # Fallback: lista vazia
+            self._station_exclude = set()  # Fallback: conjunto vazio
+            self._drop_after_fd = False  # Fallback: não remover originais
 
     # ---------- helpers to detect column names dynamically ----------
     def _detect_price_column(self, df) -> Optional[str]:
-        cols = list(df.columns)
+        cols = list(df.columns)  # Lista colunas disponíveis
         # Prefer y_close if present
-        for cand in [
-            'y_close',
-        ] + [c for c in cols if c.lower().endswith('close')] + [c for c in cols if 'close' in c.lower()]:
-            if cand in cols:
-                return cand
-        return None
+        for cand in [  # Ordem de preferência para colunas de preço
+            'y_close',  # Coluna preferida
+        ] + [c for c in cols if c.lower().endswith('close')] + [c for c in cols if 'close' in c.lower()]:  # Outras colunas com 'close'
+            if cand in cols:  # Verifica se coluna existe
+                return cand  # Retorna primeira encontrada
+        return None  # Retorna None se não encontrou
 
     def _detect_returns_column(self, df) -> Optional[str]:
-        cols = list(df.columns)
+        cols = list(df.columns)  # Lista colunas disponíveis
         # Common naming: y_ret_1m, returns, ret
-        for cand in [
-            'y_ret_1m', 'returns', 'ret'
-        ] + [c for c in cols if 'ret' in c.lower()]:
-            if cand in cols:
+        for cand in [  # Ordem de preferência para colunas de retornos
+            'y_ret_1m', 'returns', 'ret'  # Nomes comuns
+        ] + [c for c in cols if 'ret' in c.lower()]:  # Outras colunas com 'ret'
+            if cand in cols:  # Verifica se coluna existe
                 return cand
         return None
     
@@ -190,18 +190,18 @@ class StationarizationEngine(BaseFeatureEngine):
         Vectorized GPU implementation of fractional differentiation weights.
         Uses CuPy for efficient computation without CPU-GPU transfers.
         """
-        j = cp.arange(1, max_lag + 1, dtype=cp.float32)
-        w = cp.concatenate([
-            cp.ones(1, dtype=cp.float32),
-            cp.cumprod(-1 * (d - j + 1) / j)
+        j = cp.arange(1, max_lag + 1, dtype=cp.float32)  # Array de índices de 1 a max_lag
+        w = cp.concatenate([  # Concatena peso inicial com pesos calculados
+            cp.ones(1, dtype=cp.float32),  # Peso inicial = 1
+            cp.cumprod(-1 * (d - j + 1) / j)  # Produto cumulativo dos pesos fracionários
         ])
-        if tol > 0:
-            aw = cp.abs(w)
-            cum = cp.cumsum(aw)
-            total = cum[-1]
-            keep = int(cp.searchsorted(cum, (1 - tol) * total)) + 1
-            w = w[:keep]
-        return w
+        if tol > 0:  # Se há tolerância especificada
+            aw = cp.abs(w)  # Valores absolutos dos pesos
+            cum = cp.cumsum(aw)  # Soma cumulativa dos valores absolutos
+            total = cum[-1]  # Total da soma
+            keep = int(cp.searchsorted(cum, (1 - tol) * total)) + 1  # Índice para manter 1-tol da massa
+            w = w[:keep]  # Trunca pesos para manter apenas os significativos
+        return w  # Retorna array de pesos GPU
 
     def _get_fracdiff_weights_cached(self, d: float, max_lag: int, tol: float = 0.0) -> cp.ndarray:
         """Obtém pesos da FFD com cache + particionamento leve para kernels muito longos.
@@ -209,32 +209,32 @@ class StationarizationEngine(BaseFeatureEngine):
         - Evita recomputar pesos para o mesmo (d, max_lag, tol).
         - Limita o tamanho do cache para evitar pressão de memória.
         """
-        key = (round(float(d), 6), int(max_lag), round(float(tol), 8))
-        w = self._w_cache.get(key)
-        if w is not None:
+        key = (round(float(d), 6), int(max_lag), round(float(tol), 8))  # Chave do cache com precisão limitada
+        w = self._w_cache.get(key)  # Tenta obter do cache
+        if w is not None:  # Se encontrou no cache
             # Atualiza ordem LRU simples
             try:
-                self._w_cache_order.remove(key)
+                self._w_cache_order.remove(key)  # Remove da posição atual
             except ValueError:
-                pass
-            self._w_cache_order.append(key)
-            return w
+                pass  # Ignora se não estava na lista
+            self._w_cache_order.append(key)  # Adiciona ao final (mais recente)
+            return w  # Retorna pesos do cache
 
         # Compute and insert
-        w = self._fracdiff_weights_gpu(d, max_lag, tol)
+        w = self._fracdiff_weights_gpu(d, max_lag, tol)  # Calcula novos pesos
 
         # LRU eviction policy
-        self._w_cache[key] = w
-        self._w_cache_order.append(key)
-        if len(self._w_cache_order) > self._w_cache_max_entries:
-            old_key = self._w_cache_order.pop(0)
+        self._w_cache[key] = w  # Armazena no cache
+        self._w_cache_order.append(key)  # Adiciona à ordem
+        if len(self._w_cache_order) > self._w_cache_max_entries:  # Se cache excedeu limite
+            old_key = self._w_cache_order.pop(0)  # Remove mais antigo
             try:
                 # Libera memória do array antigo explicitamente
-                del self._w_cache[old_key]
-                cp.get_default_memory_pool().free_all_blocks()
+                del self._w_cache[old_key]  # Remove do cache
+                cp.get_default_memory_pool().free_all_blocks()  # Libera memória GPU
             except Exception:
-                pass
-        return w
+                pass  # Ignora erros de limpeza
+        return w  # Retorna pesos calculados
     
 
     
@@ -243,26 +243,26 @@ class StationarizationEngine(BaseFeatureEngine):
         Fractional differentiation of order d using GPU convolution.
         Sets NaN in the first (len(w)-1) positions due to boundary effects.
         """
-        max_lag = min(self.config.max_lag, len(data) - 1)
-        w = self._get_fracdiff_weights_cached(d, max_lag, self.config.threshold)
+        max_lag = min(self.config.max_lag, len(data) - 1)  # Limita lag máximo ao tamanho dos dados
+        w = self._get_fracdiff_weights_cached(d, max_lag, self.config.threshold)  # Obtém pesos do cache
         
         # Use direct convolution for short kernels, FFT for long ones
-        if w.size <= 129:
-            y = cp.convolve(data, w, mode="full")[:len(data)]
-        else:
+        if w.size <= 129:  # Para kernels pequenos
+            y = cp.convolve(data, w, mode="full")[:len(data)]  # Convolução direta
+        else:  # Para kernels grandes
             try:
-                from cusignal import fftconvolve
-                y = fftconvolve(data, w, mode="full")[:len(data)]
+                from cusignal import fftconvolve  # Tenta GPU FFT primeiro
+                y = fftconvolve(data, w, mode="full")[:len(data)]  # FFT convolução GPU
             except ImportError:
                 # Fallback to scipy if cusignal is not available
-                from scipy.signal import fftconvolve as scipy_fftconvolve
-                y = cp.asarray(scipy_fftconvolve(cp.asnumpy(data), cp.asnumpy(w), mode="full")[:len(data)])
+                from scipy.signal import fftconvolve as scipy_fftconvolve  # Fallback para CPU FFT
+                y = cp.asarray(scipy_fftconvolve(cp.asnumpy(data), cp.asnumpy(w), mode="full")[:len(data)])  # FFT convolução CPU
 
         # Set invalid boundary values to NaN
-        k = w.size - 1
-        if k > 0:
-            y[:k] = cp.nan
-        return y.astype(cp.float32, copy=False)
+        k = w.size - 1  # Número de valores inválidos no início
+        if k > 0:  # Se há valores inválidos
+            y[:k] = cp.nan  # Define como NaN
+        return y.astype(cp.float32, copy=False)  # Retorna como float32
 
     def _series_quality_report(self, data: cp.ndarray, name: str = "series") -> Dict[str, Any]:
         """Validações adicionais de qualidade com janelas/limites dinâmicos.
@@ -560,69 +560,69 @@ class StationarizationEngine(BaseFeatureEngine):
             DataFrame with additional stationarized features
         """
         try:
-            self._log_info("Starting stationarization pipeline...")
+            self._log_info("Starting stationarization pipeline...")  # Log de início do pipeline
             # Track schema before to derive new columns list
             try:
-                cols_before = set(list(df.columns))
+                cols_before = set(list(df.columns))  # Colunas antes do processamento
             except Exception:
-                cols_before = None
+                cols_before = None  # Fallback se não conseguir obter colunas
             
             # Apply fractional differentiation
-            df = self._apply_fractional_differentiation(df)
+            df = self._apply_fractional_differentiation(df)  # Aplica diferenciação fracionária
             
             # Apply rolling correlations
-            df = self._compute_rolling_correlations(df)
+            df = self._compute_rolling_correlations(df)  # Calcula correlações móveis
             
             # Apply rolling stationarization
-            df = self._apply_rolling_stationarization(df)
+            df = self._apply_rolling_stationarization(df)  # Aplica estacionarização móvel
             
             # Apply variance stabilization
-            df = self._apply_variance_stabilization(df)
+            df = self._apply_variance_stabilization(df)  # Aplica estabilização de variância
 
             # Tick-volume z-scores (15m/60m) and lag-1
-            df = self._apply_tick_volume_zscores(df)
+            df = self._apply_tick_volume_zscores(df)  # Aplica z-scores de volume
 
             # Explicit stationarization sweep for configured candidates
-            df = self._apply_explicit_stationarization_dask(df)
+            df = self._apply_explicit_stationarization_dask(df)  # Aplica estacionarização explícita
             
             # Record metrics: new columns and default d used in Dask path
             try:
-                cols_after = set(list(df.columns)) if cols_before is not None else None
-                new_cols = sorted(list(cols_after - cols_before)) if (cols_before is not None and cols_after is not None) else []
+                cols_after = set(list(df.columns)) if cols_before is not None else None  # Colunas após processamento
+                new_cols = sorted(list(cols_after - cols_before)) if (cols_before is not None and cols_after is not None) else []  # Novas colunas criadas
             except Exception:
-                new_cols = []
+                new_cols = []  # Fallback para lista vazia
 
             try:
-                d_grid = list(getattr(self.settings.features, 'frac_diff_values', []))
-                d_default = float(d_grid[-1]) if d_grid else None
+                d_grid = list(getattr(self.settings.features, 'frac_diff_values', []))  # Valores de d configurados
+                d_default = float(d_grid[-1]) if d_grid else None  # Valor padrão de d (último da lista)
             except Exception:
-                d_default = None
+                d_default = None  # Fallback para None
 
-            self._record_metrics('stationarization', {
-                'new_columns': new_cols,
-                'new_columns_count': len(new_cols),
-                'fracdiff_default_d': d_default,
+            self._record_metrics('stationarization', {  # Registra métricas de estacionarização
+                'new_columns': new_cols,  # Lista de novas colunas
+                'new_columns_count': len(new_cols),  # Contagem de novas colunas
+                'fracdiff_default_d': d_default,  # Valor padrão de d
             })
 
             # Optional artifact summary
             try:
-                if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):
+                if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):  # Verifica se deve escrever artefatos
                     # Try to infer currency pair for path
-                    ccy = None
+                    ccy = None  # Inicializa par de moedas
                     try:
-                        head = df.head(1)
-                        if 'currency_pair' in head.columns and len(head) > 0:
-                            ccy = str(head.iloc[0]['currency_pair'])
+                        head = df.head(1)  # Pega primeira linha para inferir par
+                        if 'currency_pair' in head.columns and len(head) > 0:  # Verifica se há coluna de par
+                            ccy = str(head.iloc[0]['currency_pair'])  # Extrai par de moedas
                     except Exception:
-                        ccy = None
-                    from pathlib import Path
-                    out_root = Path(getattr(self.settings.output, 'output_path', './output'))
-                    subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))
-                    out_dir = (out_root / ccy / subdir / 'stationarization') if ccy else (out_root / subdir / 'stationarization')
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    import json as _json
-                    summary_path = out_dir / 'summary.json'
-                    with open(summary_path, 'w') as f:
+                        ccy = None  # Fallback para None
+                    from pathlib import Path  # Importa Path para manipulação de diretórios
+                    out_root = Path(getattr(self.settings.output, 'output_path', './output'))  # Diretório raiz de saída
+                    subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))  # Subdiretório de artefatos
+                    out_dir = (out_root / ccy / subdir / 'stationarization') if ccy else (out_root / subdir / 'stationarization')  # Diretório específico
+                    out_dir.mkdir(parents=True, exist_ok=True)  # Cria diretório se não existir
+                    import json as _json  # Importa JSON para serialização
+                    summary_path = out_dir / 'summary.json'  # Caminho do arquivo de resumo
+                    with open(summary_path, 'w') as f:  # Abre arquivo para escrita
                         _json.dump({'new_columns': new_cols, 'fracdiff_default_d': d_default}, f, indent=2)
                     self._record_artifact('stationarization', str(summary_path), kind='json')
             except Exception:

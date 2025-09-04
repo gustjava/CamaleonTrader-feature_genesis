@@ -45,10 +45,10 @@ class DataProcessor:
         self.run_id = run_id
         
         # Initialize feature engines (pass client for Dask usage when available)
-        self.station = StationarizationEngine(self.settings, client)
-        self.stats = StatisticalTests(self.settings, client)
-        self.feng = FeatureEngineeringEngine(self.settings, client)
-        self.garch = GARCHModels(self.settings, client)
+        self.station = StationarizationEngine(self.settings, client)  # Engine 1: Estacionarização
+        self.stats = StatisticalTests(self.settings, client)  # Engine 4: Testes estatísticos (estágios 1-4)
+        self.feng = FeatureEngineeringEngine(self.settings, client)  # Engine 2: Feature engineering (BK filter)
+        self.garch = GARCHModels(self.settings, client)  # Engine 3: Modelos GARCH
     
     def process_currency_pair(self, currency_pair: str, r2_path: str) -> bool:
         """
@@ -71,24 +71,24 @@ class DataProcessor:
                     logger.warning("Database unavailable; proceeding without task tracking")
             
             # Load data
-            gdf = self._load_currency_pair_data(r2_path)
+            gdf = self._load_currency_pair_data(r2_path)  # Carrega dados do par de moeda
             if gdf is None:
                 self._register_task_failure(currency_pair, r2_path, "Failed to load data")
                 return False
             
             # Validate initial data
-            if not self._validate_initial_data(gdf, currency_pair):
+            if not self._validate_initial_data(gdf, currency_pair):  # Valida qualidade dos dados carregados
                 self._register_task_failure(currency_pair, r2_path, "Initial data validation failed")
                 return False
             
             # Process through feature engines
-            gdf = self._apply_feature_engines(gdf, currency_pair)
+            gdf = self._apply_feature_engines(gdf, currency_pair)  # Aplica pipeline de feature engineering
             if gdf is None:
                 self._register_task_failure(currency_pair, r2_path, "Feature engineering failed")
                 return False
             
             # Save processed data
-            if not self._save_processed_data(gdf, currency_pair):
+            if not self._save_processed_data(gdf, currency_pair):  # Salva dados processados
                 self._register_task_failure(currency_pair, r2_path, "Data saving failed")
                 return False
             

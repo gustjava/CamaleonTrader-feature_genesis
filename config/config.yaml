@@ -38,28 +38,32 @@ r2:
 # GPU cluster settings for distributed processing
 dask:
   # Worker configuration
-  gpus_per_worker: 1
-  threads_per_worker: 1
-  memory_limit: "8GB"
+  gpus_per_worker: 1  # Uma GPU por worker (otimizado para isolamento)
+  threads_per_worker: 1  # Uma thread por worker (evita conflitos GPU)
+  memory_limit: "8GB"  # Limite de memória RAM por worker
   
-  # RMM (RAPIDS Memory Manager) settings
-  rmm_pool_size: "4GB"
-  rmm_initial_pool_size: "4GB"
-  rmm_maximum_pool_size: "8GB"
-  spilling_enabled: true
-  spilling_target: 0.9
-  spilling_max_spill: "32GB"
+  # RMM (RAPIDS Memory Manager) settings - Gerenciamento de memória GPU
+  rmm_pool_size: "4GB"  # Tamanho do pool de memória GPU
+  rmm_initial_pool_size: "4GB"  # Tamanho inicial do pool
+  rmm_maximum_pool_size: "8GB"  # Tamanho máximo do pool
+  # Preferir tamanhos proporcionais (se > 0, sobrepõem os valores fixos acima)
+  rmm_pool_fraction: 0.60              # 60% da memória da GPU por worker
+  rmm_initial_pool_fraction: 0.40      # 40% da memória da GPU na alocação inicial
+  rmm_maximum_pool_fraction: 0.60      # Limite superior de segurança (fração)
+  spilling_enabled: true  # Habilita spill para RAM quando GPU fica cheia
+  spilling_target: 0.9  # Alvo de utilização antes do spill
+  spilling_max_spill: "32GB"  # Máximo de spill permitido
   
-  # Memory management
-  memory_target_fraction: 0.8
-  memory_spill_fraction: 0.9
-  local_directory: "/tmp/dask-worker-space"
+  # Memory management - Gerenciamento de memória RAM
+  memory_target_fraction: 0.8  # Alvo de utilização de RAM (80%)
+  memory_spill_fraction: 0.9  # Inicia spill quando RAM atinge 90%
+  local_directory: "/tmp/dask-worker-space"  # Diretório para spill de dados
   
-  # Network protocol settings
-  protocol: "ucx"
-  enable_tcp_over_ucx: true
-  enable_infiniband: false
-  enable_nvlink: true
+  # Network protocol settings - Configurações de rede para comunicação entre workers
+  protocol: "ucx"  # Protocolo UCX para comunicação GPU-GPU
+  enable_tcp_over_ucx: true  # Habilita TCP sobre UCX
+  enable_infiniband: false  # InfiniBand desabilitado (não disponível)
+  enable_nvlink: true  # Habilita NVLink para comunicação direta entre GPUs
 
 # Feature Engineering Configuration
 # Parameters for all feature engineering engines
@@ -79,25 +83,25 @@ features:
     threshold: 1e-5
     max_lag: 1000
   
-  # Baxter-King filter configuration
+  # Baxter-King filter configuration - Filtro passa-banda para séries temporais
   baxter_king:
-    low_freq: 6
-    high_freq: 32
-    k: 12
-  # Stage 0: Feature Engineering (generalized)
+    low_freq: 6  # Frequência baixa (período longo) - remove tendências
+    high_freq: 32  # Frequência alta (período curto) - remove ruído
+    k: 12  # Tamanho do kernel do filtro
+  # Stage 0: Feature Engineering (generalized) - Engine 2 do pipeline
   feature_engineering:
     baxter_king:
-      k: 12
-      low_freq: 32
-      high_freq: 6
-      causal: true
-      apply_to_all: true
-      # Apply BK to these source columns (if present)
+      k: 12  # Tamanho do kernel (2k+1 pontos)
+      low_freq: 32  # Período da frequência baixa (remove tendências > 32 períodos)
+      high_freq: 6  # Período da frequência alta (remove ruído < 6 períodos)
+      causal: true  # Shift temporal para evitar look-ahead bias
+      apply_to_all: true  # Aplica BK a todas as colunas numéricas elegíveis
+      # Apply BK to these source columns (if present) - Colunas específicas para BK
       source_columns:
-        - 'y_close'
-        - 'log_stabilized_y_close'
-        - 'y_open'
-        - 'y_high'
+        - 'y_close'  # Preço de fechamento do target
+        - 'log_stabilized_y_close'  # Log do preço estacionarizado
+        - 'y_open'  # Preço de abertura do target
+        - 'y_high'  # Preço máximo do target
         - 'y_low'
         - 'y_weighted_close'
         - 'y_typical_price'
@@ -136,6 +140,10 @@ features:
     q: 1
     max_iter: 1000
     tolerance: 1e-6
+    max_samples: 10000          # Limite de linhas usadas no ajuste GARCH
+    min_price_rows: 200         # Mínimo de pontos de preço após limpeza
+    min_return_rows: 100        # Mínimo de retornos após diff(log)
+    log_price: true             # Usa log para calcular retornos (robusto para escala)
   
   # Distance correlation configuration
   distance_corr:
@@ -174,6 +182,9 @@ features:
   stage3_lgbm_early_stopping_rounds: 0
   stage3_use_gpu: true
   stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
+  # Force GPU usage for all stages
+  force_gpu_usage: true
+  gpu_fallback_enabled: false  # Disable CPU fallbacks to force GPU usage
   # Stage 3 embedded selector (SelectFromModel)
   stage3_selector_method: selectfrommodel   # wrappers|selectfrommodel
   stage3_importance_type: gain              # gain|split|weight (backend-dependent)
@@ -194,14 +205,51 @@ features:
   dcor_batch_size: 64
   # Stage 1 rolling dCor (exposed)
   stage1_rolling_enabled: true
-  stage1_rolling_window: 2000
+  stage1_rolling_window: 1200     # diagnóstico: janela menor para aumentar janelas válidas
   stage1_rolling_step: 500
   stage1_rolling_min_periods: 200
   # Minimum pairwise valid observations per rolling window (handles sparse/off-hours data)
-  stage1_rolling_min_valid_pairs: 200
+  stage1_rolling_min_valid_pairs: 400   # diagnóstico: ~33% de 1200
   stage1_rolling_max_rows: 20000
   stage1_rolling_max_windows: 20
-  stage1_agg: max  # mean|median|min|max|p25|p75
+  stage1_agg: median  # diagnóstico: usar mediana para robustez
+  # Session masks (UTC) for external drivers (applied in Stage 1 dCor/permutation)
+  sessions:
+    drivers:
+      dxy:
+        weekmask: [0,1,2,3,4]
+        # 24h Mon-Fri (adjust if you have exact sessions)
+        open_windows:
+          0: [[0, 1440]]
+          1: [[0, 1440]]
+          2: [[0, 1440]]
+          3: [[0, 1440]]
+          4: [[0, 1440]]
+        holidays: []
+      spx:
+        weekmask: [0,1,2,3,4]
+        # US cash 13:30–20:00 UTC (810–1200 minutes)
+        open_windows:
+          0: [[810, 1200]]
+          1: [[810, 1200]]
+          2: [[810, 1200]]
+          3: [[810, 1200]]
+          4: [[810, 1200]]
+        holidays: []
+    # Map feature substrings to driver keys
+    feature_prefix_map:
+      dxy: dxy
+      _dxy: dxy
+      spx: spx
+      _spx: spx
+  # Data-driven session auto-mask (UTC-agnostic; usa gaps/NaNs por janela)
+  session_auto_mask:
+    enabled: true
+    window_rows: 120        # tamanho da janela (em linhas) para contagem de válidos
+    min_valid: 60           # diagnóstico: relaxa cobertura mínima para 50%
+  # Stage 1 logging (diagnóstico)
+  stage1_log_all_scores: true
+  stage1_log_top_k: 500
   stage1_use_rolling_scores: true
   # Dataset schema/feature gating (leakage control)
   dataset_target_columns: []         # list of label/target columns present in the dataset
