@@ -316,7 +316,15 @@ class DataProcessor:
                     if not self._validate_intermediate_data(gdf, currency_pair, engine_name):
                         logger.error(f"Data validation failed after {engine_name} for {currency_pair}")
                         return None
-                    
+
+                    # Aggressive local GPU memory cleanup between engines (cuDF path)
+                    try:
+                        import gc as _gc
+                        _gc.collect()
+                        cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
+                
                 except Exception as e:
                     logger.error(f"🚨 CRITICAL ERROR in {engine_name} Engine: {e}")
                     if not self.settings.error_handling.continue_on_error:
@@ -462,9 +470,12 @@ class DataProcessor:
             return False
 
     def _validate_intermediate_data_dask(self, ddf, currency_pair: str, engine_name: str) -> bool:
-        """Lightweight post-engine validation for dask_cudf DataFrame."""
+        """Lightweight post-engine validation for dask_cudf DataFrame.
+
+        Uses a minimal head() to avoid large materializations that could exhaust GPU memory.
+        """
         try:
-            sample = ddf.head(100)
+            sample = ddf.head(1)
             if sample.shape[0] == 0:
                 logger.error(f"Empty Dask DataFrame after {engine_name} for {currency_pair}")
                 return False
@@ -581,6 +592,13 @@ class DataProcessor:
                     # Stabilize graph/memory between engines
                     ddf = ddf.persist()
                     wait(ddf)
+
+                    # Free CuPy pools on all workers to reduce carry-over memory
+                    try:
+                        if self.client:
+                            self.client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
+                    except Exception:
+                        pass
 
                     if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
                         raise RuntimeError(f"Validation failed after {engine_name}")

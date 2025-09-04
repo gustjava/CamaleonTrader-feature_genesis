@@ -566,7 +566,47 @@ class BaseFeatureEngine(ABC):
         Returns:
             DataFrame with new scalar columns
         """
-        return df.assign(**mapping)
+        # Avoid broadcasting large string scalars across Dask DataFrames (can explode GPU memory)
+        try:
+            is_dask = hasattr(df, 'map_partitions')
+        except Exception:
+            is_dask = False
+
+        if not is_dask:
+            # cuDF path: usually smaller; keep behavior
+            return df.assign(**mapping)
+
+        safe: Dict[str, Any] = {}
+        skipped: Dict[str, int] = {}
+        for k, v in mapping.items():
+            try:
+                if isinstance(v, (int, float, bool)):
+                    safe[k] = v
+                elif isinstance(v, str):
+                    # Only broadcast short strings to avoid large allocations on all rows
+                    if len(v) <= 128:
+                        safe[k] = v
+                    else:
+                        skipped[k] = len(v)
+                else:
+                    # Skip complex types/lists/dicts
+                    skipped[k] = -1
+            except Exception:
+                skipped[k] = -1
+
+        if skipped:
+            try:
+                self.logger.info(
+                    "Skipping broadcast of large/complex scalars on Dask",
+                    extra={
+                        'skipped_keys': list(skipped.keys())[:10],
+                        'counts': {k: skipped[k] for k in list(skipped.keys())[:10]},
+                    }
+                )
+            except Exception:
+                pass
+
+        return df.assign(**safe) if safe else df
 
     def _single_partition(self, df: dask_cudf.DataFrame, cols: Optional[list] = None) -> dask_cudf.DataFrame:
         """

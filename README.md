@@ -19,37 +19,37 @@ O design e o roadmap seguem o documento “Um Pipeline Robusto de Seleção de F
 - `data_io/local_loader.py` e `data_io/r2_loader.py`: leitura de Feather/Parquet como `dask_cudf.DataFrame` (e fallback síncrono para `cudf` quando necessário).
 - `features/base_engine.py`: base comum aos ENGINES (validações leves compatíveis com Dask, monitoramento de memória, logging e utilidades).
 - ENGINES (em `features/`):
-  - `stationarization.py` (StationarizationEngine): Diferenciação Fracionária (FFD), variantes de estacionarização e correl. rolantes, com implementações vetorizadas em GPU.
-  - `feature_engineering.py` (FeatureEngineeringEngine): transformações iniciais (ex.: Baxter–King generalizado por múltiplas colunas) aceleradas em GPU.
-  - `garch_models.py` (GARCHModels): ajuste GARCH(1,1) com log‑verossimilhança vetorizada em GPU e extração de métricas/colunas de volatilidade e resíduos para seleção.
-  - `statistical_tests.py` (StatisticalTests): ADF e correlação de distância (dCor) em GPU (ver limitações abaixo).
+  - **Engine 1**: `stationarization.py` (StationarizationEngine, order: 1): Diferenciação Fracionária (FFD), variantes de estacionarização e correl. rolantes, com implementações vetorizadas em GPU.
+  - **Engine 2**: `feature_engineering.py` (FeatureEngineeringEngine, order: 2): transformações iniciais (ex.: Baxter–King generalizado por múltiplas colunas) aceleradas em GPU.
+  - **Engine 3**: `garch_models.py` (GARCHModels, order: 3): ajuste GARCH(1,1) com log‑verossimilhança vetorizada em GPU e extração de métricas/colunas de volatilidade e resíduos para seleção.
+  - **Engine 4**: `statistical_tests.py` (StatisticalTests, order: 4): ADF e correlação de distância (dCor) em GPU (ver limitações abaixo).
 
 ## Fluxo de Execução (por moeda)
 
 1. Descoberta de pares e verificação de saída existente.
 2. Carregamento (`dask_cudf.read_feather`/`read_parquet`) e `persist()`.
 3. Execução dos ENGINES na ordem definida em `config` (cada engine retorna o DataFrame com novas colunas):
-   - StationarizationEngine → FeatureEngineeringEngine → GARCHModels → StatisticalTests.
+   - **Engine 1**: StationarizationEngine (order: 1) → **Engine 2**: FeatureEngineeringEngine (order: 2) → **Engine 3**: GARCHModels (order: 3) → **Engine 4**: StatisticalTests (order: 4).
    - Entre motores: `persist()` + `client.wait(...)` para estabilizar o grafo/memória.
 4. `compute()` para `cudf.DataFrame` e salvamento como Feather v2 (um arquivo por par).
 5. Registro de status em base (quando habilitado).
 
 ## ENGINES — O que cada um faz
 
-- StationarizationEngine (`features/stationarization.py`)
-  - FFD: pesos vetorizados em GPU; busca de d ótimo com teste de estacionariedade simples (variância por períodos).
-  - Séries geradas: `frac_diff_*` e estatísticas associadas; estabilizações de variância (log/sqrt); correl. rolantes entre categorias relevantes detectadas dinamicamente (preço, retornos, volume, spread, volatilidade, OFI).
-  - Rotas Dask usam detecção dinâmica de colunas (e.g., `y_close`, `y_ret_1m`) para evitar dependência de nomes fixos.
+**Engine 1 — StationarizationEngine (`features/stationarization.py`)**
+- FFD: pesos vetorizados em GPU; busca de d ótimo com teste de estacionariedade simples (variância por períodos).
+- Séries geradas: `frac_diff_*` e estatísticas associadas; estabilizações de variância (log/sqrt); correl. rolantes entre categorias relevantes detectadas dinamicamente (preço, retornos, volume, spread, volatilidade, OFI).
+- Rotas Dask usam detecção dinâmica de colunas (e.g., `y_close`, `y_ret_1m`) para evitar dependência de nomes fixos.
 
-- StatisticalTests (`features/statistical_tests.py`)
-  - ADF vetorizado em GPU usando decomposição QR; versão rolling disponível para séries fracionadas.
-  - Correlação de distância (dCor) vetorizada com “centering trick”. Para datasets grandes é usada amostra de cauda (<= 10k). Existe fallback simplificado (correlação Pearson) no caminho single‑fit para contornar limites de memória.
+**Engine 2 — FeatureEngineeringEngine (`features/feature_engineering.py`)**
+- Transformações iniciais de sinal (ex.: Baxter–King generalizado para múltiplas colunas) operando em GPU; gera colunas `bk_filter_<col>`.
 
-- FeatureEngineeringEngine (`features/feature_engineering.py`)
-  - Transformações iniciais de sinal (ex.: Baxter–King generalizado para múltiplas colunas) operando em GPU; gera colunas `bk_filter_<col>`.
+**Engine 3 — GARCHModels (`features/garch_models.py`)**
+- Ajuste GARCH(1,1) com log‑likelihood vetorizado em GPU (`cupyx.scipy.signal.lfilter`), parâmetros (ω, α, β), variância condicional, estatísticas de volatilidade e métricas associadas.
 
-- GARCHModels (`features/garch_models.py`)
-  - Ajuste GARCH(1,1) com log‑likelihood vetorizado em GPU (`cupyx.scipy.signal.lfilter`), parâmetros (ω, α, β), variância condicional, estatísticas de volatilidade e métricas associadas.
+**Engine 4 — StatisticalTests (`features/statistical_tests.py`)**
+- ADF vetorizado em GPU usando decomposição QR; versão rolling disponível para séries fracionadas.
+- Correlação de distância (dCor) vetorizada com "centering trick". Para datasets grandes é usada amostra de cauda (<= 10k). Existe fallback simplificado (correlação Pearson) no caminho single‑fit para contornar limites de memória.
 
 ## Entradas e Saídas
 
@@ -202,4 +202,4 @@ Observação: a estrutura YAML acima será integrada ao `config/config.yaml` num
 
 - Salvar métricas de Estágio 1, listas de Estágio 1/2/3 e importâncias do Estágio 3; no Estágio 4, salvar frequências (Parquet) e gráficos de barras (PNG) por par/alvo.
 
-Referências detalhadas: ver `README_STAGE0_FEATURE_ENGINEERING.md`, `README_STATISTICAL_TESTS.md` (atualizado como Estágio 1), `README_STAGE2_VIF_MI.md`, `README_STAGE3_WRAPPER_EMBEDDED.md` e `README_STAGE4_STABILITY.md`.
+Referências detalhadas: ver `README_ENGINE2_FEATURE_ENGINEERING.md`, `README_STATISTICAL_TESTS.md` (atualizado como Estágio 1), `README_STAGE2_VIF_MI.md`, `README_STAGE3_WRAPPER_EMBEDDED.md` e `README_STAGE4_STABILITY.md`.

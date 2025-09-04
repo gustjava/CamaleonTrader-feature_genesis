@@ -90,6 +90,7 @@ features:
       k: 12
       low_freq: 32
       high_freq: 6
+      causal: true
       apply_to_all: true
       # Apply BK to these source columns (if present)
       source_columns:
@@ -138,7 +139,7 @@ features:
   
   # Distance correlation configuration
   distance_corr:
-    max_samples: 50000
+    max_samples: 20000
   
   # Empirical Mode Decomposition configuration
   emd:
@@ -147,7 +148,7 @@ features:
     max_iterations: 100
   
   # Statistical tests parameters
-  distance_corr_max_samples: 1000
+  distance_corr_max_samples: 20000
   distance_corr_tile_size: 2048
   selection_target_column: y_ret_fwd_15m
   # Optional list to run multi-target sweep (per run, per pair)
@@ -159,13 +160,13 @@ features:
   vif_threshold: 5.0
   mi_threshold: 0.3
   stage3_top_n: 50
-  # Stage 3 wrappers (LightGBM)
+  # Stage 3 wrappers (LightGBM) - Legacy format (maintained for compatibility)
   stage3_task: auto  # auto|regression|classification
   stage3_random_state: 42
   stage3_lgbm_enabled: true
   stage3_lgbm_num_leaves: 31
   stage3_lgbm_max_depth: -1
-  stage3_lgbm_n_estimators: 200
+  stage3_lgbm_n_estimators: 300
   stage3_lgbm_learning_rate: 0.05
   stage3_lgbm_feature_fraction: 0.8
   stage3_lgbm_bagging_fraction: 0.8
@@ -173,6 +174,11 @@ features:
   stage3_lgbm_early_stopping_rounds: 0
   stage3_use_gpu: true
   stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
+  # Stage 3 embedded selector (SelectFromModel)
+  stage3_selector_method: selectfrommodel   # wrappers|selectfrommodel
+  stage3_importance_type: gain              # gain|split|weight (backend-dependent)
+  stage3_importance_threshold: median       # 'median' or numeric value
+  stage3_save_importances_format: json      # json|parquet
   dcor_min_threshold: 0.05
   dcor_min_percentile: 0.0
   stage1_top_n: 100
@@ -195,7 +201,7 @@ features:
   stage1_rolling_min_valid_pairs: 200
   stage1_rolling_max_rows: 20000
   stage1_rolling_max_windows: 20
-  stage1_agg: median  # mean|median|min|max|p25|p75
+  stage1_agg: max  # mean|median|min|max|p25|p75
   stage1_use_rolling_scores: true
   # Dataset schema/feature gating (leakage control)
   dataset_target_columns: []         # list of label/target columns present in the dataset
@@ -231,6 +237,14 @@ features:
   cpcv_k_leave_out: 2
   cpcv_purge: 0
   cpcv_embargo: 0
+  # Stage 4 stability selection
+  stage4_enabled: true
+  stage4_n_bootstrap: 30
+  stage4_block_size: 5000
+  stage4_stability_threshold: 0.7
+  stage4_plot: true
+  stage4_random_state: 42
+  stage4_bootstrap_method: block   # block|tssplit
   adf_alpha: 0.05
   # Stage 1 explicit candidates (no regex)
   station_candidates_include:
@@ -488,6 +502,21 @@ security:
   # Access control
   require_authentication: true
   session_timeout: 3600
+
+# Selection Configuration
+# Feature selection settings organized by stage
+selection:
+  stage3:
+    model: lgbm            # lgbm
+    task: auto             # auto|regression|classification
+    importance_threshold: median   # median|float
+    use_gpu: true
+    random_state: 42
+    n_estimators: 300
+    learning_rate: 0.05
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    early_stopping_rounds: 0
 
 # Backup and Recovery Configuration
 # Data backup and recovery settings

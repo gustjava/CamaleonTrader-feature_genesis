@@ -192,14 +192,20 @@ echo '--- [REMOTO] Verificando ambiente conda...'
 if conda env list | grep -q 'dynamic-stage0'; then
     echo '✅ Ambiente dynamic-stage0 encontrado, ativando...'
     conda activate dynamic-stage0
+elif conda env list | grep -q 'feature-genesis'; then
+    echo '✅ Ambiente feature-genesis encontrado, ativando...'
+    conda activate feature-genesis
 else
-    echo '⚠️  Ambiente dynamic-stage0 não encontrado!'
-    echo 'Usando ambiente base (RAPIDS já instalado)...'
+    echo '⚠️  Nenhum dos ambientes esperados (dynamic-stage0/feature-genesis) encontrado!'
+    echo 'Usando ambiente base (RAPIDS já instalado, se aplicável)...'
     # Não ativar nenhum ambiente específico, usar o base
 fi
 
-echo '--- [REMOTO] Instalando dependências adicionais...'
-conda install -c conda-forge sqlalchemy pymysql cryptography lightgbm -y || true
+echo '--- [REMOTO] Instalando dependências adicionais para Stage 3/4...'
+# LightGBM (árvores), scikit-learn (LassoCV/TSS), XGBoost (GPU opcional), matplotlib (plots Stage 4)
+conda install -c conda-forge -y \
+  sqlalchemy pymysql cryptography \
+  scikit-learn lightgbm xgboost matplotlib || true
 
 echo '--- [REMOTO] Verificando se rclone está instalado...'
 if ! command -v rclone &> /dev/null; then

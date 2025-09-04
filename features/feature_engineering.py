@@ -47,7 +47,7 @@ def _bk_weights_cpu(k: int, low_period: float, high_period: float) -> _np.ndarra
     return weights
 
 
-def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: float, high_period: float) -> cudf.Series:
+def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: float, high_period: float, causal: bool = True) -> cudf.Series:
     """Deterministic partition function: apply BK on a single partition (GPU).
 
     Handles nulls by filling with 0 for the convolution and restoring NaNs
@@ -87,7 +87,13 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
     # BK borders are NaN by definition
     y[:k] = _cp.nan
     y[-k:] = _cp.nan
-    return cudf.Series(y, index=series.index)
+
+    # Build output series and apply causal shift if requested
+    out = cudf.Series(y, index=series.index)
+    if causal and k > 0:
+        # Shift by +k to ensure each value at t depends only on x[<= t]
+        out = out.shift(k)
+    return out
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +120,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         high = 6.0
         sources: List[str] = []
         apply_all = False
+        causal = True
         if feats is not None:
             try:
                 fe = getattr(feats, 'feature_engineering', {}) or {}
@@ -126,6 +133,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
                     if isinstance(sc, list):
                         sources = [str(c) for c in sc]
                     apply_all = bool(bk.get('apply_to_all', False))
+                    causal = bool(bk.get('causal', causal))
             except Exception:
                 pass
             # fallback to features.baxter_king dict
@@ -136,6 +144,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
                         k = int(bk2.get('k', k))
                         low = float(bk2.get('low_freq', low))
                         high = float(bk2.get('high_freq', high))
+                        causal = bool(bk2.get('causal', causal))
             except Exception:
                 pass
             # legacy flat keys
@@ -145,7 +154,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
                 high = float(getattr(feats, 'baxter_king_high_freq', high))
             except Exception:
                 pass
-        return {'k': k, 'low': low, 'high': high, 'source_columns': sources, 'apply_to_all': apply_all}
+        return {'k': k, 'low': low, 'high': high, 'source_columns': sources, 'apply_to_all': apply_all, 'causal': causal}
 
     def _eligible_all_numeric(self, df, exclude: List[str]) -> List[str]:
         """Return all numeric columns suitable for BK, excluding prefixes/names.
@@ -237,13 +246,14 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         k = int(params['k'])
         low = float(params['low'])
         high = float(params['high'])
+        causal = bool(params.get('causal', True))
         new_cols: List[str] = []
         for col in src:
             out = f"bk_filter_{col}"
             try:
-                gdf[out] = _apply_bk_filter_gpu_partition(gdf[col], k, low, high)
+                gdf[out] = _apply_bk_filter_gpu_partition(gdf[col], k, low, high, causal)
                 new_cols.append(out)
-                self._log_info("Applied BK", source=col, out=out, k=k, low=low, high=high)
+                self._log_info("Applied BK", source=col, out=out, k=k, low=low, high=high, causal=bool(causal))
             except Exception as e:
                 self._log_warn("BK application failed", source=col, error=str(e))
 
@@ -293,15 +303,16 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         k = int(params['k'])
         low = float(params['low'])
         high = float(params['high'])
+        causal = bool(params.get('causal', True))
         new_cols: List[str] = []
         for col in src:
             out = f"bk_filter_{col}"
             try:
                 df[out] = df[col].map_partitions(
-                    _apply_bk_filter_gpu_partition, k, low, high, meta=(out, 'f4')
+                    _apply_bk_filter_gpu_partition, k, low, high, bool(causal), meta=(out, 'f4')
                 )
                 new_cols.append(out)
-                self._log_info("Applied BK (Dask)", source=col, out=out, k=k, low=low, high=high)
+                self._log_info("Applied BK (Dask)", source=col, out=out, k=k, low=low, high=high, causal=bool(causal))
             except Exception as e:
                 self._log_warn("BK application failed (Dask)", source=col, error=str(e))
 

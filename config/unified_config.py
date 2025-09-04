@@ -152,6 +152,11 @@ class FeatureConfig:
     stage3_lgbm_early_stopping_rounds: int = 0
     stage3_use_gpu: bool = True
     stage3_wrapper_backend: str = "xgb_gpu"  # lgbm|xgb_gpu
+    # Stage 3 embedded selector (SelectFromModel)
+    stage3_selector_method: str = "wrappers"  # wrappers|selectfrommodel
+    stage3_importance_type: str = "gain"      # gain|split|weight (backend-dependent)
+    stage3_importance_threshold: str = "median"  # 'median' or float as string
+    stage3_save_importances_format: str = "json"  # json|parquet
     # Stage 1 retention controls
     dcor_min_threshold: float = 0.0
     dcor_min_percentile: float = 0.0  # 0.0..1.0
@@ -212,6 +217,14 @@ class FeatureConfig:
     cpcv_k_leave_out: int = 2
     cpcv_purge: int = 0
     cpcv_embargo: int = 0
+    # Stage 4 stability selection
+    stage4_enabled: bool = False
+    stage4_n_bootstrap: int = 30
+    stage4_block_size: int = 5000
+    stage4_stability_threshold: float = 0.7
+    stage4_plot: bool = True
+    stage4_random_state: int = 42
+    stage4_bootstrap_method: str = "block"  # block|tssplit
     emd_max_imfs: int = 10
     emd_tolerance: float = 1e-8
     emd_max_iterations: int = 100
@@ -233,6 +246,25 @@ class FeatureConfig:
     # Drop non-retained candidates after Stage 1 (based on dCor gates)
     drop_nonretained_after_stage1: bool = False
 
+
+@dataclass 
+class SelectionStage3Config:
+    """Stage 3 multivariate selection configuration."""
+    model: str = "lgbm"  # lgbm
+    task: str = "auto"   # auto|regression|classification  
+    importance_threshold: str = "median"  # median|float
+    use_gpu: bool = True
+    random_state: int = 42
+    n_estimators: int = 300
+    learning_rate: float = 0.05
+    feature_fraction: float = 0.8
+    bagging_fraction: float = 0.8
+    early_stopping_rounds: int = 0
+
+@dataclass
+class SelectionConfig:
+    """Feature selection configuration organized by stage."""
+    stage3: SelectionStage3Config = field(default_factory=SelectionStage3Config)
 
 @dataclass
 class ProcessingConfig:
@@ -380,6 +412,7 @@ class UnifiedConfig:
     r2: R2Config = field(default_factory=R2Config)
     dask: DaskConfig = field(default_factory=DaskConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    selection: SelectionConfig = field(default_factory=SelectionConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     monitoring: MonitoringConfig = field(default_factory=MonitoringConfig)
