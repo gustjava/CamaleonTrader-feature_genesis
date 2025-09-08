@@ -1,0 +1,172 @@
+# ====================================================================================
+# COMANDOS ÚTEIS PARA VAST.AI - FEATURE GENESIS
+# ====================================================================================
+
+# ====================================================================================
+# 1. CONECTAR À INSTÂNCIA VAST.AI
+# ====================================================================================
+
+# Listar instâncias ativas
+vast show instances
+
+# Obter informações detalhadas da instância (inclui SSH host e porta)
+vast show instances --raw | jq '.[] | select(.id == INSTANCE_ID) | {id, ssh_host, ssh_port}'
+
+# Obter URL SSH da instância (substitua INSTANCE_ID pelo ID da sua instância)
+vast ssh-url INSTANCE_ID
+
+# Exemplo de saída: ssh://root@ssh8.vast.ai:15222
+# Extrair HOST e PORTA da URL SSH
+
+# Obter SSH host diretamente da instância
+vast show instances --raw | jq -r '.[] | select(.id == INSTANCE_ID) | .ssh_host'
+
+# Obter SSH porta diretamente da instância
+vast show instances --raw | jq -r '.[] | select(.id == INSTANCE_ID) | .ssh_port'
+
+# Exemplo:
+# vast show instances --raw | jq '.[] | select(.id == 25645223) | {id, ssh_host, ssh_port}'
+
+# Conectar via SSH com chave (substitua HOST e PORTA pelos valores extraídos)
+ssh -p PORTA -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@HOST
+
+# Exemplo completo:
+# vast ssh-url 25645223
+# ssh -p 44290 -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@43.100.46.13
+
+# ====================================================================================
+# COPIE E COLE ESTE BLOCO PARA CONECTAR DIRETAMENTE:
+# ====================================================================================
+INSTANCE_ID=25645223; SSH_HOST=$(vast show instances --raw | jq -r ".[] | select(.id == $INSTANCE_ID) | .ssh_host"); SSH_PORT=$(vast show instances --raw | jq -r ".[] | select(.id == $INSTANCE_ID) | .ssh_port"); ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@$SSH_HOST
+
+# ====================================================================================
+# 2. COMANDOS PARA EXECUTAR NA INSTÂNCIA REMOTA
+# ====================================================================================
+
+# Matar processo orchestration/main.py
+pkill -9 -f 'orchestration/main.py'
+
+# Verificar se o processo foi morto (sem mostrar o próprio comando grep)
+ps aux | grep orchestration/main.py | grep -v grep
+
+# Alternativa mais limpa usando pgrep
+pgrep -f orchestration/main.py
+
+# Monitorar GPUs com auto-refresh (1 segundo) - VERSÃO MELHORADA
+watch -n 1 'echo "=== INFORMAÇÕES DAS GPUs - $(date) ==="; echo ""; nvidia-smi --query-gpu=index,name,driver_version,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit,clocks.current.graphics,clocks.current.memory,clocks.max.graphics,clocks.max.memory --format=csv,noheader,nounits; echo ""; echo "=== PROCESSOS USANDO GPU ==="; nvidia-smi pmon -c 1 -s um; echo ""; echo "=== INFORMAÇÕES DO SISTEMA ==="; echo "CPU: $(nproc) cores"; echo "RAM Total: $(free -h | grep Mem | awk "{print \$2}")"; echo "RAM Disponível: $(free -h | grep Mem | awk "{print \$7}")"; echo "RAM Usada: $(free -h | grep Mem | awk "{print \$3}")"; echo "Disco Disponível: $(df -h / | tail -1 | awk "{print \$4}")"; echo "Disco Usado: $(df -h / | tail -1 | awk "{print \$3}")"; echo "Load Average: $(uptime | awk -F"load average:" "{print \$2}")"'
+
+# Versão mais compacta e organizada
+watch -n 1 'clear; echo "=== MONITORAMENTO SISTEMA - $(date) ==="; echo ""; echo "🖥️  CPU: $(nproc) cores | Load: $(uptime | awk -F"load average:" "{print \$2}")"; echo "💾 RAM: $(free -h | grep Mem | awk "{print \$3}")/$(free -h | grep Mem | awk "{print \$2}") (usado/total) | Disponível: $(free -h | grep Mem | awk "{print \$7}")"; echo "💿 Disco: $(df -h / | tail -1 | awk "{print \$3}")/$(df -h / | tail -1 | awk "{print \$2}") (usado/total) | Disponível: $(df -h / | tail -1 | awk "{print \$4}")"; echo ""; echo "=== GPUs ==="; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free --format=csv,noheader,nounits | awk -F, "{printf \"GPU %s: %s%% | Mem: %sMB usada | %sMB livre\\n\", \$1, \$2, \$3, \$4}"; echo ""; echo "=== PROCESSOS GPU ==="; nvidia-smi pmon -c 1 -s um'
+
+# Versão SIMPLIFICADA - Apenas GPU essencial
+watch -n 1 'clear; echo "=== GPUs - $(date) ==="; echo ""; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free --format=csv,noheader,nounits | awk -F", " "{printf \"GPU %s: %s%% uso | %s MB usada | %s MB livre\\n\", \$1, \$2, \$3, \$4}"'
+
+# Versão ULTRA SIMPLES - Só o que você pediu
+watch -n 1 'clear; echo "=== GPUs - $(date) ==="; echo ""; nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.free --format=csv,noheader,nounits | awk -F", " "{printf \"GPU %s: %s%% | %sMB usada | %sMB livre\\n\", \$1, \$2, \$3, \$4}"'
+
+# ====================================================================================
+# 3. COMANDOS ALTERNATIVOS PARA MONITORAMENTO
+# ====================================================================================
+
+# Monitoramento simples de GPU
+nvidia-smi
+
+# Monitoramento contínuo de GPU (atualiza a cada 2 segundos)
+nvidia-smi -l 2
+
+# Ver processos usando GPU
+nvidia-smi pmon
+
+# Informações detalhadas do sistema
+htop
+
+# Ver uso de memória
+free -h
+
+# Ver uso de disco
+df -h
+
+# Ver processos Python
+ps aux | grep python
+
+# ====================================================================================
+# 4. COMANDOS PARA GERENCIAR O PIPELINE
+# ====================================================================================
+
+# Navegar para o diretório do projeto
+cd /workspace/feature_genesis
+
+# Ativar ambiente conda
+conda activate dynamic-stage0
+# ou
+conda activate feature-genesis
+
+# Executar o pipeline
+python orchestration/main.py
+
+# Executar em background
+nohup python orchestration/main.py > pipeline.log 2>&1 &
+
+# Ver logs em tempo real
+tail -f pipeline.log
+
+# ====================================================================================
+# 5. COMANDOS PARA TÚNEIS SSH (se necessário)
+# ====================================================================================
+
+# Criar túnel SSH reverso para MySQL (do local para remoto)
+ssh -R 3010:127.0.0.1:3010 -p PORTA root@HOST
+
+# Verificar se túnel está funcionando
+netstat -tlnp | grep 3010
+
+# ====================================================================================
+# 6. COMANDOS PARA SINCRONIZAÇÃO DE DADOS
+# ====================================================================================
+
+# Sincronizar dados do R2 (na instância remota)
+rclone sync "R2:bucket_name" "/data" --progress
+
+# Verificar arquivos sincronizados
+ls -la /data/
+
+# ====================================================================================
+# 7. COMANDOS DE EMERGÊNCIA
+# ====================================================================================
+
+# Matar todos os processos Python
+pkill -9 python
+
+# Matar todos os processos do usuário
+pkill -9 -u root
+
+# Reiniciar serviços NVIDIA
+sudo systemctl restart nvidia-persistenced
+
+# Verificar status dos serviços
+systemctl status nvidia-persistenced
+
+# ====================================================================================
+# 8. COMANDOS PARA DEBUGGING
+# ====================================================================================
+
+# Ver logs do sistema
+journalctl -f
+
+# Ver logs do Docker (se usando)
+docker logs CONTAINER_ID
+
+# Ver uso de recursos em tempo real
+top
+
+# Ver conexões de rede
+netstat -tulpn
+
+# ====================================================================================
+# EXEMPLO DE FLUXO COMPLETO:
+# ====================================================================================
+# 1. vast ssh 25645223
+# 2. pkill -9 -f 'orchestration/main.py'
+# 3. ps aux | grep orchestration/main.py
+# 4. watch -n 1 'nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits'
+# ====================================================================================

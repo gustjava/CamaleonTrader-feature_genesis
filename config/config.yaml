@@ -96,6 +96,7 @@ features:
       high_freq: 6  # Período da frequência alta (remove ruído < 6 períodos)
       causal: true  # Shift temporal para evitar look-ahead bias
       apply_to_all: true  # Aplica BK a todas as colunas numéricas elegíveis
+      fill_borders: true  # Preenche bordas NaN com valores apropriados (forward/backward fill)
       # Apply BK to these source columns (if present) - Colunas específicas para BK
       source_columns:
         - 'y_close'  # Preço de fechamento do target
@@ -242,6 +243,10 @@ features:
       _dxy: dxy
       spx: spx
       _spx: spx
+      brent: brent
+      _brent: brent
+      ust10y: ust10y
+      _ust10y: ust10y
   # Data-driven session auto-mask (UTC-agnostic; usa gaps/NaNs por janela)
   session_auto_mask:
     enabled: true

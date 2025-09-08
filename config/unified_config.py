@@ -279,6 +279,8 @@ class FeatureConfig:
     })
     # Session configuration for external drivers
     sessions: Dict[str, Any] = field(default_factory=dict)
+    # Index gap imputation configuration (Kalman session-aware)
+    index_imputation: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass 
@@ -416,6 +418,7 @@ class PipelineEngineConfig:
 class PipelineConfig:
     """Pipeline engine configuration."""
     engines: Dict[str, PipelineEngineConfig] = field(default_factory=lambda: {
+        'index_gap_imputation': PipelineEngineConfig(enabled=False, order=0, description="Kalman session-aware index gap imputation"),
         'stationarization': PipelineEngineConfig(enabled=True, order=1, description="Stationarization techniques"),
         'feature_engineering': PipelineEngineConfig(enabled=True, order=2, description="Early feature engineering (e.g., BK)"),
         'garch_models': PipelineEngineConfig(enabled=True, order=3, description="GARCH volatility modeling"),

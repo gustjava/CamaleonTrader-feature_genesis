@@ -47,7 +47,7 @@ def _bk_weights_cpu(k: int, low_period: float, high_period: float) -> _np.ndarra
     return weights
 
 
-def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: float, high_period: float, causal: bool = True) -> cudf.Series:
+def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: float, high_period: float, causal: bool = True, fill_borders: bool = True) -> cudf.Series:
     """Deterministic partition function: apply BK on a single partition (GPU).
 
     Handles nulls by filling with 0 for the convolution and restoring NaNs
@@ -85,8 +85,39 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
         # Best-effort; if mask conversion fails, proceed without restoration
         pass
     # BK borders are NaN by definition (insufficient data for convolution)
-    y[:k] = _cp.nan  # First k values are NaN
-    y[-k:] = _cp.nan  # Last k values are NaN
+    # IMPROVEMENT: Replace NaN borders with appropriate values instead of leaving them as NaN
+    if fill_borders and k > 0 and len(y) > 2 * k:
+        # Forward fill for the first k values (use the first valid value after the border)
+        first_valid_idx = k
+        if first_valid_idx < len(y) and not _cp.isnan(y[first_valid_idx]):
+            y[:k] = y[first_valid_idx]
+        else:
+            # If the first valid value is also NaN, find the next non-NaN value
+            for i in range(k, len(y)):
+                if not _cp.isnan(y[i]):
+                    y[:k] = y[i]
+                    break
+        
+        # Backward fill for the last k values (use the last valid value before the border)
+        last_valid_idx = len(y) - k - 1
+        if last_valid_idx >= 0 and not _cp.isnan(y[last_valid_idx]):
+            y[-k:] = y[last_valid_idx]
+        else:
+            # If the last valid value is also NaN, find the previous non-NaN value
+            for i in range(len(y) - k - 1, -1, -1):
+                if not _cp.isnan(y[i]):
+                    y[-k:] = y[i]
+                    break
+    elif fill_borders and k > 0:
+        # Edge case: series is too short, use the only available value
+        if len(y) > 0:
+            valid_val = None
+            for i in range(len(y)):
+                if not _cp.isnan(y[i]):
+                    valid_val = y[i]
+                    break
+            if valid_val is not None:
+                y[:] = valid_val
 
     # Build output series and apply causal shift if requested
     out = cudf.Series(y, index=series.index)  # Create output series
@@ -121,6 +152,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         sources: List[str] = []  # Source columns to apply BK filter to
         apply_all = False  # Whether to apply to all numeric columns
         causal = True  # Whether to apply causal shift
+        fill_borders = True  # Whether to fill NaN borders with appropriate values
         if feats is not None:
             try:
                 fe = getattr(feats, 'feature_engineering', {}) or {}  # Get feature engineering config
@@ -134,6 +166,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
                         sources = [str(c) for c in sc]  # Convert to strings
                     apply_all = bool(bk.get('apply_to_all', False))  # Apply to all flag
                     causal = bool(bk.get('causal', causal))  # Causal flag
+                    fill_borders = bool(bk.get('fill_borders', fill_borders))  # Fill borders flag
             except Exception:
                 pass
             # fallback to features.baxter_king dict
@@ -154,7 +187,7 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
                 high = float(getattr(feats, 'baxter_king_high_freq', high))  # Legacy high frequency
             except Exception:
                 pass
-        return {'k': k, 'low': low, 'high': high, 'source_columns': sources, 'apply_to_all': apply_all, 'causal': causal}
+        return {'k': k, 'low': low, 'high': high, 'source_columns': sources, 'apply_to_all': apply_all, 'causal': causal, 'fill_borders': fill_borders}
 
     def _eligible_all_numeric(self, df, exclude: List[str]) -> List[str]:
         """Return all numeric columns suitable for BK, excluding prefixes/names.
@@ -247,11 +280,12 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         low = float(params['low'])  # Low frequency (long period)
         high = float(params['high'])  # High frequency (short period)
         causal = bool(params.get('causal', True))  # Temporal shift to avoid look-ahead bias
+        fill_borders = bool(params.get('fill_borders', True))  # Fill NaN borders with appropriate values
         new_cols: List[str] = []  # Track newly created columns
         for col in src:  # Apply BK filter to each source column
             out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
             try:
-                gdf[out] = _apply_bk_filter_gpu_partition(gdf[col], k, low, high, causal)  # Apply BK filter on GPU
+                gdf[out] = _apply_bk_filter_gpu_partition(gdf[col], k, low, high, causal, fill_borders)  # Apply BK filter on GPU
                 new_cols.append(out)  # Add to list of created columns
                 self._log_info("Applied BK", source=col, out=out, k=k, low=low, high=high, causal=bool(causal))
             except Exception as e:
@@ -304,12 +338,13 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         low = float(params['low'])  # Low frequency (long period)
         high = float(params['high'])  # High frequency (short period)
         causal = bool(params.get('causal', True))  # Temporal shift to avoid look-ahead bias
+        fill_borders = bool(params.get('fill_borders', True))  # Fill NaN borders with appropriate values
         new_cols: List[str] = []  # Track newly created columns
         for col in src:  # Apply BK filter to each source column
             out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
             try:
                 df[out] = df[col].map_partitions(  # Apply BK filter to each partition
-                    _apply_bk_filter_gpu_partition, k, low, high, bool(causal), meta=(out, 'f4')  # GPU partition function with metadata
+                    _apply_bk_filter_gpu_partition, k, low, high, bool(causal), bool(fill_borders), meta=(out, 'f4')  # GPU partition function with metadata
                 )
                 new_cols.append(out)  # Add to list of created columns
                 self._log_info("Applied BK (Dask)", source=col, out=out, k=k, low=low, high=high, causal=bool(causal))

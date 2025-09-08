@@ -1,0 +1,39 @@
+
+version: 1
+disable_existing_loggers: false
+formatters:
+  simple:
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  json:
+    class: pythonjsonlogger.jsonlogger.JsonFormatter
+    format: '%(asctime)s %(name)s %(levelname)s %(message)s'
+
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: simple
+    stream: ext://sys.stdout
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: json
+    filename: logs/pipeline_execution.log
+    maxBytes: 10485760 # 10MB
+    backupCount: 5
+    encoding: utf8
+
+loggers:
+  __main__:
+    level: DEBUG
+    handlers: [console, file]
+  orchestration:
+    level: DEBUG
+    handlers: [console, file]
+  features:
+    level: DEBUG
+    handlers: [console, file]
+
+root:
+  level: INFO
+  handlers: [console, file]

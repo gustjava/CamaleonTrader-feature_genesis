@@ -73,20 +73,24 @@ class PipelineOrchestrator:
 
     # ---------------- Run lifecycle ----------------
     def start_run(self, dashboard_url: Optional[str] = None, hostname: Optional[str] = None) -> Optional[int]:
+        """Starts a new pipeline run, if the database is available."""
         try:
             if not self.db_handler.connect():
                 logger.warning("Database unavailable; run lifecycle tracking disabled.")
                 return None
             self.current_run_id = self.db_handler.create_run(hostname=hostname, dashboard_url=dashboard_url)
+            logger.info(f"Started pipeline run with ID: {self.current_run_id}")
             return self.current_run_id
         except Exception as e:
             logger.warning(f"Could not start pipeline run: {e}")
             return None
 
     def end_run(self, status: str = 'COMPLETED') -> None:
+        """Ends the current pipeline run, if one is active."""
         try:
             if self.current_run_id:
                 self.db_handler.end_run(self.current_run_id, status=status)
+                logger.info(f"Ended pipeline run with ID: {self.current_run_id} and status: {status}")
         except Exception as e:
             logger.warning(f"Could not end pipeline run: {e}")
     
@@ -165,7 +169,7 @@ class PipelineOrchestrator:
     
     def _clean_existing_output_files(self):
         """Clean up existing feather files for debugging."""
-        logger.info("🧹 Cleaning up existing feather files for debug...")
+        logger.info("Cleaning up existing feather files for debug...")
         import glob
         
         feather_files = glob.glob(f"{self.settings.output.output_path}/*/*.feather")
@@ -240,7 +244,7 @@ class PipelineOrchestrator:
     
     def _log_cluster_diagnostics(self, client: Client):
         """Log diagnostic information about the cluster."""
-        logger.info(f"Cluster status: Active")
+        logger.info("Cluster status: Active")
         logger.info(f"Client status: Connected")
         logger.info(f"Dashboard link: {client.dashboard_link}")
         
@@ -262,7 +266,7 @@ class PipelineOrchestrator:
         to use all GPUs for a single currency pair. Fail-fast on first error.
         """
         logger.info("=" * 60)
-        logger.info("STARTING DRIVER-SIDE PROCESSING (MULTI-GPU PER TASK)")
+        logger.info("Starting driver-side processing (multi-GPU per task)")
         logger.info("=" * 60)
 
         processor = DataProcessor(client, run_id=self.current_run_id)
@@ -271,11 +275,11 @@ class PipelineOrchestrator:
 
         for i, task in enumerate(tasks):
             if self.emergency_shutdown.is_set():
-                logger.critical("🚨 EMERGENCY SHUTDOWN DETECTED - STOPPING ALL PROCESSING")
+                logger.critical("Emergency shutdown detected - stopping all processing")
                 break
 
             logger.info("=" * 60)
-            logger.info(f"TASK {i+1}/{len(tasks)}: {task.currency_pair}")
+            logger.info(f"Task {i+1}/{len(tasks)}: {task.currency_pair}")
             logger.info("=" * 60)
             logger.info(f"File: {task.filename} ({task.file_size_mb:.1f} MB)")
             logger.info(f"R2 Path: {task.r2_path}")
@@ -285,7 +289,7 @@ class PipelineOrchestrator:
                 if ok:
                     successful_tasks += 1
                     logger.info("=" * 60)
-                    logger.info(f"✅ SUCCESS: {task.currency_pair} completed successfully")
+                    logger.info(f"Success: {task.currency_pair} completed successfully")
                     logger.info("=" * 60)
                     # Free worker memory proactively between tasks
                     try:
@@ -295,14 +299,14 @@ class PipelineOrchestrator:
                 else:
                     failed_tasks += 1
                     logger.error("=" * 60)
-                    logger.error(f"❌ FAILURE: {task.currency_pair} failed to process")
+                    logger.error(f"Failure: {task.currency_pair} failed to process")
                     logger.error("=" * 60)
-                    logger.critical("FAIL-FAST: Stopping pipeline due to task failure")
+                    logger.critical("Fail-fast: Stopping pipeline due to task failure")
                     break
             except CriticalPipelineError as e:
                 failed_tasks += 1
                 logger.critical("=" * 60)
-                logger.critical(f"🚨 CRITICAL PIPELINE ERROR processing {task.currency_pair}")
+                logger.critical(f"Critical pipeline error processing {task.currency_pair}")
                 logger.critical(f"Error: {str(e)}")
                 logger.critical("=" * 60)
                 self.emergency_shutdown.set()
@@ -310,7 +314,7 @@ class PipelineOrchestrator:
             except Exception as e:
                 failed_tasks += 1
                 logger.critical("=" * 60)
-                logger.critical(f"❌ CRITICAL ERROR processing {task.currency_pair}")
+                logger.critical(f"Critical error processing {task.currency_pair}")
                 logger.critical(f"Error: {str(e)}")
                 logger.critical("=" * 60)
                 self.emergency_shutdown.set()
@@ -326,7 +330,7 @@ class PipelineOrchestrator:
     def log_pipeline_summary(self, result: PipelineResult, total_discovered: int):
         """Log a summary of the pipeline execution."""
         logger.info("=" * 60)
-        logger.info("PIPELINE EXECUTION SUMMARY")
+        logger.info("Pipeline Execution Summary")
         logger.info(f"Total currency pairs found: {total_discovered}")
         logger.info(f"Already processed: {total_discovered - result.total_tasks}")
         logger.info(f"Tasks attempted: {result.successful_tasks + result.failed_tasks}")
@@ -334,7 +338,7 @@ class PipelineOrchestrator:
         logger.info(f"Failed tasks: {result.failed_tasks}")
         
         if result.emergency_shutdown:
-            logger.critical("🚨 PIPELINE STOPPED DUE TO EMERGENCY SHUTDOWN")
+            logger.critical("Pipeline stopped due to emergency shutdown")
         else:
             logger.info("=" * 60)
     

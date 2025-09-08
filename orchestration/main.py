@@ -3,14 +3,39 @@ Main Orchestration Script for Dynamic Stage 0 Pipeline
 
 This script manages the Dask-CUDA cluster lifecycle and provides the foundation
 for the GPU-accelerated feature engineering pipeline using the new modular architecture.
+
+**Pipeline Overview:**
+
+The pipeline is designed to perform feature engineering on a large dataset of currency pair data.
+It uses a Dask-CUDA cluster to distribute the workload across multiple GPUs, enabling
+efficient processing of large volumes of data.
+
+The main steps of the pipeline are:
+1.  **Initialization:**
+    - Load the unified configuration from `config.yaml` and environment variables.
+    - Set up logging using the configuration from `config/logging.yaml`.
+    - Initialize the `PipelineOrchestrator`.
+2.  **Task Discovery:**
+    - The `PipelineOrchestrator` discovers the currency pairs that need to be processed.
+3.  **Dask Cluster Management:**
+    - A `DaskClusterManager` is created to manage the Dask-CUDA cluster.
+    - The cluster is started, and the Dask client is created.
+4.  **Pipeline Execution:**
+    - The `PipelineOrchestrator` executes the feature engineering pipeline on the Dask cluster.
+    - The `process_currency_pair_worker` function is called for each currency pair.
+5.  **Shutdown:**
+    - The Dask cluster is shut down gracefully.
+    - The pipeline summary is logged.
 """
 
 import logging
+import logging.config
 import sys
 import os
 import signal
 import time
 import threading
+import yaml
 from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 
@@ -29,14 +54,24 @@ except ImportError as e:
 
 from config.unified_config import get_unified_config
 from orchestration.pipeline_orchestrator import PipelineOrchestrator
-from orchestration.data_processor import process_currency_pair_worker
 from features.base_engine import CriticalPipelineError
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+def setup_logging(default_path='config/logging.yaml', default_level=logging.INFO):
+    """Set up logging configuration."""
+    path = default_path
+    if os.path.exists(path):
+        with open(path, 'rt') as f:
+            try:
+                config = yaml.safe_load(f.read())
+                logging.config.dictConfig(config)
+            except Exception as e:
+                print(f"Error reading logging configuration: {e}")
+                logging.basicConfig(level=default_level)
+    else:
+        logging.basicConfig(level=default_level)
+        print("logging.yaml not found, using basic logging.")
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # Global flag for emergency shutdown
@@ -45,8 +80,8 @@ EMERGENCY_SHUTDOWN = threading.Event()
 
 def emergency_shutdown_handler(signum, frame):
     """Handle emergency shutdown signals."""
-    logger.critical("🚨 EMERGENCY SHUTDOWN SIGNAL RECEIVED")
-    logger.critical("🛑 Initiating immediate shutdown of all processes...")
+    logger.critical("Emergency shutdown signal received.")
+    logger.critical("Initiating immediate shutdown of all processes...")
     EMERGENCY_SHUTDOWN.set()
     sys.exit(1)
 
@@ -78,7 +113,7 @@ class DaskClusterManager:
     def _get_gpu_count(self) -> int:
         """Get the number of available GPUs."""
         try:
-            return cp.cuda.runtime.getDeviceCount()  # Detecta número de GPUs NVIDIA disponíveis
+            return cp.cuda.runtime.getDeviceCount()
         except Exception as e:
             logger.warning(f"Could not detect GPU count: {e}")
             return 1
@@ -86,10 +121,9 @@ class DaskClusterManager:
     def _configure_rmm(self):
         """Configure RMM (RAPIDS Memory Manager) for optimal memory management."""
         try:
-            from rmm import reinitialize  # Importa gerenciador de memória RAPIDS
+            from rmm import reinitialize
             
-            # Determine safe pool sizes based on actual device memory
-            def parse_size_gb(val: str) -> float:  # Converte strings de tamanho para GB
+            def parse_size_gb(val: str) -> float:
                 v = str(val).strip().upper()
                 if v.endswith('GB'):
                     return float(v[:-2])
@@ -98,12 +132,11 @@ class DaskClusterManager:
                 return float(v)
 
             try:
-                free_b, total_b = cp.cuda.runtime.memGetInfo()  # Obtém memória livre e total da GPU
-                total_gb = total_b / (1024 ** 3)  # Converte bytes para GB
+                free_b, total_b = cp.cuda.runtime.memGetInfo()
+                total_gb = total_b / (1024 ** 3)
             except Exception:
-                total_gb = 8.0  # Fallback conservador se não conseguir detectar memória
+                total_gb = 8.0
 
-            # Proportional sizing if configured; fallback to fixed sizes
             pool_frac = float(getattr(self.config.dask, 'rmm_pool_fraction', 0.0) or 0.0)
             init_frac = float(getattr(self.config.dask, 'rmm_initial_pool_fraction', 0.0) or 0.0)
             max_frac = float(getattr(self.config.dask, 'rmm_maximum_pool_fraction', 0.0) or 0.0)
@@ -111,46 +144,43 @@ class DaskClusterManager:
             if pool_frac > 0.0:
                 desired_pool_gb = max(0.25, total_gb * pool_frac)
             else:
-                desired_pool_gb = parse_size_gb(self.config.dask.rmm_pool_size)  # Tamanho desejado do pool em GB
+                desired_pool_gb = parse_size_gb(self.config.dask.rmm_pool_size)
 
             if init_frac > 0.0:
                 desired_init_gb = max(0.25, total_gb * init_frac)
             else:
-                desired_init_gb = parse_size_gb(self.config.dask.rmm_initial_pool_size)  # Tamanho inicial desejado em GB
+                desired_init_gb = parse_size_gb(self.config.dask.rmm_initial_pool_size)
 
-            # Limita a fração máxima da memória total da GPU para evitar overallocation do pool
             if max_frac > 0.0:
                 cap_gb = max(0.25, total_gb * max_frac)
             else:
-                cap_gb = max(0.25, total_gb * 0.60)  # Máximo de 60% da memória total, mínimo 0.25GB
-            safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb))  # Pool seguro (não excede o limite)
-            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb))  # Inicial seguro (não excede o pool)
+                cap_gb = max(0.25, total_gb * 0.60)
+            safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb))
+            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb))
 
-            # Persist safe values for cluster kwargs
-            self._safe_rmm_pool_size_str = f"{safe_pool_gb:.2f}GB"  # String formatada para cluster kwargs
-            initial_pool_size = int(safe_init_gb * (1024 ** 3))  # Converte GB para bytes para RMM
+            self._safe_rmm_pool_size_str = f"{safe_pool_gb:.2f}GB"
+            initial_pool_size = int(safe_init_gb * (1024 ** 3))
 
-            # Tenta pool CUDA malloc async primeiro (se disponível), senão pool clássico
             try:
                 reinitialize(
-                    pool_allocator=True,  # Habilita pool allocator (mais eficiente)
-                    initial_pool_size=initial_pool_size,  # Tamanho inicial do pool em bytes
-                    managed_memory=False  # Desabilita managed memory (mais previsível)
+                    pool_allocator=True,
+                    initial_pool_size=initial_pool_size,
+                    managed_memory=False
                 )
                 logger.info(
-                    "✅ RMM configured (pool) with %.2fGB initial, pool=%.2fGB (cap=%.2fGB of %.2fGB)",
+                    "RMM configured (pool) with %.2fGB initial, pool=%.2fGB (cap=%.2fGB of %.2fGB)",
                     safe_init_gb, safe_pool_gb, cap_gb, total_gb
                 )
             except Exception as e_pool:
                 logger.warning("RMM pool init failed (%s). Falling back to default CUDA allocator.", e_pool)
-                os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")  # Fallback para allocator padrão CUDA
+                os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
             
         except ImportError:
-            logger.warning("⚠️ RMM not available, using default CUDA memory management")
-            os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")  # Usa allocator padrão CUDA se RMM não disponível
+            logger.warning("RMM not available, using default CUDA memory management")
+            os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
         except Exception as e:
             logger.error(f"Failed to configure RMM: {e}")
-            os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")  # Fallback para allocator padrão em caso de erro
+            os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
 
     def start_cluster(self) -> bool:
         """
@@ -160,18 +190,16 @@ class DaskClusterManager:
         """
         try:
             logger.info("Starting Dask-CUDA cluster...")
-            gpu_count = self._get_gpu_count()  # Detecta número de GPUs disponíveis
+            gpu_count = self._get_gpu_count()
             logger.info(f"Detected {gpu_count} GPU(s)")
 
-            # Configure RMM before creating cluster
-            self._configure_rmm()  # Configura gerenciamento de memória GPU antes de criar cluster
+            self._configure_rmm()
 
-            # Configure worker memory via dask config to avoid deprecation warnings
             try:
                 import dask
                 dask.config.set({
-                    'distributed.worker.memory.target': float(self.config.dask.memory_target_fraction),  # Alvo de utilização de RAM (80%)
-                    'distributed.worker.memory.spill': float(self.config.dask.memory_spill_fraction),  # Inicia spill quando RAM atinge 90%
+                    'distributed.worker.memory.target': float(self.config.dask.memory_target_fraction),
+                    'distributed.worker.memory.spill': float(self.config.dask.memory_spill_fraction),
                 })
                 logger.info("Dask memory config set (target=%.2f, spill=%.2f)",
                             float(self.config.dask.memory_target_fraction),
@@ -179,117 +207,109 @@ class DaskClusterManager:
             except Exception as e:
                 logger.warning(f"Could not set Dask memory config: {e}")
 
-            # Build cluster configuration from unified config (omit deprecated kwargs)
             cluster_kwargs = {
-                'n_workers': gpu_count,  # Um worker por GPU (isolamento completo)
-                'threads_per_worker': self.config.dask.threads_per_worker,  # Uma thread por worker (evita conflitos GPU)
-                # Use safe pool size string if computed during RMM config
-                'rmm_pool_size': getattr(self, '_safe_rmm_pool_size_str', self.config.dask.rmm_pool_size),  # Pool de memória GPU calculado dinamicamente
-                'local_directory': self.config.dask.local_directory,  # Diretório para spill de dados quando RAM fica cheia
+                'n_workers': gpu_count,
+                'threads_per_worker': self.config.dask.threads_per_worker,
+                'rmm_pool_size': getattr(self, '_safe_rmm_pool_size_str', self.config.dask.rmm_pool_size),
+                'local_directory': self.config.dask.local_directory,
             }
 
-            # Add UCX configuration if enabled
-            if self.config.dask.protocol == "ucx":  # Se protocolo UCX estiver habilitado
+            if self.config.dask.protocol == "ucx":
                 cluster_kwargs.update({
-                    'protocol': "ucx",  # Protocolo UCX para comunicação GPU-GPU
-                    'enable_tcp_over_ucx': self.config.dask.enable_tcp_over_ucx,  # Habilita TCP sobre UCX
-                    'enable_infiniband': self.config.dask.enable_infiniband,  # InfiniBand (geralmente desabilitado)
-                    'enable_nvlink': self.config.dask.enable_nvlink,  # NVLink para comunicação direta entre GPUs
+                    'protocol': "ucx",
+                    'enable_tcp_over_ucx': self.config.dask.enable_tcp_over_ucx,
+                    'enable_infiniband': self.config.dask.enable_infiniband,
+                    'enable_nvlink': self.config.dask.enable_nvlink,
                 })
 
             try:
                 logger.info("Creating LocalCUDACluster with UCX...")
-                self.cluster = LocalCUDACluster(**cluster_kwargs)  # Tenta criar cluster com UCX (mais rápido)
+                self.cluster = LocalCUDACluster(**cluster_kwargs)
             except Exception as ucx_err:
                 logger.warning(f"UCX unavailable ({ucx_err}); falling back to TCP.")
-                # Remove UCX-specific parameters for TCP fallback
-                for key in ['protocol', 'enable_tcp_over_ucx', 'enable_infiniband', 'enable_nvlink']:  # Remove parâmetros UCX
+                for key in ['protocol', 'enable_tcp_over_ucx', 'enable_infiniband', 'enable_nvlink']:
                     cluster_kwargs.pop(key, None)
-                self.cluster = LocalCUDACluster(**cluster_kwargs)  # Cria cluster com TCP (fallback mais lento mas funcional)
+                self.cluster = LocalCUDACluster(**cluster_kwargs)
 
-            logger.info("✓ Cluster created successfully")
-            self.client = Client(self.cluster)  # Cria cliente Dask para comunicação com cluster
-            logger.info("✓ Client created successfully")
+            logger.info("Cluster created successfully")
+            self.client = Client(self.cluster)
+            logger.info("Client created successfully")
 
             logger.info("Waiting for workers to be ready...")
-            self.client.wait_for_workers(gpu_count, timeout=300)  # Aguarda todos os workers ficarem prontos (timeout 5min)
-            logger.info(f"✓ {gpu_count} workers ready")
-            logger.info(f"✓ Dashboard URL: {self.client.dashboard_link}")
-            logger.info(f"✓ Active workers: {len(self.client.scheduler_info()['workers'])}")
+            self.client.wait_for_workers(gpu_count, timeout=300)
+            logger.info(f"{gpu_count} workers ready")
+            logger.info(f"Dashboard URL: {self.client.dashboard_link}")
+            logger.info(f"Active workers: {len(self.client.scheduler_info()['workers'])}")
             
-            # Set up worker death monitoring
-            self._setup_worker_monitoring()  # Configura monitoramento para detectar falhas de workers
+            self._setup_worker_monitoring()
             
             return True
 
         except Exception as e:
             logger.error(f"Failed to start Dask-CUDA cluster: {e}", exc_info=True)
-            self.shutdown()  # Limpa recursos em caso de falha
+            self.shutdown()
             return False
 
     def get_client(self) -> Optional[Client]:
         """Get the Dask client instance."""
-        return self.client  # Retorna cliente Dask para comunicação com cluster
+        return self.client
 
     def get_cluster(self) -> Optional[LocalCUDACluster]:
         """Get the Dask-CUDA cluster instance."""
-        return self.cluster  # Retorna instância do cluster Dask-CUDA
+        return self.cluster
 
     def is_active(self) -> bool:
         """Check if the cluster is active."""
-        return self.cluster is not None and self.client is not None  # Verifica se cluster e cliente estão ativos
+        return self.cluster is not None and self.client is not None
         
     def shutdown(self):
         """Shutdown the cluster and client gracefully."""
         logger.info("Shutting down Dask-CUDA cluster...")
         try:
             if self.client:
-                self.client.close()  # Fecha cliente Dask
+                self.client.close()
             if self.cluster:
-                self.cluster.close()  # Fecha cluster Dask-CUDA
+                self.cluster.close()
             logger.info("Dask-CUDA cluster shutdown complete")
         except Exception as e:
             logger.error(f"Error during cluster shutdown: {e}")
         finally:
-            self.client = None  # Limpa referência ao cliente
-            self.cluster = None  # Limpa referência ao cluster
+            self.client = None
+            self.cluster = None
     
     def __enter__(self):
         """Context manager entry."""
-        if not self.start_cluster():  # Inicia cluster ao entrar no contexto
+        if not self.start_cluster():
             raise RuntimeError("Failed to start Dask-CUDA cluster")
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
-        self.shutdown()  # Fecha cluster ao sair do contexto (garantia de limpeza)
+        self.shutdown()
 
     def _setup_worker_monitoring(self):
         """Set up monitoring to detect worker deaths and stop pipeline."""
         try:
-            # Get initial worker count
-            self.initial_worker_count = len(self.client.scheduler_info()["workers"])  # Conta workers iniciais
+            self.initial_worker_count = len(self.client.scheduler_info()["workers"])
             logger.info(f"Monitoring {self.initial_worker_count} workers for failures")
             
-            # Set up periodic check
             def monitor_workers():
                 while True:
                     try:
-                        current_workers = len(self.client.scheduler_info()["workers"])  # Conta workers atuais
-                        if current_workers < self.initial_worker_count:  # Se algum worker morreu
-                            logger.critical("🚨 WORKER DEATH DETECTED!")
+                        current_workers = len(self.client.scheduler_info()["workers"])
+                        if current_workers < self.initial_worker_count:
+                            logger.critical("WORKER DEATH DETECTED!")
                             logger.critical(f"Workers: {current_workers}/{self.initial_worker_count}")
-                            logger.critical("🛑 STOPPING PIPELINE IMMEDIATELY")
-                            EMERGENCY_SHUTDOWN.set()  # Sinaliza shutdown de emergência
+                            logger.critical("STOPPING PIPELINE IMMEDIATELY")
+                            EMERGENCY_SHUTDOWN.set()
                             break
-                        time.sleep(5)  # Check every 5 seconds
+                        time.sleep(5)
                     except Exception as e:
                         logger.error(f"Error in worker monitoring: {e}")
                         break
             
-            # Start monitoring in background thread
-            monitor_thread = threading.Thread(target=monitor_workers, daemon=True)  # Thread daemon (não bloqueia shutdown)
-            monitor_thread.start()  # Inicia monitoramento em background
+            monitor_thread = threading.Thread(target=monitor_workers, daemon=True)
+            monitor_thread.start()
             
         except Exception as e:
             logger.error(f"Failed to setup worker monitoring: {e}")
@@ -298,13 +318,13 @@ class DaskClusterManager:
 @contextmanager
 def managed_dask_cluster():
     """Context manager for Dask-CUDA cluster lifecycle."""
-    cluster_manager = DaskClusterManager()  # Cria gerenciador de cluster
+    cluster_manager = DaskClusterManager()
     try:
-        if not cluster_manager.start_cluster():  # Inicia cluster
+        if not cluster_manager.start_cluster():
             raise RuntimeError("Failed to start Dask-CUDA cluster")
-        yield cluster_manager  # Retorna cluster ativo
+        yield cluster_manager
     finally:
-        cluster_manager.shutdown()  # Garante shutdown mesmo em caso de erro
+        cluster_manager.shutdown()
 
 
 def run_pipeline():
@@ -314,73 +334,73 @@ def run_pipeline():
     logger.info("=" * 60)
 
     try:
-        # Get unified configuration
-        config = get_unified_config()  # Carrega configuração unificada (YAML + variáveis de ambiente)
+        # Step 1: Get unified configuration
+        config = get_unified_config()
         
-        # Initialize pipeline orchestrator
-        orchestrator = PipelineOrchestrator()  # Cria orquestrador do pipeline
+        # Step 2: Initialize pipeline orchestrator
+        orchestrator = PipelineOrchestrator()
         
-        # Connect to database (non-fatal; continue without DB if unavailable)
-        if not orchestrator.connect_database():  # Tenta conectar ao banco (não é fatal)
+        # Step 3: Connect to database (non-fatal)
+        if not orchestrator.connect_database():
             logger.warning("Database unavailable; continuing without task tracking.")
 
-        # Discover tasks
-        pending_tasks = orchestrator.discover_tasks()  # Descobre pares de moeda que precisam de processamento
+        # Step 4: Discover tasks
+        pending_tasks = orchestrator.discover_tasks()
         if not pending_tasks:
             logger.info("No tasks to process. Pipeline complete.")
             return 0
 
-        logger.info(f"Processing {len(pending_tasks)} currency pairs that need feature engineering")  # Log do número de tarefas
+        logger.info(f"Processing {len(pending_tasks)} currency pairs that need feature engineering")
 
-        # Execute pipeline with cluster management
-        with managed_dask_cluster() as cluster_manager:  # Context manager garante shutdown automático
-            if not cluster_manager.is_active():  # Verifica se cluster está ativo
+        # Step 5: Execute pipeline with cluster management
+        with managed_dask_cluster() as cluster_manager:
+            if not cluster_manager.is_active():
                 logger.error("Cluster manager is not active")
                 raise RuntimeError("Failed to start or activate Dask cluster.")
             
-            client = cluster_manager.get_client()  # Obtém cliente Dask do cluster
+            client = cluster_manager.get_client()
             if not client:
                 logger.error("Failed to get Dask client")
                 raise RuntimeError("Failed to get Dask client.")
             
-            # Start DB-backed run lifecycle (best-effort)
+            # Step 5a: Start DB-backed run lifecycle (best-effort)
             try:
                 orchestrator.start_run(
-                    dashboard_url=getattr(client, 'dashboard_link', None),  # URL do dashboard Dask
-                    hostname=cluster_manager.hostname,  # Hostname da máquina
+                    dashboard_url=getattr(client, 'dashboard_link', None),
+                    hostname=cluster_manager.hostname,
                 )
             except Exception as e:
-                logger.warning(f"Run lifecycle tracking unavailable: {e}")  # Não é fatal se falhar
+                logger.warning(f"Run lifecycle tracking unavailable: {e}")
 
-            # Execute the pipeline
-            result = orchestrator.execute_pipeline(cluster_manager, client)  # Executa pipeline completo
+            # Step 5b: Execute the pipeline
+            result = orchestrator.execute_pipeline(cluster_manager, client)
             
-            # Log pipeline summary
-            orchestrator.log_pipeline_summary(result, len(pending_tasks))  # Log do resumo da execução
+            # Step 5c: Log pipeline summary
+            orchestrator.log_pipeline_summary(result, len(pending_tasks))
             
-            # Clean up
-            orchestrator.cleanup()  # Limpa recursos e conexões
+            # Step 5d: Clean up
+            orchestrator.cleanup()
             
-            # Check if emergency shutdown was triggered
-            if result.emergency_shutdown:  # Se shutdown de emergência foi acionado
-                logger.critical("🚨 PIPELINE STOPPED DUE TO EMERGENCY SHUTDOWN")
+            # Step 5e: Check if emergency shutdown was triggered
+            if result.emergency_shutdown:
+                logger.critical("PIPELINE STOPPED DUE TO EMERGENCY SHUTDOWN")
                 try:
-                    orchestrator.end_run(status='ABORTED')  # Marca execução como abortada
+                    orchestrator.end_run(status='ABORTED')
                 finally:
-                    return 1  # Código de erro para shutdown de emergência
+                    return 1
             
-            exit_code = 0 if result.failed_tasks == 0 else 1  # 0 = sucesso, 1 = falha
+            exit_code = 0 if result.failed_tasks == 0 else 1
             try:
-                orchestrator.end_run(status='COMPLETED' if exit_code == 0 else 'FAILED')  # Marca status final da execução
+                orchestrator.end_run(status='COMPLETED' if exit_code == 0 else 'FAILED')
             finally:
-                return exit_code  # Retorna código de saída apropriado
+                return exit_code
 
     except Exception as e:
-        logger.error(f"FATAL PIPELINE ERROR: {e}", exc_info=True)  # Log de erro fatal com stack trace
-        return 1  # Código de erro para falha fatal
+        logger.error(f"FATAL PIPELINE ERROR: {e}", exc_info=True)
+        return 1
 
 
 if __name__ == "__main__":
     import multiprocessing
-    multiprocessing.freeze_support()  # Suporte para multiprocessing em executáveis congelados
-    sys.exit(run_pipeline())  # Executa pipeline e sai com código de retorno apropriado
+    multiprocessing.freeze_support()
+    sys.exit(run_pipeline())

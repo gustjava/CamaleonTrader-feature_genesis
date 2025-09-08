@@ -504,7 +504,7 @@ class DataProcessor:
                         self.db_handler.update_task_status(task_id, 'RUNNING')
                         # Attach context to engines for metrics/artifacts
                         try:
-                            for eng in (self.station, self.stats, self.garch):
+                            for eng in (self.station, self.stats, self.garch, self.feng):
                                 if hasattr(eng, 'set_task_context'):
                                     eng.set_task_context(self.run_id, task_id, self.db_handler)
                         except Exception:
