@@ -1,5 +1,5 @@
 """
-Data Processor for Dynamic Stage 0 Pipeline
+Data Processor for Feature Engineering Pipeline
 
 This module handles the processing of individual currency pairs through the feature engineering pipeline.
 """
@@ -7,6 +7,7 @@ This module handles the processing of individual currency pairs through the feat
 import logging
 import sys
 import os
+import time
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -19,8 +20,10 @@ from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
 from features import StationarizationEngine, StatisticalTests, GARCHModels, FeatureEngineeringEngine
 from features.base_engine import CriticalPipelineError
+from utils.logging_utils import get_logger, info_event, warn_event, error_event, time_event, Events
+from utils import log_context
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "orchestration.processor")
 
 
 class DataProcessor:
@@ -280,9 +283,15 @@ class DataProcessor:
                     logger.info(f"⏭️ Skipping disabled engine: {engine_name}")
                     continue
                 
-                logger.info("=" * 50)
-                logger.info(f"PROCESSING {currency_pair} - STAGE {getattr(engine_config, 'order', 0)}: {engine_name.upper()}")
-                logger.info("=" * 50)
+                # Set engine context
+                log_context.set_engine(engine_name)
+                
+                # Log engine start with structured data
+                info_event(logger, Events.ENGINE_START, 
+                           f"Starting {engine_name} processing for {currency_pair}",
+                           pair=currency_pair, engine=engine_name, 
+                           order=getattr(engine_config, 'order', 0), 
+                           desc=getattr(engine_config, 'description', 'No description'))
                 try:
                     desc = getattr(engine_config, 'description', 'No description')
                 except Exception:
@@ -302,6 +311,14 @@ class DataProcessor:
                     rows_after = len(gdf)
                     cols_after = len(gdf.columns)
                     new_cols = cols_after - cols_before
+                    
+                    # Log engine completion with structured data
+                    info_event(logger, Events.ENGINE_END, 
+                               f"{engine_name.title()} processing completed for {currency_pair}",
+                               pair=currency_pair, engine=engine_name,
+                               order=getattr(engine_config, 'order', 0),
+                               rows_before=rows_before, rows_after=rows_after,
+                               cols_before=cols_before, cols_after=cols_after, new_cols=new_cols)
                     
                     logger.info(f"{engine_name.title()} complete: {cols_before} -> {cols_after} cols (+{new_cols} new), "
                               f"{rows_before} -> {rows_after} rows ({rows_after - rows_before} change)")
@@ -564,9 +581,15 @@ class DataProcessor:
                     logger.info(f"⏭️ Skipping disabled engine: {engine_name}")
                     continue
 
-                logger.info("=" * 50)
-                logger.info(f"PROCESSING {currency_pair} (Dask) - STAGE {eng_cfg.order}: {engine_name.upper()}")
-                logger.info("=" * 50)
+                # Set engine context
+                log_context.set_engine(engine_name)
+                
+                # Log engine start with structured data
+                info_event(logger, Events.ENGINE_START, 
+                           f"Starting {engine_name} processing for {currency_pair} (Dask)",
+                           pair=currency_pair, engine=engine_name, 
+                           order=eng_cfg.order, 
+                           desc=eng_cfg.description)
                 logger.info(f"📝 Description: {eng_cfg.description}")
                 # Stage DB start (schema deltas based on columns only, rows unknown for Dask)
                 stage_id = None
@@ -591,7 +614,11 @@ class DataProcessor:
 
                     # Stabilize graph/memory between engines
                     ddf = ddf.persist()
-                    wait(ddf)
+                    try:
+                        wait(ddf, timeout=300)  # 5 minute timeout
+                    except Exception as wait_err:
+                        logger.warning(f"Wait timeout or error for {engine_name}: {wait_err}")
+                        # Continue without waiting - data is still persisted
 
                     # Free CuPy pools on all workers to reduce carry-over memory
                     try:
@@ -602,6 +629,15 @@ class DataProcessor:
 
                     if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
                         raise RuntimeError(f"Validation failed after {engine_name}")
+
+                    # Log engine completion with structured data
+                    cols_after = len(ddf.columns)
+                    new_cols = (cols_after - cols_before) if (cols_before is not None and cols_after is not None) else None
+                    info_event(logger, Events.ENGINE_END, 
+                               f"{engine_name.title()} processing completed for {currency_pair} (Dask)",
+                               pair=currency_pair, engine=engine_name,
+                               order=eng_cfg.order,
+                               cols_before=cols_before, cols_after=cols_after, new_cols=new_cols)
 
                     # Save intermediate checkpoint if enabled
                     try:
@@ -712,6 +748,11 @@ class DataProcessor:
             bool: True if saving was successful, False otherwise
         """
         try:
+            # Log I/O start
+            info_event(logger, Events.IO_SAVE_START, 
+                       f"Starting save operation for {currency_pair}",
+                       pair=currency_pair, columns=len(gdf.columns), rows=len(gdf))
+            
             logger.info(f"Saving processed data with {len(gdf.columns)} columns to Feather v2 files for {currency_pair}")
             
             # Get the output path from settings
@@ -773,6 +814,12 @@ class DataProcessor:
             # Verify the saved data
             saved_files = list(output_dir.glob("*.feather"))
             total_size_mb = sum(f.stat().st_size for f in saved_files) / (1024 * 1024)
+            
+            # Log I/O completion
+            info_event(logger, Events.IO_SAVE_END, 
+                       f"Save operation completed for {currency_pair}",
+                       pair=currency_pair, files_created=len(saved_files), 
+                       total_size_mb=round(total_size_mb, 2), path=str(output_dir))
             
             logger.info(f"Successfully saved processed data for {currency_pair}")
             logger.info(f"Files created: {len(saved_files)}")

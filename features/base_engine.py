@@ -445,10 +445,13 @@ class BaseFeatureEngine(ABC):
         Check and log memory usage at different stages.
         
         Args:
-            stage: Stage identifier for logging
+            stage: Stage identifier for logging (kept for DB compatibility)
         """
         try:
             import psutil
+            
+            # Convert stage to operation name for logging
+            operation_name = stage.replace('_', ' ').title()
             
             # System memory
             memory = psutil.virtual_memory()
@@ -461,7 +464,7 @@ class BaseFeatureEngine(ABC):
             }
             
             if memory_percent > 85:
-                self.logger.warning(f"High system memory usage at {stage}: {memory_percent:.1f}% ({memory_gb:.2f} GB)")
+                self.logger.warning(f"High system memory usage during {operation_name}: {memory_percent:.1f}% ({memory_gb:.2f} GB)")
             
             # GPU memory if available
             try:
@@ -474,7 +477,7 @@ class BaseFeatureEngine(ABC):
                 self.memory_usage[stage]['gpu_gb'] = gpu_used_gb
                 
                 if gpu_percent > 85:
-                    self.logger.warning(f"High GPU memory usage at {stage}: {gpu_percent:.1f}% ({gpu_used_gb:.2f} GB)")
+                    self.logger.warning(f"High GPU memory usage during {operation_name}: {gpu_percent:.1f}% ({gpu_used_gb:.2f} GB)")
                     
             except Exception as e:
                 self.logger.debug(f"Could not get GPU memory info: {e}")

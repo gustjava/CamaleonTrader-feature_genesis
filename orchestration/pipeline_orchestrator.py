@@ -1,5 +1,5 @@
 """
-Pipeline Orchestrator for Dynamic Stage 0 Pipeline
+Pipeline Orchestrator for Feature Engineering Pipeline
 
 This module handles the high-level orchestration of the feature engineering pipeline,
 separating orchestration logic from processing logic.
@@ -22,8 +22,15 @@ from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
 from features.base_engine import CriticalPipelineError
 from orchestration.data_processor import DataProcessor
+from utils.logging_utils import (
+    get_logger,
+    info_event,
+    warn_event,
+    error_event,
+)
+from utils import log_context
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, component="orchestration.orchestrator")
 
 
 @dataclass
@@ -76,13 +83,14 @@ class PipelineOrchestrator:
         """Starts a new pipeline run, if the database is available."""
         try:
             if not self.db_handler.connect():
-                logger.warning("Database unavailable; run lifecycle tracking disabled.")
+                warn_event(logger, "db.unavailable", "Database unavailable; run lifecycle tracking disabled.")
                 return None
             self.current_run_id = self.db_handler.create_run(hostname=hostname, dashboard_url=dashboard_url)
-            logger.info(f"Started pipeline run with ID: {self.current_run_id}")
+            log_context.set_run_id(self.current_run_id)
+            info_event(logger, "run.start", "Started pipeline run", run_id=self.current_run_id, hostname=hostname, dashboard_url=dashboard_url)
             return self.current_run_id
         except Exception as e:
-            logger.warning(f"Could not start pipeline run: {e}")
+            warn_event(logger, "run.start.warn", "Could not start pipeline run", error=str(e))
             return None
 
     def end_run(self, status: str = 'COMPLETED') -> None:
@@ -90,9 +98,9 @@ class PipelineOrchestrator:
         try:
             if self.current_run_id:
                 self.db_handler.end_run(self.current_run_id, status=status)
-                logger.info(f"Ended pipeline run with ID: {self.current_run_id} and status: {status}")
+                info_event(logger, "run.end", "Ended pipeline run", run_id=self.current_run_id, status=status)
         except Exception as e:
-            logger.warning(f"Could not end pipeline run: {e}")
+            warn_event(logger, "run.end.warn", "Could not end pipeline run", error=str(e))
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
@@ -106,14 +114,14 @@ class PipelineOrchestrator:
         Returns:
             List of ProcessingTask objects representing work to be done.
         """
-        logger.info("Discovering currency pairs in local data directory...")
+        info_event(logger, "task.discovery.start", "Discovering currency pairs in local data directory...")
         
         available_pairs = self.local_loader.discover_currency_pairs()
         if not available_pairs:
-            logger.info("No currency pairs found in data directory.")
+            info_event(logger, "task.discovery.none", "No currency pairs found in data directory.")
             return []
         
-        logger.info(f"Found {len(available_pairs)} currency pairs in data directory")
+        info_event(logger, "task.discovery.found", "Currency pairs found", count=len(available_pairs))
         
         # Clean up existing feather files for debugging if configured
         if self.settings.development.clean_existing_output:
@@ -129,12 +137,12 @@ class PipelineOrchestrator:
             consolidated = out_dir / f"{currency_pair}.feather"
             if not self.settings.development.force_reprocessing:
                 if consolidated.exists():
-                    logger.info(f"Skipping {currency_pair} - consolidated output exists")
+                    info_event(logger, "task.skip.existing", "Skipping pair; consolidated output exists", pair=currency_pair)
                     continue
                 # Also skip if partitioned feather outputs exist
                 try:
                     if out_dir.exists() and any(out_dir.glob("part-*.feather")):
-                        logger.info(f"Skipping {currency_pair} - partitioned output exists")
+                        info_event(logger, "task.skip.partitioned", "Skipping pair; partitioned output exists", pair=currency_pair)
                         continue
                 except Exception:
                     pass
@@ -143,16 +151,16 @@ class PipelineOrchestrator:
             if consolidated.exists() and self.settings.development.force_reprocessing:
                 try:
                     consolidated.unlink()
-                    logger.info(f"Removed existing consolidated output for reprocessing: {consolidated}")
+                    info_event(logger, "output.remove", "Removed consolidated output for reprocessing", path=str(consolidated))
                 except Exception as e:
-                    logger.warning(f"Could not remove file {consolidated}: {e}")
+                    warn_event(logger, "output.remove.warn", "Could not remove consolidated output", path=str(consolidated), error=str(e))
                 # Remove partitioned outputs as well
                 try:
                     for p in out_dir.glob("part-*.feather"):
                         p.unlink()
-                    logger.info(f"Removed existing partitioned outputs in {out_dir}")
+                    info_event(logger, "output.remove", "Removed existing partitioned outputs", path=str(out_dir))
                 except Exception as e:
-                    logger.warning(f"Could not remove partitioned outputs in {out_dir}: {e}")
+                    warn_event(logger, "output.remove.warn", "Could not remove partitioned outputs", path=str(out_dir), error=str(e))
             
             task = ProcessingTask(
                 task_id=None,  # Will be assigned after successful processing
@@ -163,29 +171,29 @@ class PipelineOrchestrator:
                 filename=pair_info['filename']
             )
             pending_tasks.append(task)
-            logger.info(f"Added {currency_pair} to processing queue")
+            info_event(logger, "task.queue.added", "Added pair to processing queue", pair=currency_pair)
         
         return pending_tasks
     
     def _clean_existing_output_files(self):
         """Clean up existing feather files for debugging."""
-        logger.info("Cleaning up existing feather files for debug...")
+        info_event(logger, "output.cleanup.start", "Cleaning up existing feather files for debug...")
         import glob
         
         feather_files = glob.glob(f"{self.settings.output.output_path}/*/*.feather")
         for feather_file in feather_files:
             try:
                 os.remove(feather_file)
-                logger.info(f"Removed: {feather_file}")
+                info_event(logger, "output.cleanup.removed", "Removed file", path=feather_file)
             except Exception as e:
-                logger.warning(f"Could not remove {feather_file}: {e}")
+                warn_event(logger, "output.cleanup.warn", "Could not remove file", path=feather_file, error=str(e))
         
-        logger.info(f"Cleaned up {len(feather_files)} feather files")
+        info_event(logger, "output.cleanup.end", "Cleanup complete", removed=len(feather_files))
     
     def connect_database(self) -> bool:
         """Connect to the database for task tracking."""
         if not self.db_handler.connect():
-            logger.error("Failed to connect to database.")
+            error_event(logger, "db.connect.error", "Failed to connect to database.")
             return False
         return True
     
@@ -211,12 +219,12 @@ class PipelineOrchestrator:
                 emergency_shutdown=False
             )
         
-        logger.info(f"Processing {len(pending_tasks)} currency pairs that need feature engineering")
+        info_event(logger, "task.discovery.summary", "Pending tasks to process", count=len(pending_tasks))
         
         # Verify cluster status
         if not cluster_manager.is_active():
             error_msg = "Cluster manager is not active"
-            logger.error(error_msg)
+            error_event(logger, "cluster.inactive", error_msg)
             return PipelineResult(
                 total_tasks=len(pending_tasks),
                 successful_tasks=0,
@@ -227,7 +235,7 @@ class PipelineOrchestrator:
         
         if not client:
             error_msg = "Failed to get Dask client"
-            logger.error(error_msg)
+            error_event(logger, "client.missing", error_msg)
             return PipelineResult(
                 total_tasks=len(pending_tasks),
                 successful_tasks=0,
@@ -244,20 +252,26 @@ class PipelineOrchestrator:
     
     def _log_cluster_diagnostics(self, client: Client):
         """Log diagnostic information about the cluster."""
-        logger.info("Cluster status: Active")
-        logger.info(f"Client status: Connected")
-        logger.info(f"Dashboard link: {client.dashboard_link}")
+        # Get cluster information
+        workers = list(client.scheduler_info()["workers"].keys())
+        worker_count = len(workers)
+        dashboard_url = str(client.dashboard_link)
+        
+        # Get GPU count from context or detect
+        gpu_count = log_context.get_context().get('gpu_count', worker_count)
+        
+        info_event(logger, "cluster.ready", "Cluster is ready for processing", 
+                   gpu_count=gpu_count, workers=worker_count, dashboard_url=dashboard_url)
         
         # Log worker information
-        workers = list(client.scheduler_info()["workers"].keys())
-        logger.info(f"Workers: {workers}")
+        info_event(logger, "cluster.workers", "Workers connected", workers=workers)
         
         # Log CUDA device information
         try:
             dev_ids = client.run(lambda: __import__("cupy").cuda.runtime.getDevice())
-            logger.info(f"CUDA device per worker: {dev_ids}")
+            info_event(logger, "cluster.cuda.devices", "CUDA device per worker", devices=dev_ids)
         except Exception as e:
-            logger.warning(f"Could not get CUDA device info: {e}")
+            warn_event(logger, "cluster.cuda.warn", "Could not get CUDA device info", error=str(e))
     
 
     def _process_tasks_on_driver(self, client: Client, tasks: List[ProcessingTask]) -> PipelineResult:
@@ -265,9 +279,7 @@ class PipelineOrchestrator:
         Process tasks sequentially on the driver, leveraging Dask-CUDA within each task
         to use all GPUs for a single currency pair. Fail-fast on first error.
         """
-        logger.info("=" * 60)
-        logger.info("Starting driver-side processing (multi-GPU per task)")
-        logger.info("=" * 60)
+        info_event(logger, "task.execution.start", "Starting driver-side processing (multi-GPU per task)")
 
         processor = DataProcessor(client, run_id=self.current_run_id)
         successful_tasks = 0
@@ -278,45 +290,42 @@ class PipelineOrchestrator:
                 logger.critical("Emergency shutdown detected - stopping all processing")
                 break
 
-            logger.info("=" * 60)
-            logger.info(f"Task {i+1}/{len(tasks)}: {task.currency_pair}")
-            logger.info("=" * 60)
-            logger.info(f"File: {task.filename} ({task.file_size_mb:.1f} MB)")
-            logger.info(f"R2 Path: {task.r2_path}")
+            info_event(
+                logger,
+                "task.start",
+                "Processing currency pair",
+                index=i + 1,
+                total=len(tasks),
+                pair=task.currency_pair,
+                filename=task.filename,
+                size_mb=round(task.file_size_mb, 1),
+                r2_path=task.r2_path,
+            )
 
             try:
                 ok = processor.process_currency_pair_dask(task.currency_pair, task.r2_path, client)
                 if ok:
                     successful_tasks += 1
-                    logger.info("=" * 60)
-                    logger.info(f"Success: {task.currency_pair} completed successfully")
-                    logger.info("=" * 60)
+                    info_event(logger, "task.success", "Task completed successfully", pair=task.currency_pair)
                     # Free worker memory proactively between tasks
                     try:
                         client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
                     except Exception as e:
-                        logger.debug(f"Worker memory cleanup skipped: {e}")
+                        # keep as debug
+                        pass
                 else:
                     failed_tasks += 1
-                    logger.error("=" * 60)
-                    logger.error(f"Failure: {task.currency_pair} failed to process")
-                    logger.error("=" * 60)
-                    logger.critical("Fail-fast: Stopping pipeline due to task failure")
+                    error_event(logger, "task.failure", "Task failed to process", pair=task.currency_pair)
+                    warn_event(logger, "pipeline.failfast", "Stopping pipeline due to task failure")
                     break
             except CriticalPipelineError as e:
                 failed_tasks += 1
-                logger.critical("=" * 60)
-                logger.critical(f"Critical pipeline error processing {task.currency_pair}")
-                logger.critical(f"Error: {str(e)}")
-                logger.critical("=" * 60)
+                error_event(logger, "task.critical", "Critical pipeline error", pair=task.currency_pair, error=str(e))
                 self.emergency_shutdown.set()
                 break
             except Exception as e:
                 failed_tasks += 1
-                logger.critical("=" * 60)
-                logger.critical(f"Critical error processing {task.currency_pair}")
-                logger.critical(f"Error: {str(e)}")
-                logger.critical("=" * 60)
+                error_event(logger, "task.critical", "Critical error processing task", pair=task.currency_pair, error=str(e))
                 self.emergency_shutdown.set()
                 break
 
@@ -329,22 +338,21 @@ class PipelineOrchestrator:
     
     def log_pipeline_summary(self, result: PipelineResult, total_discovered: int):
         """Log a summary of the pipeline execution."""
-        logger.info("=" * 60)
-        logger.info("Pipeline Execution Summary")
-        logger.info(f"Total currency pairs found: {total_discovered}")
-        logger.info(f"Already processed: {total_discovered - result.total_tasks}")
-        logger.info(f"Tasks attempted: {result.successful_tasks + result.failed_tasks}")
-        logger.info(f"Successful tasks: {result.successful_tasks}")
-        logger.info(f"Failed tasks: {result.failed_tasks}")
+        info_event(logger, "pipeline.summary", "Pipeline execution summary",
+                   total_found=total_discovered,
+                   already_processed=total_discovered - result.total_tasks,
+                   attempted=result.successful_tasks + result.failed_tasks,
+                   success=result.successful_tasks,
+                   failed=result.failed_tasks)
         
         if result.emergency_shutdown:
-            logger.critical("Pipeline stopped due to emergency shutdown")
+            error_event(logger, "pipeline.abort", "Pipeline stopped due to emergency shutdown")
         else:
-            logger.info("=" * 60)
+            pass
     
     def cleanup(self):
         """Clean up resources."""
         try:
             self.db_handler.close()
         except Exception as e:
-            logger.warning(f"Error during database cleanup: {e}")
+            warn_event(logger, "db.cleanup.warn", "Error during database cleanup", error=str(e))

@@ -65,13 +65,13 @@ class DaskConfig:
     gpus_per_worker: int = 1
     threads_per_worker: int = 1
     memory_limit: str = "8GB"
-    rmm_pool_size: str = "8GB"
-    rmm_initial_pool_size: str = "8GB"
-    rmm_maximum_pool_size: str = "16GB"
+    rmm_pool_size: str = "0GB"  # Desabilitado - usar rmm_pool_fraction
+    rmm_initial_pool_size: str = "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
+    rmm_maximum_pool_size: str = "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
     # New: proportional pool sizing (fractions of device total). If > 0, these override fixed sizes.
-    rmm_pool_fraction: float = 0.0                 # e.g., 0.60 -> 60% of device total
-    rmm_initial_pool_fraction: float = 0.0         # e.g., 0.50 -> 50% of rmm_pool (or total)
-    rmm_maximum_pool_fraction: float = 0.0         # optional cap; if 0.0, default safety cap is used
+    rmm_pool_fraction: float = 0.40                 # e.g., 0.40 -> 40% of device total (adaptável)
+    rmm_initial_pool_fraction: float = 0.30         # e.g., 0.30 -> 30% of rmm_pool (or total)
+    rmm_maximum_pool_fraction: float = 0.50         # optional cap; if 0.0, default safety cap is used
     spilling_enabled: bool = True
     spilling_target: float = 0.9
     spilling_max_spill: str = "32GB"
@@ -349,7 +349,7 @@ class LoggingConfig:
 class MonitoringConfig:
     """Monitoring and metrics configuration."""
     metrics_enabled: bool = True
-    dashboard_port: int = 8787
+    dashboard_port: int = 8788
     health_check_interval: int = 30
 
 

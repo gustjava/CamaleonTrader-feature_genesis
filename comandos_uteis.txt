@@ -6,38 +6,8 @@
 # 1. CONECTAR À INSTÂNCIA VAST.AI
 # ====================================================================================
 
-# Listar instâncias ativas
-vast show instances
-
-# Obter informações detalhadas da instância (inclui SSH host e porta)
-vast show instances --raw | jq '.[] | select(.id == INSTANCE_ID) | {id, ssh_host, ssh_port}'
-
-# Obter URL SSH da instância (substitua INSTANCE_ID pelo ID da sua instância)
-vast ssh-url INSTANCE_ID
-
-# Exemplo de saída: ssh://root@ssh8.vast.ai:15222
-# Extrair HOST e PORTA da URL SSH
-
-# Obter SSH host diretamente da instância
-vast show instances --raw | jq -r '.[] | select(.id == INSTANCE_ID) | .ssh_host'
-
-# Obter SSH porta diretamente da instância
-vast show instances --raw | jq -r '.[] | select(.id == INSTANCE_ID) | .ssh_port'
-
-# Exemplo:
-# vast show instances --raw | jq '.[] | select(.id == 25645223) | {id, ssh_host, ssh_port}'
-
-# Conectar via SSH com chave (substitua HOST e PORTA pelos valores extraídos)
-ssh -p PORTA -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@HOST
-
-# Exemplo completo:
-# vast ssh-url 25645223
-# ssh -p 44290 -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@43.100.46.13
-
-# ====================================================================================
-# COPIE E COLE ESTE BLOCO PARA CONECTAR DIRETAMENTE:
-# ====================================================================================
-INSTANCE_ID=25645223; SSH_HOST=$(vast show instances --raw | jq -r ".[] | select(.id == $INSTANCE_ID) | .ssh_host"); SSH_PORT=$(vast show instances --raw | jq -r ".[] | select(.id == $INSTANCE_ID) | .ssh_port"); ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@$SSH_HOST
+# Comando para conectar e manter terminal interativo:
+ssh -p 29060 -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 -t root@ssh4.vast.ai
 
 # ====================================================================================
 # 2. COMANDOS PARA EXECUTAR NA INSTÂNCIA REMOTA
@@ -165,7 +135,7 @@ netstat -tulpn
 # ====================================================================================
 # EXEMPLO DE FLUXO COMPLETO:
 # ====================================================================================
-# 1. vast ssh 25645223
+# 1. vast ssh 25709061
 # 2. pkill -9 -f 'orchestration/main.py'
 # 3. ps aux | grep orchestration/main.py
 # 4. watch -n 1 'nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits'

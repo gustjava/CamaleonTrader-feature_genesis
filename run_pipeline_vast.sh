@@ -62,10 +62,10 @@ echo "✅ Instância selecionada automaticamente: $INSTANCE_ID"
 echo "Aguardando SSH da instância $INSTANCE_ID ficar disponível..."
 SSH_HOST=""; SSH_PORT=""
 for i in {1..120}; do
-  SSH_URL=$("$VAST_BIN" ssh-url "$INSTANCE_ID" 2>/dev/null || echo "")
-  if [[ -n "$SSH_URL" ]]; then
-    SSH_HOST=$(sed -n 's#ssh://root@\([^:]*\):.*#\1#p' <<<"$SSH_URL")
-    SSH_PORT=$(sed -n 's#ssh://.*:\([0-9]*\).*#\1#p' <<<"$SSH_URL")
+  INSTANCE_INFO=$("$VAST_BIN" show instances --raw | jq -r ".[] | select(.id == $INSTANCE_ID) | {ssh_host, ssh_port}" 2>/dev/null || echo "")
+  if [[ -n "$INSTANCE_INFO" && "$INSTANCE_INFO" != "null" ]]; then
+    SSH_HOST=$(echo "$INSTANCE_INFO" | jq -r '.ssh_host' 2>/dev/null || echo "")
+    SSH_PORT=$(echo "$INSTANCE_INFO" | jq -r '.ssh_port' 2>/dev/null || echo "")
     if [[ -n "$SSH_HOST" && -n "$SSH_PORT" ]]; then
       if nc -z -w5 "$SSH_HOST" "$SSH_PORT"; then
         echo "✅ SSH pronto em $SSH_HOST:$SSH_PORT"

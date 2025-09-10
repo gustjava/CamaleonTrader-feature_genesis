@@ -1,5 +1,5 @@
 """
-Statistical Tests Module for Dynamic Stage 0 Pipeline
+Statistical Tests Module for Feature Engineering Pipeline
 
 GPU-accelerated statistical tests including ADF and distance correlation.
 """
@@ -18,8 +18,10 @@ import pandas as pd  # For small host-side tables (artifacts, merges)
 import re  # For regular expressions
 
 from .base_engine import BaseFeatureEngine  # Base class for feature engines
+from utils.logging_utils import get_logger, info_event, warn_event, error_event, Events
+from utils import log_context
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.StatisticalTests")
 
 
 # -------- Module-level helpers to avoid Dask tokenization issues --------
@@ -1146,7 +1148,10 @@ class StatisticalTests(BaseFeatureEngine):
         # Apply sampling for large datasets to control computational cost
         max_rows = int(getattr(self, 'selection_max_rows', 100000))
         if X.shape[0] > max_rows:
-            self._log_info(f"Stage 3 sampling | {{ original: {X.shape[0]}, sampled: {max_rows} }}")
+            info_event(logger, Events.ENGINE_SAMPLING, 
+                       f"Applying systematic sampling for feature selection",
+                       original_rows=X.shape[0], sampled_rows=max_rows, 
+                       sampling_ratio=round(max_rows/X.shape[0], 3))
             # Use systematic sampling to preserve time-series structure
             indices = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
             X = X[indices]
@@ -1165,7 +1170,9 @@ class StatisticalTests(BaseFeatureEngine):
                 X_tr, y_tr = X[tr_idx], y[tr_idx]  # Training data
                 X_va, y_va = X[va_idx], y[va_idx]  # Validation data
                 eval_set = (X_tr, y_tr, X_va, y_va)  # Evaluation set for early stopping
-                self._log_info(f"Stage 3 TimeSeriesSplit | {{ splits: {n_splits}, train: {len(X_tr)}, val: {len(X_va)} }}")
+                info_event(logger, Events.ENGINE_SAMPLING, 
+                           f"TimeSeriesSplit configured for feature selection",
+                           splits=n_splits, train_size=len(X_tr), val_size=len(X_va))
             except Exception as e_ts:
                 eval_set = None
                 self._log_warn("TimeSeriesSplit setup failed", error=str(e_ts))
@@ -1191,8 +1198,10 @@ class StatisticalTests(BaseFeatureEngine):
             except Exception:
                 use_gpu = False  # fallback if GPU not available
                 
-            # Log Stage 3 wrapper fit details
-            self._log_info(f"Stage 3 wrapper fit | {{ model: 'lgbm', use_gpu: {str(use_gpu).lower()}, rows: {X.shape[0]}, cols: {X.shape[1]} }}")
+            # Log wrapper fit details
+            info_event(logger, Events.ENGINE_WRAPPER_FIT, 
+                       f"Training LightGBM model for feature selection",
+                       model='lgbm', use_gpu=use_gpu, rows=X.shape[0], cols=X.shape[1])
             
             if task == 'classification':
                 model = lgb.LGBMClassifier(**params)  # Create classifier
@@ -1215,7 +1224,7 @@ class StatisticalTests(BaseFeatureEngine):
                     importances = {f: float(w) for f, w in zip(candidates, list(fi))}
             backend_used = 'lgbm'
         except Exception as e_lgbm:
-            self._log_warn("Stage 3 LGBM failed; trying XGBoost/Sklearn", error=str(e_lgbm))
+            warn_event(logger, "engine.wrapper_fit.fallback", "LightGBM failed; trying XGBoost/Sklearn", error=str(e_lgbm))
             # Try XGBoost
             try:
                 import xgboost as xgb
@@ -1230,7 +1239,9 @@ class StatisticalTests(BaseFeatureEngine):
                     'n_jobs': -1,
                     'tree_method': 'gpu_hist' if use_gpu_xgb else 'hist',
                 }
-                self._log_info(f"Stage 3 wrapper fit | {{ model: 'xgb', use_gpu: {str(use_gpu_xgb).lower()}, rows: {X.shape[0]}, cols: {X.shape[1]} }}")
+                info_event(logger, Events.ENGINE_WRAPPER_FIT, 
+                           f"Training XGBoost model for feature selection",
+                           model='xgb', use_gpu=use_gpu_xgb, rows=X.shape[0], cols=X.shape[1])
                 if task == 'classification':
                     model = xgb.XGBClassifier(**params)
                 else:
@@ -1248,10 +1259,12 @@ class StatisticalTests(BaseFeatureEngine):
                     importances = {f: float(w) for f, w in zip(candidates, list(fi))}
                 backend_used = 'xgb'
             except Exception as e_xgb:
-                self._log_warn("Stage 3 XGBoost failed; falling back to RandomForest", error=str(e_xgb))
+                warn_event(logger, "engine.wrapper_fit.fallback", "XGBoost failed; falling back to RandomForest", error=str(e_xgb))
                 try:
                     from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-                    self._log_info(f"Stage 3 wrapper fit | {{ model: 'rf', use_gpu: false, rows: {X.shape[0]}, cols: {X.shape[1]} }}")
+                    info_event(logger, Events.ENGINE_WRAPPER_FIT, 
+                               f"Training RandomForest model for feature selection",
+                               model='rf', use_gpu=False, rows=X.shape[0], cols=X.shape[1])
                     if task == 'classification':
                         model = RandomForestClassifier(n_estimators=200, random_state=int(getattr(self, 'stage3_random_state', 42)), n_jobs=-1)
                     else:
@@ -1262,7 +1275,7 @@ class StatisticalTests(BaseFeatureEngine):
                         importances = {f: float(w) for f, w in zip(candidates, list(fi))}
                     backend_used = 'rf'
                 except Exception as e_rf:
-                    self._log_warn("Stage 3 RandomForest failed", error=str(e_rf))
+                    warn_event(logger, "engine.wrapper_fit.error", "RandomForest failed", error=str(e_rf))
 
         if not importances:
             return [], {}, backend_used
@@ -1279,8 +1292,11 @@ class StatisticalTests(BaseFeatureEngine):
             ordered = sorted(selected, key=lambda f: importances.get(f, 0.0), reverse=True)
             selected = ordered[:top_n]
             
-        # Log Stage 3 selected features details
-        self._log_info(f"Stage 3 selected features | {{ kept: {len(selected)}, threshold: {thr_val:.6f} }}")
+        # Log selected features details
+        info_event(logger, Events.ENGINE_FEATURE_SELECTION, 
+                   f"Feature selection completed",
+                   selected_count=len(selected), threshold=round(thr_val, 6), 
+                   total_candidates=len(candidates), selection_ratio=round(len(selected)/len(candidates), 3))
         return selected, importances, backend_used
 
     def _stage3_selectfrommodel_cv(self, X_df, y_series, candidates: List[str]) -> (List[str], dict, str):

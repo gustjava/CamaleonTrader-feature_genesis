@@ -40,16 +40,17 @@ dask:
   # Worker configuration
   gpus_per_worker: 1  # Uma GPU por worker (otimizado para isolamento)
   threads_per_worker: 1  # Uma thread por worker (evita conflitos GPU)
-  memory_limit: "8GB"  # Limite de memória RAM por worker
+  memory_limit: "2GB"  # Limite de memória RAM por worker
   
   # RMM (RAPIDS Memory Manager) settings - Gerenciamento de memória GPU
-  rmm_pool_size: "4GB"  # Tamanho do pool de memória GPU
-  rmm_initial_pool_size: "4GB"  # Tamanho inicial do pool
-  rmm_maximum_pool_size: "8GB"  # Tamanho máximo do pool
-  # Preferir tamanhos proporcionais (se > 0, sobrepõem os valores fixos acima)
-  rmm_pool_fraction: 0.60              # 60% da memória da GPU por worker
-  rmm_initial_pool_fraction: 0.40      # 40% da memória da GPU na alocação inicial
-  rmm_maximum_pool_fraction: 0.60      # Limite superior de segurança (fração)
+  # Tamanhos fixos desabilitados - usando apenas configurações proporcionais
+  rmm_pool_size: "0GB"  # Desabilitado - usar rmm_pool_fraction
+  rmm_initial_pool_size: "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
+  rmm_maximum_pool_size: "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
+  # Configurações proporcionais desabilitadas
+  rmm_pool_fraction: 0.0              # RMM desabilitado
+  rmm_initial_pool_fraction: 0.0      # RMM desabilitado
+  rmm_maximum_pool_fraction: 0.0      # RMM desabilitado
   spilling_enabled: true  # Habilita spill para RAM quando GPU fica cheia
   spilling_target: 0.9  # Alvo de utilização antes do spill
   spilling_max_spill: "32GB"  # Máximo de spill permitido
@@ -60,10 +61,10 @@ dask:
   local_directory: "/tmp/dask-worker-space"  # Diretório para spill de dados
   
   # Network protocol settings - Configurações de rede para comunicação entre workers
-  protocol: "ucx"  # Protocolo UCX para comunicação GPU-GPU
-  enable_tcp_over_ucx: true  # Habilita TCP sobre UCX
+  protocol: "tcp"  # Protocolo TCP para estabilidade
+  enable_tcp_over_ucx: false  # Desabilita TCP sobre UCX
   enable_infiniband: false  # InfiniBand desabilitado (não disponível)
-  enable_nvlink: true  # Habilita NVLink para comunicação direta entre GPUs
+  enable_nvlink: false  # Desabilita NVLink para evitar problemas
 
 # Feature Engineering Configuration
 # Parameters for all feature engineering engines
@@ -413,7 +414,7 @@ logging:
 # Performance monitoring and metrics collection
 monitoring:
   metrics_enabled: true
-  dashboard_port: 8787
+  dashboard_port: 8888
   health_check_interval: 30
 
 # Output Configuration

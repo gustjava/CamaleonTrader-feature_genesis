@@ -1,39 +1,116 @@
 
 version: 1
 disable_existing_loggers: false
+
 formatters:
-  simple:
-    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+  # Console formatter - clean and readable for humans
+  console:
+    format: '%(asctime)s %(name)-20s %(levelname)-8s %(event)-25s %(message)s'
+    datefmt: '%H:%M:%S'
+  
+  # JSON formatter - structured for automated analysis
   json:
     class: pythonjsonlogger.jsonlogger.JsonFormatter
-    format: '%(asctime)s %(name)s %(levelname)s %(message)s'
+    format: '%(asctime)s %(levelname)s %(name)s %(component)s %(event)s %(run_id)s %(task_id)s %(pair)s %(engine)s %(hostname)s %(gpu_count)s %(workers)s %(dashboard_url)s %(duration_ms)s %(rows_before)s %(rows_after)s %(cols_before)s %(cols_after)s %(new_cols)s %(message)s'
+    datefmt: '%Y-%m-%dT%H:%M:%S'
+
+  # Detailed formatter for debugging
+  detailed:
+    format: '%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(event)s - %(message)s | run_id=%(run_id)s task_id=%(task_id)s pair=%(pair)s engine=%(engine)s'
+    datefmt: '%Y-%m-%d %H:%M:%S'
 
 handlers:
+  # Console output - clean and readable
   console:
     class: logging.StreamHandler
     level: INFO
-    formatter: simple
+    formatter: console
     stream: ext://sys.stdout
+    filters: [console_filter]
+  
+  # File output - structured JSON for analysis
   file:
     class: logging.handlers.RotatingFileHandler
     level: DEBUG
     formatter: json
     filename: logs/pipeline_execution.log
-    maxBytes: 10485760 # 10MB
+    maxBytes: 10485760  # 10MB
     backupCount: 5
     encoding: utf8
+    filters: [json_filter]
+  
+  # Error file - only errors and critical messages
+  error_file:
+    class: logging.handlers.RotatingFileHandler
+    level: ERROR
+    formatter: detailed
+    filename: logs/pipeline_errors.log
+    maxBytes: 5242880  # 5MB
+    backupCount: 3
+    encoding: utf8
+
+filters:
+  # Filter to ensure console logs are clean (no None values)
+  console_filter:
+    class: utils.logging_utils.ConsoleFilter
+  
+  # Filter to ensure JSON logs have all required fields
+  json_filter:
+    class: utils.logging_utils.JsonFilter
 
 loggers:
+  # Main application logger
   __main__:
     level: DEBUG
-    handlers: [console, file]
+    handlers: [console, file, error_file]
+    propagate: false
+  
+  # Orchestration module
   orchestration:
     level: DEBUG
-    handlers: [console, file]
+    handlers: [console, file, error_file]
+    propagate: false
+  
+  # Features module
   features:
     level: DEBUG
-    handlers: [console, file]
+    handlers: [console, file, error_file]
+    propagate: false
+  
+  # Data I/O module
+  data_io:
+    level: DEBUG
+    handlers: [console, file, error_file]
+    propagate: false
+  
+  # Utils module
+  utils:
+    level: DEBUG
+    handlers: [console, file, error_file]
+    propagate: false
+  
+  # Dask and distributed logging (reduce verbosity)
+  distributed:
+    level: WARNING
+    handlers: [file]
+    propagate: false
+  
+  dask:
+    level: WARNING
+    handlers: [file]
+    propagate: false
+  
+  # Third-party libraries (reduce noise)
+  urllib3:
+    level: WARNING
+    handlers: [file]
+    propagate: false
+  
+  requests:
+    level: WARNING
+    handlers: [file]
+    propagate: false
 
 root:
   level: INFO
-  handlers: [console, file]
+  handlers: [console, file, error_file]
