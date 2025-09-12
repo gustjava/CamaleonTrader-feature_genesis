@@ -1,0 +1,23 @@
+# Example simplified configuration focused on transparency
+pipeline:
+  stationarization:
+    enabled: true
+    description: "Remove tendências e memória longa das séries"
+    fractional_differentiation:
+      d_values: [0.1, 0.2, 0.3, 0.4, 0.5]
+      purpose: "Torna séries não-estacionárias em estacionárias"
+      impact: "Adiciona ~N features por coluna fonte"
+
+    baxter_king_filter:
+      low_freq: 32
+      high_freq: 6
+      purpose: "Filtro passa-banda para séries temporais"
+      impact: "Adiciona colunas filtradas"
+
+  feature_engineering:
+    enabled: true
+    description: "Aplica transformações técnicas avançadas"
+    baxter_king_advanced:
+      apply_to_all_numeric: true
+      purpose: "Aplica BK a todas as colunas numéricas elegíveis"
+      impact: "Adiciona features BK filtradas"

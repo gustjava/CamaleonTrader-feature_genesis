@@ -13,6 +13,7 @@ from pathlib import Path
 
 import cudf
 import cupy as cp
+import dask
 
 from config.unified_config import get_unified_config as get_settings
 from dask.distributed import Client, wait
@@ -20,8 +21,8 @@ from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
 from features import StationarizationEngine, StatisticalTests, GARCHModels, FeatureEngineeringEngine
 from features.base_engine import CriticalPipelineError
-from utils.logging_utils import get_logger, info_event, warn_event, error_event, time_event, Events
-from utils import log_context
+from utils.logging_utils import get_logger
+from features.engine_metrics import EngineMetrics
 
 logger = get_logger(__name__, "orchestration.processor")
 
@@ -52,6 +53,8 @@ class DataProcessor:
         self.stats = StatisticalTests(self.settings, client)  # Engine 4: Testes estatísticos (estágios 1-4)
         self.feng = FeatureEngineeringEngine(self.settings, client)  # Engine 2: Feature engineering (BK filter)
         self.garch = GARCHModels(self.settings, client)  # Engine 3: Modelos GARCH
+        # Transparency helpers
+        self._metrics = EngineMetrics()
     
     def process_currency_pair(self, currency_pair: str, r2_path: str) -> bool:
         """
@@ -186,6 +189,15 @@ class DataProcessor:
             
             # Check data types
             logger.info(f"📊 Data types: {gdf.dtypes.to_dict()}")
+            # Presence of open-flag columns (validation aid)
+            try:
+                flag_cols = [c for c in gdf.columns if str(c).startswith('is_') and str(c).endswith('_open')]
+                if flag_cols:
+                    logger.info(f"🔎 Detected open-flag columns: {flag_cols}")
+                else:
+                    logger.info("🔎 No is_*_open columns detected in dataset")
+            except Exception:
+                pass
             
             return True
             
@@ -283,15 +295,8 @@ class DataProcessor:
                     logger.info(f"⏭️ Skipping disabled engine: {engine_name}")
                     continue
                 
-                # Set engine context
-                log_context.set_engine(engine_name)
-                
-                # Log engine start with structured data
-                info_event(logger, Events.ENGINE_START, 
-                           f"Starting {engine_name} processing for {currency_pair}",
-                           pair=currency_pair, engine=engine_name, 
-                           order=getattr(engine_config, 'order', 0), 
-                           desc=getattr(engine_config, 'description', 'No description'))
+                # Log engine start
+                logger.info(f"Starting {engine_name} processing for {currency_pair}")
                 try:
                     desc = getattr(engine_config, 'description', 'No description')
                 except Exception:
@@ -312,16 +317,20 @@ class DataProcessor:
                     cols_after = len(gdf.columns)
                     new_cols = cols_after - cols_before
                     
-                    # Log engine completion with structured data
-                    info_event(logger, Events.ENGINE_END, 
-                               f"{engine_name.title()} processing completed for {currency_pair}",
-                               pair=currency_pair, engine=engine_name,
-                               order=getattr(engine_config, 'order', 0),
-                               rows_before=rows_before, rows_after=rows_after,
-                               cols_before=cols_before, cols_after=cols_after, new_cols=new_cols)
+                    # Log engine completion
+                    logger.info(f"{engine_name.title()} processing completed for {currency_pair}: {rows_before}→{rows_after} rows, {cols_before}→{cols_after} cols (+{new_cols})")
+
+                    # Simple GPU memory snapshot
+                    try:
+                        import cupy as _cp
+                        free_b, total_b = _cp.cuda.runtime.memGetInfo()
+                        used_gb = (total_b - free_b) / (1024**3)
+                        total_gb = total_b / (1024**3)
+                        mem = {'gpu_used_gb': round(used_gb, 2), 'gpu_total_gb': round(total_gb, 2)}
+                    except Exception:
+                        mem = {}
                     
-                    logger.info(f"{engine_name.title()} complete: {cols_before} -> {cols_after} cols (+{new_cols} new), "
-                              f"{rows_before} -> {rows_after} rows ({rows_after - rows_before} change)")
+                    logger.info(f"{engine_name.title()} complete: {cols_before} -> {cols_after} cols (+{new_cols} new), {rows_before} -> {rows_after} rows ({rows_after - rows_before} change)")
                     
                     if new_cols > 0:
                         new_col_names = [col for col in gdf.columns if col not in gdf.columns[:cols_before]]
@@ -507,6 +516,13 @@ class DataProcessor:
         """
         try:
             logger.info(f"Starting Dask processing for {currency_pair}")
+            # Cluster snapshot to aid debugging
+            try:
+                sched = client.scheduler_info()
+                workers_list = list(sched.get('workers', {}).keys())
+                logger.info(f"Dask snapshot: workers={len(workers_list)}, dashboard={getattr(client, 'dashboard_link', None)}")
+            except Exception as e:
+                logger.debug(f"Could not fetch scheduler info: {e}")
 
             task_id = None
             if not self.db_connected:
@@ -533,19 +549,21 @@ class DataProcessor:
             r2_lower = str(r2_path).lower()
             ddf = None
             try:
-                if r2_lower.endswith('.parquet'):
-                    ddf = self.loader.load_currency_pair_data(r2_path, client)
-                elif r2_lower.endswith('.feather'):
-                    ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
-                else:
-                    # Attempt feather (dir or file), then parquet
-                    ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
-                    if ddf is None:
+                with dask.annotate(task_key_name=f"load-{currency_pair}"):
+                    if r2_lower.endswith('.parquet'):
                         ddf = self.loader.load_currency_pair_data(r2_path, client)
+                    elif r2_lower.endswith('.feather'):
+                        ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
+                    else:
+                        # Attempt feather (dir or file), then parquet
+                        ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
+                        if ddf is None:
+                            ddf = self.loader.load_currency_pair_data(r2_path, client)
             except Exception as _e:
                 logger.warning(f"Primary load path failed: {_e}; trying fallbacks")
                 if ddf is None:
-                    ddf = self.loader.load_currency_pair_data(r2_path, client)
+                    with dask.annotate(task_key_name=f"load-{currency_pair}"):
+                        ddf = self.loader.load_currency_pair_data(r2_path, client)
             if ddf is None:
                 self._register_task_failure(currency_pair, r2_path, "Failed to load Dask data")
                 return False
@@ -561,6 +579,27 @@ class DataProcessor:
                 ddf = self._drop_denied_columns(ddf)
             except Exception:
                 pass
+
+            # Optional: Repartition to utilize multiple GPUs better
+            try:
+                n_workers = 1
+                try:
+                    sched = client.scheduler_info()
+                    n_workers = max(1, len(sched.get('workers', {})))
+                except Exception:
+                    pass
+                target_parts = max(ddf.npartitions, n_workers * 8)
+                if ddf.npartitions < target_parts:
+                    import dask as _dask
+                    with _dask.annotate(task_key_name=f"repartition-{currency_pair}"):
+                        logger.info(f"Repartitioning from {ddf.npartitions} to {target_parts} to utilize {n_workers} workers")
+                        ddf = ddf.repartition(npartitions=target_parts)
+                try:
+                    logger.info(f"Post-load overview: cols={len(ddf.columns)}, npartitions={ddf.npartitions}")
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Could not repartition: {e}")
 
             # Validate initial data
             if not self._validate_initial_data_dask(ddf, currency_pair):
@@ -582,14 +621,8 @@ class DataProcessor:
                     continue
 
                 # Set engine context
-                log_context.set_engine(engine_name)
-                
-                # Log engine start with structured data
-                info_event(logger, Events.ENGINE_START, 
-                           f"Starting {engine_name} processing for {currency_pair} (Dask)",
-                           pair=currency_pair, engine=engine_name, 
-                           order=eng_cfg.order, 
-                           desc=eng_cfg.description)
+                # Log engine start
+                logger.info(f"Starting {engine_name} processing for {currency_pair} (Dask)")
                 logger.info(f"📝 Description: {eng_cfg.description}")
                 # Stage DB start (schema deltas based on columns only, rows unknown for Dask)
                 stage_id = None
@@ -607,17 +640,57 @@ class DataProcessor:
                     except Exception:
                         stage_id = None
 
+                # Group all Dask tasks created inside this engine under a readable name
                 try:
-                    ddf = self._execute_engine_dask(engine_name, ddf)
+                    from dask import annotate as _annotate, config as _dask_config
+                except Exception:
+                    def _annotate(**_kwargs):
+                        from contextlib import contextmanager
+                        @contextmanager
+                        def _noop():
+                            yield
+                        return _noop()
+                    class _dask_config:  # type: ignore
+                        @staticmethod
+                        def set(*args, **kwargs):
+                            from contextlib import contextmanager
+                            @contextmanager
+                            def _noop():
+                                yield
+                            return _noop()
+
+                try:
+                    debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                    with _annotate(task_key_name=f"{engine_name}-{currency_pair}"):
+                        try:
+                            logger.info(f"Engine start: {engine_name} | npartitions={ddf.npartitions}")
+                        except Exception:
+                            pass
+                        ctx = _dask_config.set({"optimization.fuse.active": False}) if debug_dash else _dask_config.set({})
+                        with ctx:
+                            ddf = self._execute_engine_dask(engine_name, ddf)
                     if ddf is None:
                         raise RuntimeError(f"Engine {engine_name} returned None")
 
                     # Stabilize graph/memory between engines
-                    ddf = ddf.persist()
+                    logger.info(f"Persist start: {engine_name}")
                     try:
-                        wait(ddf, timeout=300)  # 5 minute timeout
+                        from dask import persist as _persist
+                        debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                        if debug_dash:
+                            ddf, = _persist(ddf, optimize_graph=False)
+                        else:
+                            ddf = ddf.persist()
+                    except Exception:
+                        ddf = ddf.persist()
+                    logger.info(f"Persist returned: {engine_name}")
+                    logger.info(f"Waiting for {engine_name} computation to complete (timeout: 60s)...")
+                    try:
+                        wait(ddf, timeout=60)  # 1 minute timeout
+                        logger.info(f"{engine_name} computation completed successfully")
                     except Exception as wait_err:
                         logger.warning(f"Wait timeout or error for {engine_name}: {wait_err}")
+                        logger.info(f"Continuing without waiting - data is still persisted for {engine_name}")
                         # Continue without waiting - data is still persisted
 
                     # Free CuPy pools on all workers to reduce carry-over memory
@@ -629,15 +702,22 @@ class DataProcessor:
 
                     if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
                         raise RuntimeError(f"Validation failed after {engine_name}")
+                    try:
+                        logger.info(f"Engine end: {engine_name} | npartitions={ddf.npartitions}")
+                    except Exception:
+                        pass
 
-                    # Log engine completion with structured data
+                    # Log engine completion (rows are unknown/expensive in Dask; report columns and partitions)
                     cols_after = len(ddf.columns)
                     new_cols = (cols_after - cols_before) if (cols_before is not None and cols_after is not None) else None
-                    info_event(logger, Events.ENGINE_END, 
-                               f"{engine_name.title()} processing completed for {currency_pair} (Dask)",
-                               pair=currency_pair, engine=engine_name,
-                               order=eng_cfg.order,
-                               cols_before=cols_before, cols_after=cols_after, new_cols=new_cols)
+                    try:
+                        nparts = getattr(ddf, 'npartitions', None)
+                    except Exception:
+                        nparts = None
+                    logger.info(
+                        f"{engine_name.title()} processing completed for {currency_pair} (Dask): "
+                        f"cols {cols_before}->{cols_after} (+{new_cols}), npartitions={nparts}"
+                    )
 
                     # Save intermediate checkpoint if enabled
                     try:
@@ -672,7 +752,28 @@ class DataProcessor:
                     return False
 
             # Save directly from Dask without materializing everything on one GPU
-            if not self._save_processed_data_dask(ddf, currency_pair):
+            with dask.annotate(task_key_name=f"save-{currency_pair}"):
+                try:
+                    from dask import config as _dask_config
+                    debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                except Exception:
+                    debug_dash = False
+                    class _dask_config:  # type: ignore
+                        @staticmethod
+                        def set(*args, **kwargs):
+                            from contextlib import contextmanager
+                            @contextmanager
+                            def _noop():
+                                yield
+                            return _noop()
+                try:
+                    logger.info(f"Preparing save: npartitions={ddf.npartitions}")
+                except Exception:
+                    pass
+                ctx = _dask_config.set({"optimization.fuse.active": False}) if debug_dash else _dask_config.set({})
+                with ctx:
+                    save_ok = self._save_processed_data_dask(ddf, currency_pair)
+            if not save_ok:
                 self._register_task_failure(currency_pair, r2_path, "Data saving failed")
                 return False
 
@@ -749,9 +850,7 @@ class DataProcessor:
         """
         try:
             # Log I/O start
-            info_event(logger, Events.IO_SAVE_START, 
-                       f"Starting save operation for {currency_pair}",
-                       pair=currency_pair, columns=len(gdf.columns), rows=len(gdf))
+            logger.info(f"Starting save operation for {currency_pair}: {len(gdf.columns)} columns, {len(gdf)} rows")
             
             logger.info(f"Saving processed data with {len(gdf.columns)} columns to Feather v2 files for {currency_pair}")
             
@@ -816,10 +915,7 @@ class DataProcessor:
             total_size_mb = sum(f.stat().st_size for f in saved_files) / (1024 * 1024)
             
             # Log I/O completion
-            info_event(logger, Events.IO_SAVE_END, 
-                       f"Save operation completed for {currency_pair}",
-                       pair=currency_pair, files_created=len(saved_files), 
-                       total_size_mb=round(total_size_mb, 2), path=str(output_dir))
+            logger.info(f"Save operation completed for {currency_pair}: {len(saved_files)} files, {round(total_size_mb, 2)}MB total")
             
             logger.info(f"Successfully saved processed data for {currency_pair}")
             logger.info(f"Files created: {len(saved_files)}")

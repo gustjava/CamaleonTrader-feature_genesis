@@ -629,6 +629,30 @@ class StationarizationEngine(BaseFeatureEngine):
                 pass
 
             self._log_info("Stationarization pipeline completed successfully")
+            # Diagnostic handoff logs to help trace pipeline progress
+            try:
+                nparts = getattr(df, 'npartitions', None)
+                ncols = len(df.columns)
+                self._log_info(
+                    "Stationarization handoff summary",
+                    partitions=int(nparts) if nparts is not None else None,
+                    columns=int(ncols),
+                )
+            except Exception:
+                pass
+            try:
+                import cupy as _cp
+                free_b, total_b = _cp.cuda.runtime.memGetInfo()
+                used_gb = (total_b - free_b) / (1024**3)
+                total_gb = total_b / (1024**3)
+                self._log_info(
+                    "GPU memory snapshot after stationarization",
+                    gpu_used_gb=round(float(used_gb), 2),
+                    gpu_total_gb=round(float(total_gb), 2),
+                )
+            except Exception:
+                pass
+            self._log_info("Returning control to orchestrator for next engine")
             return df
             
         except Exception as e:
@@ -675,6 +699,16 @@ class StationarizationEngine(BaseFeatureEngine):
         # 1) Colunas escalar "dcor_<feature>" presentes no DF (se stage1_broadcast_scores = true e Stationarization vier depois)
         # 2) Fallback: seleção por ordem (primeiro elemento disponível)
         selection_mode = str(getattr(self.settings.features, 'rolling_corr_pair_selection', 'first')).lower()
+        # If selection is 'dcor' but no dCor scores are present yet (Stationarization runs before Stage 1),
+        # defer rolling correlations to post-Stage1 step
+        if selection_mode == 'dcor':
+            try:
+                has_dcor = any(str(c).startswith('dcor_') for c in available_columns)
+            except Exception:
+                has_dcor = False
+            if not has_dcor:
+                self._log_info("Deferring rolling correlations: waiting for Stage 1 dCor (no dcor_* columns present)")
+                return df
         dcor_scores: Dict[str, float] = {}
         if selection_mode == 'dcor':
             try:
@@ -1029,6 +1063,12 @@ class StationarizationEngine(BaseFeatureEngine):
             tol = float(self.settings.features.frac_diff_threshold)
 
             created = []
+            # Batch persist to avoid huge graphs causing long driver CPU time
+            try:
+                batch_size = int(getattr(self.settings.features, 'stationarization_batch_size', 16))
+            except Exception:
+                batch_size = 16
+            since_last = 0
             originals = []
             cols = set(df.columns)
             for col in include:
@@ -1047,6 +1087,18 @@ class StationarizationEngine(BaseFeatureEngine):
                     )
                     created.append(new_col)
                     originals.append(col)
+                    since_last += 1
+                    if since_last >= max(1, batch_size):
+                        try:
+                            import dask as _dask
+                            debug_dash = bool(getattr(self.settings, 'development', {}).get('debug_dashboard', False)) if hasattr(self, 'settings') else False
+                            if debug_dash:
+                                df, = _dask.persist(df, optimize_graph=False)
+                            else:
+                                df = df.persist()
+                            since_last = 0
+                        except Exception:
+                            pass
                 except Exception:
                     continue
 
@@ -1067,6 +1119,16 @@ class StationarizationEngine(BaseFeatureEngine):
                     })
                 except Exception:
                     pass
+            # Final checkpoint to materialize recent additions
+            try:
+                import dask as _dask
+                debug_dash = bool(getattr(self.settings, 'development', {}).get('debug_dashboard', False)) if hasattr(self, 'settings') else False
+                if debug_dash:
+                    df, = _dask.persist(df, optimize_graph=False)
+                else:
+                    df = df.persist()
+            except Exception:
+                pass
             return df
         except Exception:
             return df
@@ -1997,7 +2059,7 @@ class StationarizationEngine(BaseFeatureEngine):
                 if period > 1 and period < len(data):
                     # Vectorized cyclical component using rolling mean
                     series = cudf.Series(data)
-                    trend = series.rolling(period, center=True).mean()
+                    trend = series.rolling(period, center=False).mean()
                     cyclical = series - trend
                     
                     components[f'cyclical_{period}'] = cyclical.to_cupy()
@@ -2023,7 +2085,7 @@ class StationarizationEngine(BaseFeatureEngine):
             series = cudf.Series(data)
             
             # Trend component (centered moving average)
-            trend = series.rolling(period, center=True).mean()
+            trend = series.rolling(period, center=False).mean()
             
             # Seasonal component (detrended data averaged by season)
             detrended = series - trend

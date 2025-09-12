@@ -30,20 +30,20 @@ except Exception:
 
 
 @_lru_cache(maxsize=16)  # Cache up to 16 different BK weight configurations
-def _bk_weights_cpu(k: int, low_period: float, high_period: float) -> _np.ndarray:
-    """CPU Baxter–King weights (float32), cached per worker.
+def _bk_weights_gpu(k: int, low_period: float, high_period: float) -> _cp.ndarray:
+    """GPU Baxter–King weights (float32), cached per worker.
 
     low_period > high_period (e.g., 32 > 6) ⇒ pass-band between [w_high, w_low].
     """
-    w_low = 2 * _np.pi / float(low_period)  # Convert low period to angular frequency
-    w_high = 2 * _np.pi / float(high_period)  # Convert high period to angular frequency
-    weights = _np.zeros(2 * k + 1, dtype=_np.float32)  # Initialize weight array (symmetric around center)
-    weights[k] = (w_high - w_low) / _np.pi  # Center weight (DC component)
-    j = _np.arange(1, k + 1, dtype=_np.float32)  # Lag indices for positive lags
-    weights[k + 1:] = (_np.sin(w_high * j) - _np.sin(w_low * j)) / (_np.pi * j)  # Positive lag weights
+    w_low = 2 * _cp.pi / float(low_period)  # Convert low period to angular frequency
+    w_high = 2 * _cp.pi / float(high_period)  # Convert high period to angular frequency
+    weights = _cp.zeros(2 * k + 1, dtype=_cp.float32)  # Initialize weight array (symmetric around center)
+    weights[k] = (w_high - w_low) / _cp.pi  # Center weight (DC component)
+    j = _cp.arange(1, k + 1, dtype=_cp.float32)  # Lag indices for positive lags
+    weights[k + 1:] = (_cp.sin(w_high * j) - _cp.sin(w_low * j)) / (_cp.pi * j)  # Positive lag weights
     weights[:k] = weights[k + 1:][::-1]  # Mirror weights for negative lags (symmetric filter)
-    wsum = weights.sum(dtype=_np.float64)  # Calculate sum for normalization
-    weights[k] -= (wsum - weights[k]).astype(_np.float32)  # Adjust center weight to ensure sum = 0
+    wsum = weights.sum(dtype=_cp.float64)  # Calculate sum for normalization
+    weights[k] -= (wsum - weights[k]).astype(_cp.float32)  # Adjust center weight to ensure sum = 0
     return weights
 
 
@@ -53,6 +53,9 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
     Handles nulls by filling with 0 for the convolution and restoring NaNs
     at original null positions in the output.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     # Fast-path: if dtype is obviously non-numeric, return all-NaN
     try:
         dt = str(series.dtype).lower()
@@ -60,17 +63,21 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
             return cudf.Series(_cp.full(len(series), _cp.nan, dtype=_cp.float32), index=series.index)
     except Exception:
         pass
+    
     # Ensure float32 and capture null mask before conversion (coerce failure → all-NaN)
     try:
         s = series.astype('f4')  # Convert to float32
     except Exception:
         return cudf.Series(_cp.full(len(series), _cp.nan, dtype=_cp.float32), index=series.index)
+    
     null_mask = s.isna()  # Capture null positions before filling
     # Fill nulls to allow cudf->cupy conversion
     s_filled = s.fillna(0.0)  # Fill nulls with zeros for convolution
     x = s_filled.to_cupy()  # Convert to CuPy array for GPU processing
-    w = _cp.asarray(_bk_weights_cpu(int(k), float(low_period), float(high_period)))  # Get BK weights
+    
+    w = _bk_weights_gpu(int(k), float(low_period), float(high_period))  # Get BK weights (GPU)
     n_kernel = 2 * int(k) + 1  # Kernel size
+    
     if n_kernel <= 129:  # Use direct convolution for small kernels
         y = _cp.convolve(x, w, mode="same")
     else:  # Use FFT convolution for large kernels (more efficient)
@@ -124,6 +131,7 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
     if causal and k > 0:  # Apply causal shift to avoid look-ahead bias
         # Shift by +k to ensure each value at t depends only on x[<= t]
         out = out.shift(k)
+    
     return out
 
 logger = logging.getLogger(__name__)
@@ -266,7 +274,8 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
 
     # -------------------- cuDF path --------------------
     def process_cudf(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
-        self._log_info("Starting FeatureEngineering (cuDF)…")
+        self._log_info("🚀 Starting FeatureEngineering (cuDF)…")
+        self._log_info(f"📊 Input DataFrame: {len(gdf)} rows, {len(gdf.columns)} columns")
         params = self._bk_params()  # Get BK filter parameters
         apply_all = bool(params.get('apply_to_all', False))  # Check if apply to all numeric columns
         if apply_all:
@@ -282,14 +291,25 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         causal = bool(params.get('causal', True))  # Temporal shift to avoid look-ahead bias
         fill_borders = bool(params.get('fill_borders', True))  # Fill NaN borders with appropriate values
         new_cols: List[str] = []  # Track newly created columns
-        for col in src:  # Apply BK filter to each source column
+        for i, col in enumerate(src, 1):  # Apply BK filter to each source column
             out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
+            
+            # Log progress every 10 columns or for the first/last column
+            if i == 1 or i == len(src) or i % 10 == 0:
+                self._log_info(f"🔄 Processing BK filter {i}/{len(src)}: {col} → {out}")
+            
             try:
-                gdf[out] = _apply_bk_filter_gpu_partition(gdf[col], k, low, high, causal, fill_borders)  # Apply BK filter on GPU
+                # Apply BK filter on GPU
+                gdf[out] = _apply_bk_filter_gpu_partition(gdf[col], k, low, high, causal, fill_borders)
+                
+                # Log completion every 10 columns or for the first/last column
+                if i == 1 or i == len(src) or i % 10 == 0:
+                    result_data = gdf[out]
+                    self._log_info(f"✅ BK filter completed for {col}: dtype={result_data.dtype}, nulls={result_data.isna().sum()}")
+                
                 new_cols.append(out)  # Add to list of created columns
-                self._log_info("Applied BK", source=col, out=out, k=k, low=low, high=high, causal=bool(causal))
             except Exception as e:
-                self._log_warn("BK application failed", source=col, error=str(e))
+                self._log_warn(f"❌ BK application failed for {col}", source=col, error=str(e), exc_info=True)
 
         # Record metrics/artifact
         try:
@@ -315,12 +335,14 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         except Exception:
             pass  # Ignore errors in metrics/artifact recording
 
-        self._log_info("FeatureEngineering complete (cuDF).", new_cols=len(new_cols))
+        self._log_info(f"🎯 FeatureEngineering complete (cuDF): {len(new_cols)} new columns created")
+        self._log_info(f"📊 Output DataFrame: {len(gdf)} rows, {len(gdf.columns)} columns")
         return gdf
 
     # -------------------- Dask-cuDF path --------------------
     def process(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
-        self._log_info("Starting FeatureEngineering (Dask)…")
+        self._log_info("🚀 Starting FeatureEngineering (Dask)…")
+        self._log_info(f"📊 Input DataFrame: {len(df)} rows, {len(df.columns)} columns, {df.npartitions} partitions")
         params = self._bk_params()  # Get BK filter parameters
         try:
             cols = list(df.columns)  # Get column names
@@ -340,16 +362,46 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         causal = bool(params.get('causal', True))  # Temporal shift to avoid look-ahead bias
         fill_borders = bool(params.get('fill_borders', True))  # Fill NaN borders with appropriate values
         new_cols: List[str] = []  # Track newly created columns
-        for col in src:  # Apply BK filter to each source column
+        # Batch persist to reduce graph size
+        try:
+            batch_size = int(getattr(self.settings.features, 'feature_engineering_batch_size', 16))
+        except Exception:
+            batch_size = 16
+        since_last = 0
+        for i, col in enumerate(src, 1):  # Apply BK filter to each source column
             out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
+            
+            # Log progress every 10 columns or for the first/last column
+            if i == 1 or i == len(src) or i % 10 == 0:
+                self._log_info(f"🔄 Processing BK filter (Dask) {i}/{len(src)}: {col} → {out}")
+            
             try:
+                # Apply BK filter on GPU using Dask
                 df[out] = df[col].map_partitions(  # Apply BK filter to each partition
                     _apply_bk_filter_gpu_partition, k, low, high, bool(causal), bool(fill_borders), meta=(out, 'f4')  # GPU partition function with metadata
                 )
+                
+                # Log completion every 10 columns or for the first/last column
+                if i == 1 or i == len(src) or i % 10 == 0:
+                    result_data = df[out]
+                    self._log_info(f"✅ BK filter completed (Dask) for {col}: dtype={result_data.dtype}, npartitions={result_data.npartitions}")
+                
                 new_cols.append(out)  # Add to list of created columns
-                self._log_info("Applied BK (Dask)", source=col, out=out, k=k, low=low, high=high, causal=bool(causal))
+                since_last += 1
+                if since_last >= max(1, batch_size):
+                    try:
+                        import dask as _dask
+                        # In debug mode, avoid graph optimization to keep task names visible
+                        debug_dash = bool(getattr(self.settings, 'development', {}).get('debug_dashboard', False)) if hasattr(self, 'settings') else False
+                        if debug_dash:
+                            df, = _dask.persist(df, optimize_graph=False)
+                        else:
+                            df = df.persist()
+                        since_last = 0
+                    except Exception:
+                        pass
             except Exception as e:
-                self._log_warn("BK application failed (Dask)", source=col, error=str(e))
+                self._log_warn(f"❌ BK application failed (Dask) for {col}", source=col, error=str(e), exc_info=True)
 
         # Record metrics/artifact (Dask)
         try:
@@ -374,6 +426,16 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
                 self._record_artifact('feature_engineering', str(summary_path), kind='json')  # Record artifact
         except Exception:
             pass  # Ignore errors in metrics/artifact recording
-
-        self._log_info("FeatureEngineering complete (Dask).", new_cols=len(new_cols))
+        # Final checkpoint to flush pending tasks
+        try:
+            import dask as _dask
+            debug_dash = bool(getattr(self.settings, 'development', {}).get('debug_dashboard', False)) if hasattr(self, 'settings') else False
+            if debug_dash:
+                df, = _dask.persist(df, optimize_graph=False)
+            else:
+                df = df.persist()
+        except Exception:
+            pass
+        self._log_info(f"🎯 FeatureEngineering complete (Dask): {len(new_cols)} new columns created")
+        self._log_info(f"📊 Output DataFrame: {len(df)} rows, {len(df.columns)} columns, {df.npartitions} partitions")
         return df

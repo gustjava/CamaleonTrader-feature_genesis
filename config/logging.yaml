@@ -5,18 +5,18 @@ disable_existing_loggers: false
 formatters:
   # Console formatter - clean and readable for humans
   console:
-    format: '%(asctime)s %(name)-20s %(levelname)-8s %(event)-25s %(message)s'
+    format: '%(asctime)s %(name)-20s %(levelname)-8s %(message)s'
     datefmt: '%H:%M:%S'
   
   # JSON formatter - structured for automated analysis
   json:
     class: pythonjsonlogger.jsonlogger.JsonFormatter
-    format: '%(asctime)s %(levelname)s %(name)s %(component)s %(event)s %(run_id)s %(task_id)s %(pair)s %(engine)s %(hostname)s %(gpu_count)s %(workers)s %(dashboard_url)s %(duration_ms)s %(rows_before)s %(rows_after)s %(cols_before)s %(cols_after)s %(new_cols)s %(message)s'
+    format: '%(asctime)s %(levelname)s %(name)s %(message)s'
     datefmt: '%Y-%m-%dT%H:%M:%S'
 
   # Detailed formatter for debugging
   detailed:
-    format: '%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(event)s - %(message)s | run_id=%(run_id)s task_id=%(task_id)s pair=%(pair)s engine=%(engine)s'
+    format: '%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s'
     datefmt: '%Y-%m-%d %H:%M:%S'
 
 handlers:
@@ -26,7 +26,6 @@ handlers:
     level: INFO
     formatter: console
     stream: ext://sys.stdout
-    filters: [console_filter]
   
   # File output - structured JSON for analysis
   file:
@@ -37,7 +36,6 @@ handlers:
     maxBytes: 10485760  # 10MB
     backupCount: 5
     encoding: utf8
-    filters: [json_filter]
   
   # Error file - only errors and critical messages
   error_file:
@@ -49,14 +47,6 @@ handlers:
     backupCount: 3
     encoding: utf8
 
-filters:
-  # Filter to ensure console logs are clean (no None values)
-  console_filter:
-    class: utils.logging_utils.ConsoleFilter
-  
-  # Filter to ensure JSON logs have all required fields
-  json_filter:
-    class: utils.logging_utils.JsonFilter
 
 loggers:
   # Main application logger
@@ -107,6 +97,33 @@ loggers:
     propagate: false
   
   requests:
+    level: WARNING
+    handlers: [file]
+    propagate: false
+  
+  # Tornado/WebSocket logging (disable noisy connection logs)
+  tornado:
+    level: ERROR
+    handlers: [file]
+    propagate: false
+  
+  tornado.application:
+    level: ERROR
+    handlers: [file]
+    propagate: false
+  
+  tornado.websocket:
+    level: ERROR
+    handlers: [file]
+    propagate: false
+  
+  # Bokeh server logging (disable WebSocket connection logs)
+  bokeh:
+    level: WARNING
+    handlers: [file]
+    propagate: false
+  
+  bokeh.server:
     level: WARNING
     handlers: [file]
     propagate: false

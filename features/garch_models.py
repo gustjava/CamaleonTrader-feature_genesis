@@ -50,11 +50,10 @@ def _garch_fit_partition_np(part: cudf.DataFrame, price_col: str, max_samples: i
 
         x = x.astype(np.float64, copy=False)  # Converte para float64 para precisão
         if np.isnan(x).any() or np.isinf(x).any():  # Verifica valores inválidos
-            # Replace non-finite with previous value or small positive
-            x = np.where(np.isfinite(x), x, np.nan)  # Marca valores inválidos como NaN
-            # forward fill then back fill then fill with small
+            # Replace non-finite with NaN and apply causal (forward-only) fill, then small constant for any leading NaNs
+            x = np.where(np.isfinite(x), x, np.nan)
             pd = __import__('pandas')  # Importa pandas para preenchimento
-            x = pd.Series(x).fillna(method='ffill').fillna(method='bfill').fillna(1e-8).to_numpy()  # Preenche gaps com forward/backward fill
+            x = pd.Series(x).fillna(method='ffill').fillna(1e-8).to_numpy()  # Preenche apenas com forward fill e constante
 
         # Truncate tail for bounded work
         if x.size > int(max_samples):  # Limita tamanho para controlar tempo de processamento

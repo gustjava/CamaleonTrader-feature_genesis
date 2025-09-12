@@ -58,26 +58,42 @@ if [[ -z "$INSTANCE_ID" ]]; then
 fi
 echo "✅ Instância selecionada automaticamente: $INSTANCE_ID"
 
+# Extrair todas as informações da instância de uma vez
+echo "📋 Coletando informações da instância..."
+INSTANCE_INFO=$(echo "$INSTANCES_RAW" | jq -r ".[] | select(.id == $INSTANCE_ID)")
+SSH_HOST=$(echo "$INSTANCE_INFO" | jq -r '.ssh_host // empty')
+SSH_PORT=$(echo "$INSTANCE_INFO" | jq -r '.ssh_port // empty')
+
+if [[ -z "$SSH_HOST" || -z "$SSH_PORT" ]]; then
+  echo "❌ Erro: Não foi possível obter informações SSH da instância $INSTANCE_ID"
+  echo "SSH_HOST: '$SSH_HOST'"
+  echo "SSH_PORT: '$SSH_PORT'"
+  exit 1
+fi
+
+echo "📋 Informações da instância:"
+echo "  ID: $INSTANCE_ID"
+echo "  SSH Host: $SSH_HOST"
+echo "  SSH Port: $SSH_PORT"
+
 # --------------------------- CONEXÃO SSH --------------------------------------------
 echo "Aguardando SSH da instância $INSTANCE_ID ficar disponível..."
-SSH_HOST=""; SSH_PORT=""
 for i in {1..120}; do
-  INSTANCE_INFO=$("$VAST_BIN" show instances --raw | jq -r ".[] | select(.id == $INSTANCE_ID) | {ssh_host, ssh_port}" 2>/dev/null || echo "")
-  if [[ -n "$INSTANCE_INFO" && "$INSTANCE_INFO" != "null" ]]; then
-    SSH_HOST=$(echo "$INSTANCE_INFO" | jq -r '.ssh_host' 2>/dev/null || echo "")
-    SSH_PORT=$(echo "$INSTANCE_INFO" | jq -r '.ssh_port' 2>/dev/null || echo "")
-    if [[ -n "$SSH_HOST" && -n "$SSH_PORT" ]]; then
-      if nc -z -w5 "$SSH_HOST" "$SSH_PORT"; then
-        echo "✅ SSH pronto em $SSH_HOST:$SSH_PORT"
-        break
-      fi
-    fi
+  if nc -z -w5 "$SSH_HOST" "$SSH_PORT"; then
+    echo "✅ SSH pronto em $SSH_HOST:$SSH_PORT"
+    break
   fi
   echo -n "."
   sleep 5
 done
 echo ""
-[[ -z "$SSH_HOST" || -z "$SSH_PORT" ]] && { echo "Erro fatal: Timeout ao esperar pela conexão SSH da instância."; exit 1; }
+
+# Verificar se conseguiu conectar
+if ! nc -z -w5 "$SSH_HOST" "$SSH_PORT"; then
+  echo "❌ Erro fatal: Timeout ao esperar pela conexão SSH da instância."
+  echo "Tentando conectar em: $SSH_HOST:$SSH_PORT"
+  exit 1
+fi
 
 # --- SINCRONIZAÇÃO E EXECUÇÃO ---
 SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i $SSH_KEY_PATH"
@@ -122,6 +138,52 @@ fi
 echo "✅ Túnel SSH persistente criado (PID: $TUNNEL_PID)"
 echo "📝 Logs do túnel: /tmp/vast_tunnel_${INSTANCE_ID}.log"
 
+# --- CRIAR TÚNEL PARA DASHBOARD DASK ---
+echo -e "\n🔗  Criando túnel SSH para dashboard Dask..."
+DASHBOARD_TUNNEL_PID_FILE="/tmp/vast_dashboard_tunnel_${INSTANCE_ID}.pid"
+DASHBOARD_LOCAL_PORT="8888"
+DASHBOARD_REMOTE_PORT="8888"
+
+# Mata qualquer túnel de dashboard anterior para esta instância
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    OLD_DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE")
+    if kill -0 "$OLD_DASHBOARD_PID" 2>/dev/null; then
+        echo "Matando túnel de dashboard anterior (PID: $OLD_DASHBOARD_PID)..."
+        kill "$OLD_DASHBOARD_PID"
+        sleep 2
+    fi
+    rm -f "$DASHBOARD_TUNNEL_PID_FILE"
+fi
+
+# Verifica se a porta local já está em uso
+if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+    echo "⚠️  Porta $DASHBOARD_LOCAL_PORT já está em uso. Tentando porta 8889..."
+    DASHBOARD_LOCAL_PORT="8889"
+    if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+        echo "⚠️  Porta $DASHBOARD_LOCAL_PORT também está em uso. Tentando porta 8890..."
+        DASHBOARD_LOCAL_PORT="8890"
+    fi
+fi
+
+# Cria o túnel do dashboard em background com nohup
+nohup ssh $SSH_OPTS -L $DASHBOARD_LOCAL_PORT:localhost:$DASHBOARD_REMOTE_PORT -N "root@$SSH_HOST" > /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log 2>&1 &
+DASHBOARD_TUNNEL_PID=$!
+echo "$DASHBOARD_TUNNEL_PID" > "$DASHBOARD_TUNNEL_PID_FILE"
+
+# Aguarda um pouco para o túnel se estabelecer
+echo "Aguardando túnel do dashboard se estabelecer..."
+sleep 3
+
+# Verifica se o túnel do dashboard está funcionando
+if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+    echo "✅ Túnel SSH para dashboard Dask criado (PID: $DASHBOARD_TUNNEL_PID)"
+    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    echo "🌐 Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
+else
+    echo "⚠️  Túnel do dashboard não conseguiu se estabelecer, mas continuando..."
+    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+fi
+
 # --- SINCRONIZAÇÃO DE CÓDIGO ---
 echo -e "\n🔄  Sincronizando código local com a instância remota via rsync..."
 rsync -avz --delete -e "ssh $SSH_OPTS" \
@@ -142,8 +204,8 @@ rsync -avz -e "ssh $SSH_OPTS" \
   "$LOCAL_PROJECT_DIR/onstart.sh" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
 echo "✅ Sincronização de arquivos de programa completa."
 
-# --- EXECUÇÃO DO PIPELINE ---
-echo -e "\n🚀  Executando pipeline remotamente..."
+# --- EXECUÇÃO DO PIPELINE COM TMUX DUAL TERMINAL ---
+echo -e "\n🚀  Executando pipeline remotamente com monitoramento dual..."
 
 # Variáveis de ambiente para MySQL
 REMOTE_ENV_EXPORTS=$(cat <<EOF
@@ -196,63 +258,42 @@ python orchestration/main.py
 PIPELINE_LOG_FILE="/tmp/vast_pipeline_${INSTANCE_ID}.log"
 echo "📝 Logs do pipeline: $PIPELINE_LOG_FILE"
 
-# Executa o comando via SSH em background e salva o PID
-echo "🔄 Iniciando pipeline em background..."
-ssh $SSH_OPTS "root@$SSH_HOST" "$PIPELINE_CMD" > "$PIPELINE_LOG_FILE" 2>&1 &
-PIPELINE_PID=$!
-echo "$PIPELINE_PID" > "/tmp/vast_pipeline_${INSTANCE_ID}.pid"
+# Executa o comando via SSH diretamente
+echo "🔄 Iniciando pipeline..."
+echo "📋 Para acompanhar os logs em tempo real, execute em outro terminal:"
+echo "  tail -f $PIPELINE_LOG_FILE"
+echo ""
 
-echo "✅ Pipeline iniciado (PID: $PIPELINE_PID)"
-echo "📡 Acompanhe os logs em tempo real abaixo (Ctrl+C para parar o tail):"
-
-# Tail em tempo real do log local gerado pelo SSH
-touch "$PIPELINE_LOG_FILE"
-TAIL_PID=""
-tail -n +1 -F "$PIPELINE_LOG_FILE" &
-TAIL_PID=$!
-
-# Garante limpeza do tail ao sair
-cleanup() {
-  if [ -n "${TAIL_PID:-}" ]; then
-    kill "$TAIL_PID" >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup INT TERM EXIT
-
-# Aguarda o término do processo SSH (pipeline remoto)
-PIPELINE_EXIT_CODE=1
-if [ -n "${PIPELINE_PID:-}" ]; then
-  wait "$PIPELINE_PID"
-  PIPELINE_EXIT_CODE=$?
-fi
-
-# Para o tail e imprime resumo final
-cleanup
-
-echo "📋 RESULTADO FINAL (código $PIPELINE_EXIT_CODE):"
-echo "--- Últimas 50 linhas do log ---"
-tail -n 50 "$PIPELINE_LOG_FILE" || true
-echo "---"
-
-if [ $PIPELINE_EXIT_CODE -eq 0 ]; then
-  echo "✅ Pipeline finalizado com sucesso."
+# Executa o pipeline e salva os logs
+ssh $SSH_OPTS "root@$SSH_HOST" "$PIPELINE_CMD" 2>&1 | tee "$PIPELINE_LOG_FILE"
+EXIT_CODE=${PIPEOF:-0}
+echo ""
+echo "📋 RESULTADO FINAL:"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "✅ Pipeline concluído com sucesso!"
 else
-  echo "❌ Pipeline finalizado com erro (código $PIPELINE_EXIT_CODE)."
+    echo "❌ Pipeline falhou com código de saída: $EXIT_CODE"
 fi
 
-# (monitor removido)
+echo "📝 Logs completos salvos em: $PIPELINE_LOG_FILE"
 
-# Mostra apenas o resultado final resumido
-if [ -f "$PIPELINE_LOG_FILE" ]; then
-    echo "📋 RESULTADO FINAL:"
-    tail -n 10 "$PIPELINE_LOG_FILE" | grep -E "SUCCESS|FAILURE|ERROR|CRITICAL" || echo "Pipeline concluído"
-fi
-
-# Verifica se o processo ainda está rodando
-if [ -n "${PIPELINE_PID:-}" ] && kill -0 "$PIPELINE_PID" 2>/dev/null; then
-    echo "🔄 Pipeline ainda em execução. Para parar: kill $PIPELINE_PID"
+echo -e "\n🔗 TÚNEIS SSH ATIVOS:"
+echo "   • MySQL: localhost:$LOCAL_MYSQL_PORT → remoto:$REMOTE_MYSQL_PORT (PID: $TUNNEL_PID)"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE" 2>/dev/null || echo "N/A")
+    echo "   • Dashboard Dask: localhost:$DASHBOARD_LOCAL_PORT → remoto:$DASHBOARD_REMOTE_PORT (PID: $DASHBOARD_PID)"
+    echo "   • Acesse o dashboard em: http://localhost:$DASHBOARD_LOCAL_PORT"
 else
-    echo "✅ Pipeline finalizado."
+    echo "   • Dashboard Dask: Não disponível"
 fi
 
-echo "✅ Pipeline finalizado. Logs: $PIPELINE_LOG_FILE"
+echo -e "\n💡 COMANDOS ÚTEIS:"
+echo "   • Verificar túneis: ps aux | grep 'ssh.*$SSH_HOST'"
+echo "   • Parar túnel MySQL: kill \$(cat $TUNNEL_PID_FILE)"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    echo "   • Parar túnel Dashboard: kill \$(cat $DASHBOARD_TUNNEL_PID_FILE)"
+fi
+echo "   • Ver logs MySQL: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    echo "   • Ver logs Dashboard: tail -f /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+fi

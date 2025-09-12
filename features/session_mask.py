@@ -1,6 +1,6 @@
 import cudf
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 
 def _normalize_holidays(holidays: Optional[List[str]]) -> Optional[cudf.Series]:
@@ -140,4 +140,102 @@ def build_feature_masks_data_driven(
         except Exception:
             # If rolling unsupported on this column, default to all True
             out[f] = cudf.Series(np.ones(len(gdf), dtype=bool))
+    return out
+
+
+def _resolve_open_flag_column(df, candidates: List[str]) -> Optional[str]:
+    """Return the first existing boolean/open column from candidates list."""
+    for c in candidates:
+        try:
+            if c in df.columns:
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def build_driver_masks_from_df(
+    df,
+    ts_col: str,
+    sessions_cfg: Dict,
+    driver_keys: List[str],
+    open_flag_map: Optional[Dict[str, Union[str, List[str]]]] = None,
+) -> Dict[str, cudf.Series]:
+    """Build per-driver boolean masks using is_*_open flags when available, otherwise schedules.
+
+    - If `open_flag_map[driver]` column(s) exist in df, use that column as mask.
+      Supports str or list[str] (first existing is used).
+    - Else, falls back to schedule-based mask via `build_driver_masks` using `ts_col`.
+    - If both methods fail, defaults to all True (no masking) for that driver.
+    """
+    out: Dict[str, cudf.Series] = {}
+    if df is None or not driver_keys:
+        return out
+    try:
+        import numpy as _np
+        import cudf as _cudf
+    except Exception:
+        # best-effort fallback
+        return out
+
+    # Precompute schedule masks once if ts is available
+    sched_masks: Dict[str, cudf.Series] = {}
+    ts = None
+    try:
+        if ts_col in df.columns:
+            ts = df[ts_col]
+    except Exception:
+        ts = None
+
+    for key in driver_keys:
+        m: Optional[cudf.Series] = None
+        # Prefer explicit open-flag column from df
+        if open_flag_map:
+            raw = open_flag_map.get(key)
+            cand_cols: List[str]
+            if isinstance(raw, str):
+                cand_cols = [raw]
+            elif isinstance(raw, list):
+                cand_cols = [str(x) for x in raw]
+            else:
+                cand_cols = []
+            # Common fallbacks (e.g., ust vs ust10y)
+            if not cand_cols:
+                cand_cols = [f"is_{key}_open"]
+            # Allow secondary aliases for known drivers
+            if key in ("ust", "ust10y"):
+                cand_cols.extend(["is_ust_open", "is_ust10y_open"])
+            col = _resolve_open_flag_column(df, cand_cols)
+            if col is not None:
+                try:
+                    s = df[col]
+                    # ensure boolean mask
+                    if str(s.dtype).lower() != 'bool':
+                        try:
+                            s = s.astype('bool')
+                        except Exception:
+                            s = s != 0
+                    m = s
+                except Exception:
+                    m = None
+
+        # Fallback to schedule-based mask
+        if m is None and ts is not None and isinstance(sessions_cfg, dict):
+            try:
+                if key not in sched_masks:
+                    sm = build_driver_masks(ts, sessions_cfg, [key])
+                    sched_masks.update(sm)
+                m = sched_masks.get(key)
+            except Exception:
+                m = None
+
+        # Default to all True if nothing works
+        if m is None:
+            try:
+                m = cudf.Series(np.ones(len(df), dtype=bool))
+            except Exception:
+                # last resort
+                m = None
+        if m is not None:
+            out[key] = m
     return out

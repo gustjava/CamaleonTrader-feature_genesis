@@ -20,6 +20,7 @@ import re  # For regular expressions
 from .base_engine import BaseFeatureEngine  # Base class for feature engines
 from utils.logging_utils import get_logger, info_event, warn_event, error_event, Events
 from utils import log_context
+from .session_mask import driver_for_feature  # reuse mapping helper
 
 logger = get_logger(__name__, "features.StatisticalTests")
 
@@ -119,6 +120,142 @@ def _adf_rolling_partition(series: cudf.Series, window: int, min_periods: int) -
         return series.rolling(window=window, min_periods=min_periods).apply(lambda x: _adf_tstat_window_host(np.asarray(x)))
     except Exception:
         return cudf.Series(cp.full(len(series), cp.nan))  # Return NaN series if computation fails
+
+
+def _jb_pvalue_window_host(vals: np.ndarray) -> float:
+    """Jarque–Bera p-value for a window (CPU, causal).
+
+    JB = n/6 * (skew^2 + (kurt-3)^2 / 4)
+    For chi2 with df=2, p = exp(-JB/2)
+    """
+    try:
+        x = np.asarray(vals, dtype=np.float64)
+        x = x[np.isfinite(x)]
+        n = len(x)
+        if n < 8:
+            return float('nan')
+        m = np.mean(x)
+        s = np.std(x)
+        if s == 0.0:
+            return float('nan')
+        z = (x - m) / s
+        skew = np.mean(z**3)
+        kurt = np.mean(z**4)
+        jb = (n / 6.0) * (skew**2 + ((kurt - 3.0)**2) / 4.0)
+        # For df=2, chi2 survival function simplifies to exp(-x/2)
+        p = float(np.exp(-0.5 * jb))
+        return p
+    except Exception:
+        return float('nan')
+
+
+def _jb_aggregates_partition(pdf: cudf.DataFrame, col: str, base: str, windows: list, alpha: float) -> cudf.DataFrame:
+    """Compute rolling JB p-value aggregates causally from a series within a partition.
+
+    Outputs per window (first two windows used):
+    - jb_last_p_{base}_{w}w: last p-value (float32)
+    - jb_frac_non_normal_{base}_{w}w: rolling fraction of p<alpha (float32)
+    And global (based on the first window):
+    - jb_since_non_normal_{base}: bars since last p<alpha (float32)
+    """
+    try:
+        import cupy as _cp
+        n = len(pdf)
+        # Initialize all expected columns with NaNs to satisfy meta
+        out: Dict[str, cudf.Series] = {}
+        out[f"jb_since_non_normal_{base}"] = cudf.Series(_cp.full(n, _cp.nan, dtype=_cp.float32), index=pdf.index)
+        for w in windows[:2]:
+            wv = int(w)
+            out[f"jb_last_p_{base}_{wv}w"] = cudf.Series(_cp.full(n, _cp.nan, dtype=_cp.float32), index=pdf.index)
+            out[f"jb_frac_non_normal_{base}_{wv}w"] = cudf.Series(_cp.full(n, _cp.nan, dtype=_cp.float32), index=pdf.index)
+        if col not in pdf.columns:
+            return cudf.DataFrame(out)
+        s = pdf[col]
+        pv_cols = []
+        for w in windows[:2]:
+            try:
+                wv = int(w)
+                minp = max(5, wv // 3)
+                pser = s.rolling(window=wv, min_periods=minp).apply(lambda x: _jb_pvalue_window_host(np.asarray(x))).astype('f4')
+                out[f"jb_last_p_{base}_{wv}w"] = pser
+                frac = (pser < float(alpha)).astype('int8').rolling(window=wv, min_periods=minp).mean().astype('f4')
+                out[f"jb_frac_non_normal_{base}_{wv}w"] = frac
+                pv_cols.append(pser)
+            except Exception:
+                continue
+        # since last non-normal on first available window
+        if pv_cols:
+            try:
+                p0 = pv_cols[0]
+                flag = (p0 < float(alpha)).astype('bool')
+                idx = cudf.Series(_cp.arange(n, dtype=_cp.int32), index=p0.index)
+                last_true = idx.where(flag, _cp.nan).fillna(method='ffill')
+                since = (idx - last_true).astype('f4')
+                out[f"jb_since_non_normal_{base}"] = since
+            except Exception:
+                pass
+        return cudf.DataFrame(out)
+    except Exception:
+        # Fallback meta-consistent NaNs
+        import cupy as _cp2
+        out = {f"jb_since_non_normal_{base}": cudf.Series(_cp2.full(len(pdf), _cp2.nan, dtype=_cp2.float32), index=pdf.index)}
+        for w in windows[:2]:
+            out[f"jb_last_p_{base}_{int(w)}w"] = cudf.Series(_cp2.full(len(pdf), _cp2.nan, dtype=_cp2.float32), index=pdf.index)
+            out[f"jb_frac_non_normal_{base}_{int(w)}w"] = cudf.Series(_cp2.full(len(pdf), _cp2.nan, dtype=_cp2.float32), index=pdf.index)
+        return cudf.DataFrame(out)
+
+def _adf_aggregates_partition(pdf: cudf.DataFrame, tcol: str, base: str, windows: list, alpha: float) -> cudf.DataFrame:
+    """Build causal aggregates from rolling ADF t-stat series within a partition.
+
+    Generates:
+    - adf_last_{base}: last (current) t-stat value
+    - adf_frac_stationary_{base}_{w}w: rolling fraction of stationary flags over window w
+    - adf_since_stationary_{base}: bars since last stationary flag (approx at 5% level)
+    """
+    try:
+        import cupy as _cp
+        n = len(pdf)
+        # Initialize all expected outputs with NaNs
+        out_cols: Dict[str, cudf.Series] = {}
+        out_cols[f"adf_last_{base}"] = cudf.Series(_cp.full(n, _cp.nan, dtype=_cp.float32), index=pdf.index)
+        for w in windows[:2]:
+            wv = int(w)
+            out_cols[f"adf_frac_stationary_{base}_{wv}w"] = cudf.Series(_cp.full(n, _cp.nan, dtype=_cp.float32), index=pdf.index)
+        out_cols[f"adf_since_stationary_{base}"] = cudf.Series(_cp.full(n, _cp.nan, dtype=_cp.float32), index=pdf.index)
+        if tcol not in pdf.columns:
+            return cudf.DataFrame(out_cols)
+        s = pdf[tcol].astype('f4')
+        out_cols[f"adf_last_{base}"] = s
+        crit_5 = -2.86
+        try:
+            stat_flag = (s < crit_5).astype('int8')
+            for w in windows[:2]:
+                try:
+                    wv = int(w)
+                    frac = stat_flag.rolling(window=wv, min_periods=max(1, wv // 3)).mean().astype('f4')
+                    out_cols[f"adf_frac_stationary_{base}_{wv}w"] = frac
+                except Exception:
+                    continue
+            # since last stationary
+            try:
+                idx = cudf.Series(_cp.arange(n, dtype=_cp.int32), index=s.index)
+                last_true = idx.where(stat_flag.astype('bool'), _cp.nan).fillna(method='ffill')
+                since = (idx - last_true).astype('f4')
+                out_cols[f"adf_since_stationary_{base}"] = since
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return cudf.DataFrame(out_cols)
+    except Exception:
+        # meta-consistent NaNs
+        import cupy as _cp2
+        fallback: Dict[str, cudf.Series] = {}
+        fallback[f"adf_last_{base}"] = cudf.Series(_cp2.full(len(pdf), _cp2.nan, dtype=_cp2.float32), index=pdf.index)
+        for w in windows[:2]:
+            fallback[f"adf_frac_stationary_{base}_{int(w)}w"] = cudf.Series(_cp2.full(len(pdf), _cp2.nan, dtype=_cp2.float32), index=pdf.index)
+        fallback[f"adf_since_stationary_{base}"] = cudf.Series(_cp2.full(len(pdf), _cp2.nan, dtype=_cp2.float32), index=pdf.index)
+        return cudf.DataFrame(fallback)
 
 
 def _distance_correlation_cpu(x: np.ndarray, y: np.ndarray, max_samples: int = 10000) -> float:
@@ -354,7 +491,7 @@ def _dcor_rolling_partition_gpu(
 # ---------------- Dask multi-GPU task helpers (feature-parallel) ----------------
 def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: int, tile: int,
                           sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
-                          session_auto_mask: Dict = None) -> Dict[str, float]:
+                          session_auto_mask: Dict = None, open_flag_map: Dict = None) -> Dict[str, float]:
     """Compute dCor for a chunk of features on a single worker/GPU.
 
     Accepts a pandas DataFrame to ease serialization; converts to cuDF on worker
@@ -363,12 +500,12 @@ def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: in
     try:
         import cudf as _cudf
         gdf = _cudf.from_pandas(pdf_pd)
-        # Apply session masks (driver-based and data-driven)
+        # Apply session masks (prefer open flags; fallback to schedule; plus data-driven)
         try:
-            if sessions_cfg and feature_prefix_map and ts_col in gdf.columns:
-                from .session_mask import build_driver_masks, driver_for_feature, build_feature_masks_data_driven
+            if sessions_cfg and feature_prefix_map:
+                from .session_mask import build_driver_masks_from_df, driver_for_feature, build_feature_masks_data_driven
                 drivers = list({driver_for_feature(f, feature_prefix_map) for f in feats if driver_for_feature(f, feature_prefix_map)})
-                masks = build_driver_masks(gdf[ts_col], sessions_cfg.get('drivers', {}), drivers) if drivers else {}
+                masks = build_driver_masks_from_df(gdf, ts_col, sessions_cfg.get('drivers', {}), drivers, open_flag_map=open_flag_map) if drivers else {}
                 # data-driven masks per feature
                 feat_masks = {}
                 try:
@@ -406,17 +543,17 @@ def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: in
 def _dask_dcor_rolling_chunk_task(pdf_pd, target: str, feats: List[str], window: int, step: int, min_periods: int,
                                   min_valid_pairs: int, max_rows: int, max_windows: int, agg: str, max_samples: int, tile: int,
                                   sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
-                                  session_auto_mask: Dict = None) -> Dict[str, Any]:
+                                  session_auto_mask: Dict = None, open_flag_map: Dict = None) -> Dict[str, Any]:
     """Compute rolling dCor aggregated scores for a chunk of features on a single worker/GPU."""
     try:
         import cudf as _cudf
         gdf = _cudf.from_pandas(pdf_pd)
-        # Apply session masks (driver-based and data-driven)
+        # Apply session masks (prefer open flags; fallback to schedule; plus data-driven)
         try:
-            if sessions_cfg and feature_prefix_map and ts_col in gdf.columns:
-                from .session_mask import build_driver_masks, driver_for_feature, build_feature_masks_data_driven
+            if sessions_cfg and feature_prefix_map:
+                from .session_mask import build_driver_masks_from_df, driver_for_feature, build_feature_masks_data_driven
                 drivers = list({driver_for_feature(f, feature_prefix_map) for f in feats if driver_for_feature(f, feature_prefix_map)})
-                masks = build_driver_masks(gdf[ts_col], sessions_cfg.get('drivers', {}), drivers) if drivers else {}
+                masks = build_driver_masks_from_df(gdf, ts_col, sessions_cfg.get('drivers', {}), drivers, open_flag_map=open_flag_map) if drivers else {}
                 feat_masks = {}
                 try:
                     if session_auto_mask and bool(session_auto_mask.get('enabled', False)):
@@ -462,17 +599,17 @@ def _dask_dcor_rolling_chunk_task(pdf_pd, target: str, feats: List[str], window:
 
 def _dask_perm_chunk_task(pdf_pd, target: str, feats: List[str], n_perm: int, max_samples: int, tile: int,
                           sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
-                          session_auto_mask: Dict = None) -> Dict[str, float]:
+                          session_auto_mask: Dict = None, open_flag_map: Dict = None) -> Dict[str, float]:
     """Compute permutation p-values for a chunk of features on a single worker/GPU."""
     try:
         import cudf as _cudf
         gdf = _cudf.from_pandas(pdf_pd)
-        # Apply session masks (driver-based and data-driven)
+        # Apply session masks (prefer open flags; fallback to schedule; plus data-driven)
         try:
-            if sessions_cfg and feature_prefix_map and ts_col in gdf.columns:
-                from .session_mask import build_driver_masks, driver_for_feature, build_feature_masks_data_driven
+            if sessions_cfg and feature_prefix_map:
+                from .session_mask import build_driver_masks_from_df, driver_for_feature, build_feature_masks_data_driven
                 drivers = list({driver_for_feature(f, feature_prefix_map) for f in feats if driver_for_feature(f, feature_prefix_map)})
-                masks = build_driver_masks(gdf[ts_col], sessions_cfg.get('drivers', {}), drivers) if drivers else {}
+                masks = build_driver_masks_from_df(gdf, ts_col, sessions_cfg.get('drivers', {}), drivers, open_flag_map=open_flag_map) if drivers else {}
                 feat_masks = {}
                 try:
                     if session_auto_mask and bool(session_auto_mask.get('enabled', False)):
@@ -720,6 +857,7 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage1_rolling_max_windows = 20  # Maximum number of rolling windows
             self.stage1_agg = 'median'  # Aggregation method for rolling scores
             self.stage1_use_rolling_scores = True  # Whether to use rolling scores
+            self.stage1_dashboard_per_feature = False
         else:
             # Defaults when config present - load from unified configuration
             self.selection_max_rows = int(getattr(uc.features, 'selection_max_rows', 100000))  # Max rows for selection
@@ -746,6 +884,8 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage1_rolling_max_windows = int(getattr(uc.features, 'stage1_rolling_max_windows', 20))  # Max rolling windows
             self.stage1_agg = str(getattr(uc.features, 'stage1_agg', 'median')).lower()  # Aggregation method
             self.stage1_use_rolling_scores = bool(getattr(uc.features, 'stage1_use_rolling_scores', True))  # Use rolling scores
+            # Dashboard per-feature visibility
+            self.stage1_dashboard_per_feature = bool(getattr(uc.features, 'stage1_dashboard_per_feature', False))
             # Gating and leakage control
             self.selection_target_columns = list(getattr(uc.features, 'selection_target_columns', []))
             self.dataset_target_columns = list(getattr(uc.features, 'dataset_target_columns', []))
@@ -2977,12 +3117,12 @@ class StatisticalTests(BaseFeatureEngine):
         max_rows = int(getattr(self, 'selection_max_rows', 100000))
         cols_to_pull = [c for c in [target, 'timestamp', 'currency_pair'] if c in df.columns]
         try:
-            sample_ddf = df[[target] + feats + cols_to_pull].head(max_rows)
+            sample_ddf = df[[target] + feats + cols_to_pull].tail(max_rows)
             pdf = sample_ddf.compute().to_pandas().dropna()
         except Exception as e:
             # Fallback pull in two steps
             try:
-                pdf = df[[target] + feats].head(max_rows).compute().to_pandas().dropna()
+                pdf = df[[target] + feats].tail(max_rows).compute().to_pandas().dropna()
             except Exception as e2:
                 self._log_warn("Failed to sample data for CPCV; skipping", error=f"{e} / {e2}")
                 return {}
@@ -3270,10 +3410,103 @@ class StatisticalTests(BaseFeatureEngine):
                 200,  # Minimum periods
                 meta=(out, "f8"),  # Output metadata
             )
+            # Build causal aggregates for Stage 1 competition
+            try:
+                base = str(col.split('_')[-1])
+                windows = list(getattr(self.settings.features, 'rolling_windows', [60, 120]))
+            except Exception:
+                base = str(col.split('_')[-1])
+                windows = [60, 120]
+            try:
+                # Prepare meta for aggregate columns
+                import cudf as _cudf
+                meta_cols = {
+                    f"adf_last_{base}": _cudf.Series([], dtype='f4')
+                }
+                for w in windows[:2]:
+                    meta_cols[f"adf_frac_stationary_{base}_{int(w)}w"] = _cudf.Series([], dtype='f4')
+                meta_cols[f"adf_since_stationary_{base}"] = _cudf.Series([], dtype='f4')
+                meta_df = _cudf.DataFrame(meta_cols)
+                try:
+                    from dask import annotate as _annotate
+                    debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                except Exception:
+                    def _annotate(**kwargs):
+                        from contextmanager import contextmanager
+                        @contextmanager
+                        def _noop():
+                            yield
+                        return _noop()
+                    debug_dash = False
+                ctx = _annotate(task_key_name=f"s1-adf-agg-{base}") if debug_dash else _annotate()
+                with ctx:
+                    agg = df[[out]].map_partitions(
+                        _adf_aggregates_partition,
+                        out,
+                        base,
+                        windows,
+                        float(getattr(self, 'adf_alpha', 0.05)),
+                        meta=meta_df,
+                    )
+                # Assign columns back
+                for c in meta_df.columns:
+                    if c in agg.columns:
+                        df[c] = agg[c]
+            except Exception:
+                pass
 
         # Single-fit dCor sanity check removed; proceed to completion.
         self._log_info("StatisticalTests complete.")
-        
+
+        # --- Jarque–Bera aggregates on returns (e.g., y_ret_1m) ---
+        try:
+            available_columns = list(df.columns)
+            ret_candidates = [c for c in available_columns if c == 'y_ret_1m'] or [c for c in available_columns if (c.startswith('y_') and ('ret' in c.lower()))]
+            if ret_candidates:
+                rcol = ret_candidates[0]
+                base = str(rcol).replace('y_', '')
+                try:
+                    windows = list(getattr(self.settings.features, 'rolling_windows', [60, 120]))
+                except Exception:
+                    windows = [60, 120]
+                # Build meta for aggregates
+                import cudf as _cudf
+                meta_cols = {f"jb_since_non_normal_{base}": _cudf.Series([], dtype='f4')}
+                for w in windows[:2]:
+                    meta_cols[f"jb_last_p_{base}_{int(w)}w"] = _cudf.Series([], dtype='f4')
+                    meta_cols[f"jb_frac_non_normal_{base}_{int(w)}w"] = _cudf.Series([], dtype='f4')
+                meta_df = _cudf.DataFrame(meta_cols)
+                try:
+                    from dask import annotate as _annotate
+                    debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                except Exception:
+                    def _annotate(**kwargs):
+                        from contextlib import contextmanager
+                        @contextmanager
+                        def _noop():
+                            yield
+                        return _noop()
+                    debug_dash = False
+                ctx = _annotate(task_key_name=f"s1-jb-agg-{base}") if debug_dash else _annotate()
+                with ctx:
+                    agg = df[[rcol]].map_partitions(
+                        _jb_aggregates_partition,
+                        rcol,
+                        base,
+                        windows,
+                        float(getattr(self, 'jb_alpha', 0.05)) if hasattr(self, 'jb_alpha') else 0.05,
+                        meta=meta_df,
+                    )
+                for c in meta_df.columns:
+                    if c in agg.columns:
+                        df[c] = agg[c]
+                try:
+                    self._log_info("JB aggregates added", base=base, windows=windows[:2])
+                except Exception:
+                    pass
+        except Exception as _e_jb:
+            self._log_warn("JB aggregates failed", error=str(_e_jb))
+
         # --- Stage 1: dCor ranking vs target (global) ---
         try:
             target = self.selection_target_column
@@ -3290,6 +3523,7 @@ class StatisticalTests(BaseFeatureEngine):
                     allowlist = list(getattr(self, 'feature_allowlist', []))
                     allow_prefixes = list(getattr(self, 'feature_allow_prefixes', []))
                     denylist = set(getattr(self, 'feature_denylist', []))
+                    stage1_denylist = set(getattr(self, 'stage1_feature_denylist', []))
                     deny_prefixes = list(getattr(self, 'feature_deny_prefixes', []))
                     deny_regex = list(getattr(self, 'feature_deny_regex', []))
                     metrics_prefixes = list(getattr(self, 'metrics_prefixes', ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_']))
@@ -3298,13 +3532,13 @@ class StatisticalTests(BaseFeatureEngine):
                     mt_targets = set(getattr(self, 'selection_target_columns', []))
                 except Exception:
                     allowlist, allow_prefixes = [], []
-                    denylist, deny_prefixes, deny_regex = set(), ['y_ret_fwd_'], []
+                    denylist, stage1_denylist, deny_prefixes, deny_regex = set(), set(), ['y_ret_fwd_'], []
                     metrics_prefixes = ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_']
                     dataset_targets, mt_targets = set(), set()
                     dataset_target_prefixes = []
 
                 import re as _re
-                exclude_exact = set([target]) | dataset_targets | mt_targets | denylist
+                exclude_exact = set([target]) | dataset_targets | mt_targets | denylist | stage1_denylist
                 excluded = []
 
                 def _allowed(name: str) -> bool:
@@ -3352,15 +3586,270 @@ class StatisticalTests(BaseFeatureEngine):
                     tile = int(getattr(self, 'dcor_tile_size', 2048))
                     max_rows = int(getattr(self, 'selection_max_rows', 100000))
                     try:
-                        sub = df[[target] + candidates]
-                        head_ddf = sub.head(max_rows)
-                        sample_pdf = head_ddf.compute().to_pandas() if hasattr(head_ddf, 'compute') else head_ddf.to_pandas()
+                        # Include timestamp and any declared open-flag columns to enable session masking
+                        extras = []
+                        try:
+                            extras.append('timestamp')
+                        except Exception:
+                            pass
+                        try:
+                            ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                            extra_flags: List[str] = []
+                            for _k, _v in ofm.items():
+                                if isinstance(_v, str):
+                                    extra_flags.append(str(_v))
+                                elif isinstance(_v, list):
+                                    extra_flags.extend([str(x) for x in _v])
+                            # keep only columns that actually exist
+                            extras.extend([c for c in extra_flags if c in df.columns])
+                        except Exception:
+                            pass
+                        # keep only existing timestamp if present
+                        if 'timestamp' in extras and 'timestamp' not in df.columns:
+                            try:
+                                extras.remove('timestamp')
+                            except Exception:
+                                pass
+                        sub = df[(extras + [target] + candidates)]
+                        # Prefer the most recent data: take last two partitions and then tail(max_rows)
+                        try:
+                            nparts = int(getattr(sub, 'npartitions', 1))
+                        except Exception:
+                            nparts = 1
+                        last_two = sub.partitions[max(0, nparts - 2): nparts] if nparts > 1 else sub
+                        sample_pdf = None
+                        try:
+                            # Dask >= 2022 supports npartitions arg; use it to scan both parts
+                            tail_ddf = last_two.tail(max_rows, npartitions=-1)
+                            sample_pdf = tail_ddf.compute().to_pandas()
+                        except Exception:
+                            # Fallback: take a tail from each partition and compose
+                            try:
+                                per_part = max(1, int(max_rows // max(1, int(getattr(last_two, 'npartitions', 1)))))
+                            except Exception:
+                                per_part = max(1, int(max_rows // 2))
+                            import cudf as _cudf
+                            # Build meta including extras (e.g., timestamp, open flags) to avoid schema mismatch
+                            try:
+                                cols_all = list(extras + [target] + candidates)
+                                meta = last_two._meta[cols_all]
+                            except Exception:
+                                # Fallback: construct a minimal meta with best-effort dtypes
+                                meta_cols = {}
+                                for c in (extras + [target] + candidates):
+                                    try:
+                                        if c == 'timestamp':
+                                            meta_cols[c] = _cudf.Series([], dtype='datetime64[ns]')
+                                        else:
+                                            meta_cols[c] = _cudf.Series([], dtype='f8')
+                                    except Exception:
+                                        meta_cols[c] = _cudf.Series([], dtype='f8')
+                                meta = _cudf.DataFrame(meta_cols)
+                            tails_ddf = last_two.map_partitions(lambda pdf, k=per_part: pdf.tail(int(k)), per_part, meta=meta)
+                            tails_cudf = tails_ddf.compute()
+                            sample_pdf = tails_cudf.tail(max_rows).to_pandas()
+                        # If open fraction for candidate drivers is too low, expand sampling window
+                        try:
+                            # Collect drivers present among candidates
+                            drivers = []
+                            try:
+                                prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                            except Exception:
+                                prefix_map = {}
+                            if prefix_map:
+                                seen = set()
+                                for c in candidates:
+                                    drv = driver_for_feature(c, prefix_map)
+                                    if drv and drv not in seen:
+                                        seen.add(drv)
+                                        drivers.append(drv)
+                            # Compute open fraction per driver
+                            def _open_fraction(pdf, drv_key: str) -> float:
+                                # prefer open_flag_map columns
+                                try:
+                                    ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                                except Exception:
+                                    ofm = {}
+                                cand_cols = []
+                                raw = ofm.get(drv_key)
+                                if isinstance(raw, str):
+                                    cand_cols = [raw]
+                                elif isinstance(raw, list):
+                                    cand_cols = [str(x) for x in raw]
+                                else:
+                                    cand_cols = [f"is_{drv_key}_open"]
+                                col = None
+                                for cc in cand_cols:
+                                    if cc in pdf.columns:
+                                        col = cc
+                                        break
+                                if col is not None:
+                                    vals = pdf[col]
+                                    try:
+                                        frac = float(vals.astype('bool').mean())
+                                    except Exception:
+                                        frac = float((vals != 0).mean())
+                                    return frac
+                                # fallback: schedule window using timestamp
+                                try:
+                                    sessions_cfg = getattr(self.settings.features, 'sessions', None)
+                                    drv_cfg = sessions_cfg.get('drivers', {}).get(drv_key, {}) if isinstance(sessions_cfg, dict) else {}
+                                except Exception:
+                                    drv_cfg = {}
+                                if 'timestamp' not in pdf.columns or not drv_cfg:
+                                    return 0.0
+                                ts = pdf['timestamp']
+                                try:
+                                    wday = ts.dt.weekday
+                                    minute = ts.dt.hour * 60 + ts.dt.minute
+                                except Exception:
+                                    return 0.0
+                                weekmask = set(drv_cfg.get('weekmask', [0,1,2,3,4]))
+                                open_windows = drv_cfg.get('open_windows', {}) or {}
+                                def _wins_for(d):
+                                    if isinstance(open_windows, dict):
+                                        return open_windows.get(str(d), []) or open_windows.get(d, []) or []
+                                    if isinstance(open_windows, list) and 0 <= d < len(open_windows):
+                                        return open_windows[d] or []
+                                    return []
+                                try:
+                                    m_w = wday.isin(list(weekmask))
+                                except Exception:
+                                    return 0.0
+                                time_ok = None
+                                for d in range(7):
+                                    wins = _wins_for(d)
+                                    if not wins:
+                                        continue
+                                    sel = (wday == d)
+                                    if not sel.any():
+                                        continue
+                                    min_d = minute.where(sel, -1)
+                                    ok_d = None
+                                    for w in wins:
+                                        try:
+                                            s,e = int(w[0]), int(w[1])
+                                        except Exception:
+                                            continue
+                                        ok = (min_d >= s) & (min_d < e)
+                                        ok_d = ok if ok_d is None else (ok_d | ok)
+                                    time_ok = ok_d if time_ok is None else (time_ok | ok_d)
+                                if time_ok is None:
+                                    return 0.0
+                                try:
+                                    m = (m_w & time_ok).astype('bool')
+                                    return float(m.mean())
+                                except Exception:
+                                    return 0.0
+                            try:
+                                min_open_frac = float(getattr(self, 'stage1_min_open_fraction_for_sampling', 0.20))
+                            except Exception:
+                                min_open_frac = 0.20
+                            if drivers and sample_pdf is not None and not sample_pdf.empty and nparts and nparts > 2:
+                                # compute fraction with current sample
+                                fracs = [(_d, _open_fraction(sample_pdf, _d)) for _d in drivers]
+                                worst = min((f for _, f in fracs), default=1.0)
+                                if worst < min_open_frac:
+                                    # expand window progressively up to 6 parts or nparts
+                                    for k in (4, 6, nparts):
+                                        try:
+                                            last_k = sub.partitions[max(0, nparts - k): nparts]
+                                            tail_ddf = last_k.tail(max_rows, npartitions=-1)
+                                            sample_pdf2 = tail_ddf.compute().to_pandas()
+                                        except Exception:
+                                            sample_pdf2 = sample_pdf
+                                        fracs2 = [(_d, _open_fraction(sample_pdf2, _d)) for _d in drivers]
+                                        worst2 = min((f for _, f in fracs2), default=1.0)
+                                        if worst2 >= min_open_frac or k == nparts:
+                                            if worst2 > worst:
+                                                self._log_info("Stage 1 sampling expanded for open fraction", before=round(worst,3), after=round(worst2,3), parts_used=k)
+                                                sample_pdf = sample_pdf2
+                                            break
+                        except Exception:
+                            pass
                     except Exception as _e_s1:
                         self._log_warn("Stage 1 sampling failed", error=str(_e_s1))
                         sample_pdf = None
 
                     all_scores: Dict[str, float] = {}
                     if sample_pdf is not None and not sample_pdf.empty:
+                        # Optional: restrict sample to trading hours (by hour ranges)
+                        try:
+                            hours = list(getattr(self, 'stage1_include_hours', []) or [])
+                            if hours and 'timestamp' in sample_pdf.columns:
+                                h = sample_pdf['timestamp'].dt.hour
+                                mask_any = False
+                                keep = None
+                                for rng in hours:
+                                    if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                                        start, end = int(rng[0]), int(rng[1])
+                                        if start <= end:
+                                            m = (h >= start) & (h < end)
+                                        else:
+                                            # wrap-around (e.g., [22, 6])
+                                            m = (h >= start) | (h < end)
+                                        keep = m if keep is None else (keep | m)
+                                        mask_any = True
+                                if mask_any and keep is not None:
+                                    before = len(sample_pdf)
+                                    sample_pdf = sample_pdf.loc[keep]
+                                    self._log_info("Stage 1 trading-hours filter applied", before=before, after=len(sample_pdf))
+                        except Exception:
+                            pass
+
+                        # Optional: treat zeros as NaN for configured prefixes to avoid constant-zero artifacts
+                        try:
+                            zero_prefixes = list(getattr(self, 'stage1_treat_zero_as_nan_prefixes', []) or [])
+                            min_nz = float(getattr(self, 'stage1_min_nonzero_ratio', 0.0) or 0.0)
+                            if zero_prefixes:
+                                nz_items = []
+                                total_rows = int(len(sample_pdf))
+                                for c in list(sample_pdf.columns):
+                                    if c == target:
+                                        continue
+                                    if any(str(c).startswith(p) for p in zero_prefixes):
+                                        try:
+                                            vals = sample_pdf[c]
+                                            nz_mask = (vals != 0) & np.isfinite(vals)
+                                            nz = int(nz_mask.sum())
+                                            ratio = (nz / max(1, total_rows)) if total_rows > 0 else 0.0
+                                            if nz < len(vals):
+                                                # Treat zeros as NaN to avoid artificial variance/coverage
+                                                sample_pdf.loc[~nz_mask, c] = np.nan
+                                            nz_items.append({'feature': c, 'nonzero': int(nz), 'ratio': float(ratio)})
+                                        except Exception:
+                                            pass
+                                # Persist diagnostic
+                                try:
+                                    if bool(getattr(self, 'debug_write_artifacts', True)) and nz_items:
+                                        from pathlib import Path
+                                        import json as _json
+                                        out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                        subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                        ccy = None
+                                        try:
+                                            ccy = self._mt_currency_pair(df)
+                                        except Exception:
+                                            ccy = None
+                                        out_dir = (out_root / ccy / subdir / 'stage1' / target) if ccy else (out_root / subdir / 'stage1' / target)
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        with open(out_dir / 'zero_treated.json', 'w') as f:
+                                            _json.dump({'items': nz_items}, f, indent=2)
+                                        self._log_info("Stage 1 zero-as-NaN applied", affected=len(nz_items))
+                                except Exception:
+                                    pass
+                                # Optional: drop columns below minimal non-zero ratio preemptively
+                                if min_nz > 0.0:
+                                    try:
+                                        bad = [it['feature'] for it in nz_items if float(it['ratio']) < min_nz]
+                                        if bad:
+                                            prev = len(candidates)
+                                            candidates = [f for f in candidates if f not in set(bad)]
+                                            self._log_info("Stage 1 nonzero ratio gating", removed=len(bad), threshold=min_nz, before=prev, after=len(candidates))
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                         # Initialize exclusion counters for final summary
                         excl_counts = {
                             'low_coverage': 0,
@@ -3373,29 +3862,142 @@ class StatisticalTests(BaseFeatureEngine):
                         try:
                             total_rows = int(len(sample_pdf))
                             min_cov = float(getattr(self, 'stage1_min_coverage_ratio', 0.30))
+                            try:
+                                min_cov_drv = float(getattr(self, 'stage1_min_coverage_ratio_driver', min_cov))
+                            except Exception:
+                                min_cov_drv = min_cov
                             min_var = float(getattr(self, 'stage1_min_variance', 1e-12))
                             min_uniq = int(getattr(self, 'stage1_min_unique_values', 2))
                             tmask = np.isfinite(sample_pdf[target].to_numpy())
-                            F = sample_pdf[candidates]
-                            fmask = np.isfinite(F.to_numpy())
-                            valid_pairs = (fmask & tmask[:, None]).sum(axis=0)
-                            var_f = np.nanvar(F.to_numpy(), axis=0)
-                            # approximate unique counts using pandas nunique
-                            nunique = F.apply(lambda s: s.dropna().nunique(), axis=0).to_numpy()
+                            # Session-aware coverage per feature
+                            try:
+                                prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                            except Exception:
+                                prefix_map = {}
+                            # Precompute driver masks (open) per driver key in pandas
+                            driver_masks = {}
+                            try:
+                                ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                            except Exception:
+                                ofm = {}
+                            def _driver_mask(drv: str):
+                                if drv in driver_masks:
+                                    return driver_masks[drv]
+                                # try open flag
+                                col = None
+                                raw = ofm.get(drv)
+                                cand_cols = []
+                                if isinstance(raw, str):
+                                    cand_cols = [raw]
+                                elif isinstance(raw, list):
+                                    cand_cols = [str(x) for x in raw]
+                                else:
+                                    cand_cols = [f"is_{drv}_open"]
+                                for cc in cand_cols:
+                                    if cc in sample_pdf.columns:
+                                        col = cc
+                                        break
+                                if col is not None:
+                                    try:
+                                        m = sample_pdf[col].astype('bool')
+                                    except Exception:
+                                        m = (sample_pdf[col] != 0)
+                                    driver_masks[drv] = m
+                                    return m
+                                # fallback schedule
+                                try:
+                                    sessions_cfg = getattr(self.settings.features, 'sessions', None)
+                                    drv_cfg = sessions_cfg.get('drivers', {}).get(drv, {}) if isinstance(sessions_cfg, dict) else {}
+                                except Exception:
+                                    drv_cfg = {}
+                                if 'timestamp' not in sample_pdf.columns or not drv_cfg:
+                                    m = None
+                                else:
+                                    ts = sample_pdf['timestamp']
+                                    try:
+                                        wday = ts.dt.weekday
+                                        minute = ts.dt.hour * 60 + ts.dt.minute
+                                    except Exception:
+                                        m = None
+                                    else:
+                                        weekmask = set(drv_cfg.get('weekmask', [0,1,2,3,4]))
+                                        open_windows = drv_cfg.get('open_windows', {}) or {}
+                                        def _wins_for(d):
+                                            if isinstance(open_windows, dict):
+                                                return open_windows.get(str(d), []) or open_windows.get(d, []) or []
+                                            if isinstance(open_windows, list) and 0 <= d < len(open_windows):
+                                                return open_windows[d] or []
+                                            return []
+                                        try:
+                                            m_w = wday.isin(list(weekmask))
+                                        except Exception:
+                                            m = None
+                                        else:
+                                            time_ok = None
+                                            for d in range(7):
+                                                wins = _wins_for(d)
+                                                if not wins:
+                                                    continue
+                                                sel = (wday == d)
+                                                if not sel.any():
+                                                    continue
+                                                min_d = minute.where(sel, -1)
+                                                ok_d = None
+                                                for w in wins:
+                                                    try:
+                                                        s,e = int(w[0]), int(w[1])
+                                                    except Exception:
+                                                        continue
+                                                    ok = (min_d >= s) & (min_d < e)
+                                                    ok_d = ok if ok_d is None else (ok_d | ok)
+                                                time_ok = ok_d if time_ok is None else (time_ok | ok_d)
+                                            m = (m_w & time_ok) if time_ok is not None else None
+                                driver_masks[drv] = m
+                                return m
                             keep_idx = []
                             cov_excl = []
                             var_excl = []
                             uniq_excl = []
                             for i, f in enumerate(candidates):
-                                ratio = float(valid_pairs[i]) / max(1, total_rows)
-                                if ratio < min_cov:
-                                    cov_excl.append((f, int(valid_pairs[i]), ratio))
+                                drv = driver_for_feature(f, prefix_map) if prefix_map else None
+                                m_open = _driver_mask(drv) if drv else None
+                                # coverage ratio computed within open mask (if any)
+                                try:
+                                    fvals = sample_pdf[f].to_numpy()
+                                except Exception:
+                                    fvals = sample_pdf[f]
+                                if m_open is not None:
+                                    # make boolean numpy mask aligned with data
+                                    try:
+                                        m_arr = m_open.to_numpy(dtype=bool)
+                                    except Exception:
+                                        m_arr = np.asarray(m_open, dtype=bool)
+                                    denom = int(np.sum((tmask) & m_arr))
+                                    num = int(np.sum(np.isfinite(fvals) & tmask & m_arr))
+                                else:
+                                    denom = int(np.sum(tmask))
+                                    num = int(np.sum(np.isfinite(fvals) & tmask))
+                                ratio = (float(num) / max(1, float(denom))) if denom > 0 else 0.0
+                                thr = float(min_cov_drv if drv else min_cov)
+                                if ratio < thr:
+                                    cov_excl.append((f, int(num), ratio))
                                     continue
-                                if float(var_f[i]) <= min_var:
-                                    var_excl.append((f, float(var_f[i])))
+                                # variance and unique computed on open subset
+                                try:
+                                    if m_open is not None:
+                                        sel = sample_pdf.loc[m_open, f]
+                                    else:
+                                        sel = sample_pdf[f]
+                                    v = float(sel.var(skipna=True))
+                                    u = int(sel.dropna().nunique())
+                                except Exception:
+                                    v = float('nan')
+                                    u = 0
+                                if not np.isfinite(v) or v <= float(min_var):
+                                    var_excl.append((f, v))
                                     continue
-                                if int(nunique[i]) < min_uniq:
-                                    uniq_excl.append((f, int(nunique[i])))
+                                if u < int(min_uniq):
+                                    uniq_excl.append((f, u))
                                     continue
                                 keep_idx.append(i)
                             if keep_idx and len(keep_idx) < len(candidates):
@@ -3415,6 +4017,19 @@ class StatisticalTests(BaseFeatureEngine):
                                     low_variance=len(var_excl),
                                     low_unique=len(uniq_excl),
                                 )
+                                # Log explicit lists (capped) to help diagnose data issues
+                                try:
+                                    cov_names = [n for (n, _v, _r) in cov_excl]
+                                    var_names = [n for (n, _v) in var_excl]
+                                    uniq_names = [n for (n, _u) in uniq_excl]
+                                    if cov_names:
+                                        self._log_info("Stage 1 pre-gating low_coverage", features=cov_names)
+                                    if var_names:
+                                        self._log_info("Stage 1 pre-gating low_variance", features=var_names)
+                                    if uniq_names:
+                                        self._log_info("Stage 1 pre-gating low_unique", features=uniq_names)
+                                except Exception:
+                                    pass
                                 # Persist small artifact with reasons
                                 try:
                                     if bool(getattr(self, 'debug_write_artifacts', True)):
@@ -3431,9 +4046,9 @@ class StatisticalTests(BaseFeatureEngine):
                                         import json as _json
                                         with open(out_dir / 'pregate_exclusions.json', 'w') as f:
                                             _json.dump({
-                                                'low_coverage': [{'feature': n, 'valid_pairs': int(v), 'ratio': float(r)} for n, v, r in cov_excl[:50]],
-                                                'low_variance': [{'feature': n, 'variance': float(v)} for n, v in var_excl[:50]],
-                                                'low_unique': [{'feature': n, 'unique': int(u)} for n, u in uniq_excl[:50]],
+                                                'low_coverage': [{'feature': n, 'valid_pairs': int(v), 'ratio': float(r)} for n, v, r in cov_excl],
+                                                'low_variance': [{'feature': n, 'variance': float(v)} for n, v in var_excl],
+                                                'low_unique': [{'feature': n, 'unique': int(u)} for n, u in uniq_excl],
                                             }, f, indent=2)
                                         self._record_artifact('stage1', str(out_dir / 'pregate_exclusions.json'), kind='json')
                                 except Exception:
@@ -3454,6 +4069,11 @@ class StatisticalTests(BaseFeatureEngine):
                             except Exception:
                                 sp = sample_pdf
                             # Rolling scores (if enabled): distribute feature chunks
+                            # Identify currency pair for task naming (best effort)
+                            try:
+                                ccy = self._mt_currency_pair(df) or "pair"
+                            except Exception:
+                                ccy = "pair"
                             if self.stage1_rolling_enabled:
                                 w = int(self.stage1_rolling_window)  # Tamanho da janela rolling
                                 st = int(self.stage1_rolling_step)  # Passo entre janelas
@@ -3473,12 +4093,12 @@ class StatisticalTests(BaseFeatureEngine):
                                     except Exception:
                                         prefix_map = {}
                                     target_worker = workers_list[i % len(workers_list)] if workers_list else None
-                                    futs.append(self.client.submit(
-                                        _dask_dcor_rolling_chunk_task,
-                                        sp,
-                                        target,
-                                        feats,
-                                        w,
+                                futs.append(self.client.submit(
+                                    _dask_dcor_rolling_chunk_task,
+                                    sp,
+                                    target,
+                                    feats,
+                                    w,
                                         st,
                                         mp,
                                         mvp,
@@ -3487,12 +4107,14 @@ class StatisticalTests(BaseFeatureEngine):
                                         ag,
                                         int(self.dcor_max_samples),
                                         int(tile),
-                                        getattr(self.settings.features, 'sessions', None),
-                                        prefix_map,
-                                        'timestamp',
-                                        getattr(self.settings.features, 'session_auto_mask', None),
-                                        workers=target_worker,
-                                    ))
+                                    getattr(self.settings.features, 'sessions', None),
+                                    prefix_map,
+                                    'timestamp',
+                                    getattr(self.settings.features, 'session_auto_mask', None),
+                                    getattr(self.settings.features.sessions, 'open_flag_map', None),
+                                    workers=target_worker,
+                                    key=f"s1-rolling-{ccy}-{i:03d}-{len(feats)}",
+                                ))
                                 parts = self.client.gather(futs) if futs else []  # Coleta resultados de todos os workers
                                 roll_counts = {}
                                 for part in parts:
@@ -3520,6 +4142,30 @@ class StatisticalTests(BaseFeatureEngine):
                                         except Exception:
                                             pass
                                         self._log_info("Stage 1 rolling gating", removed=len(removed), min_windows=int(min_win))
+                                        # Log sample of removed features for rolling criterion
+                                        try:
+                                            self._log_info("Stage 1 rolling gating removed", features=removed)
+                                        except Exception:
+                                            pass
+                                        # Persist artifact with removed (capped)
+                                        try:
+                                            if bool(getattr(self, 'debug_write_artifacts', True)):
+                                                from pathlib import Path
+                                                import json as _json
+                                                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                                subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                                ccy = None
+                                                try:
+                                                    ccy = self._mt_currency_pair(df)
+                                                except Exception:
+                                                    ccy = None
+                                                out_dir = (out_root / ccy / subdir / 'stage1' / target) if ccy else (out_root / subdir / 'stage1' / target)
+                                                out_dir.mkdir(parents=True, exist_ok=True)
+                                                with open(out_dir / 'rolling_removed.json', 'w') as f:
+                                                    _json.dump({'min_windows': int(min_win), 'removed': removed}, f, indent=2)
+                                                self._record_artifact('stage1', str(out_dir / 'rolling_removed.json'), kind='json')
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     pass
 
@@ -3530,36 +4176,132 @@ class StatisticalTests(BaseFeatureEngine):
                                     row_brd.update({k: v for k, v in list(roll_counts.items())[:min(10, len(roll_counts))]})
                                     df = self._broadcast_scalars(df, row_brd)
                             # Global dCor per feature - Calcula dCor para toda a série temporal
-                            chunks = np.array_split(np.array(candidates, dtype=object), n_workers)  # Divide features em chunks
                             futs = []
-                            for i, arr in enumerate(chunks):
-                                feats = [str(x) for x in arr.tolist()]  # Lista de features para este chunk
-                                if not feats:
-                                    continue
-                                try:
-                                    prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
-                                except Exception:
-                                    prefix_map = {}
-                                target_worker = workers_list[i % len(workers_list)] if workers_list else None
-                                futs.append(self.client.submit(
-                                    _dask_dcor_chunk_task,
-                                    sp,
-                                    target,
-                                    feats,
-                                    int(self.dcor_max_samples),
-                                    int(tile),
-                                    getattr(self.settings.features, 'sessions', None),
-                                    prefix_map,
-                                    'timestamp',
-                                    getattr(self.settings.features, 'session_auto_mask', None),
-                                    workers=target_worker,
-                                ))
+                            try:
+                                from dask import annotate as _annotate, config as _dask_config
+                            except Exception:
+                                def _annotate(**kwargs):
+                                    from contextlib import contextmanager
+                                    @contextmanager
+                                    def _noop():
+                                        yield
+                                    return _noop()
+                                class _dask_config:  # type: ignore
+                                    @staticmethod
+                                    def set(*args, **kwargs):
+                                        from contextlib import contextmanager
+                                        @contextmanager
+                                        def _noop():
+                                            yield
+                                        return _noop()
+                            if bool(getattr(self, 'stage1_dashboard_per_feature', False)):
+                                # Submit one task per feature for detailed dashboard visibility
+                                for j, f in enumerate(candidates):
+                                    feats = [str(f)]
+                                    try:
+                                        prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                                    except Exception:
+                                        prefix_map = {}
+                                    target_worker = workers_list[j % len(workers_list)] if workers_list else None
+                                    key = f"s1-dcor-{ccy}-{feats[0]}"
+                                    with _annotate(task_key_name=key), _dask_config.set({"optimization.fuse.active": False, "dataframe.query-planning": False}):
+                                        futs.append(self.client.submit(
+                                            _dask_dcor_chunk_task,
+                                            sp,
+                                            target,
+                                            feats,
+                                            int(self.dcor_max_samples),
+                                            int(tile),
+                                            getattr(self.settings.features, 'sessions', None),
+                                            prefix_map,
+                                            'timestamp',
+                                            getattr(self.settings.features, 'session_auto_mask', None),
+                                            getattr(self.settings.features.sessions, 'open_flag_map', None),
+                                            workers=target_worker,
+                                            key=key,
+                                        ))
+                            else:
+                                # Chunked submission (default)
+                                chunks = np.array_split(np.array(candidates, dtype=object), n_workers)
+                                for i, arr in enumerate(chunks):
+                                    feats = [str(x) for x in arr.tolist()]
+                                    if not feats:
+                                        continue
+                                    try:
+                                        prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {}))
+                                    except Exception:
+                                        prefix_map = {}
+                                    target_worker = workers_list[i % len(workers_list)] if workers_list else None
+                                    key = f"s1-dcor-{ccy}-{i:03d}-{len(feats)}"
+                                    with _annotate(task_key_name=key), _dask_config.set({"optimization.fuse.active": False, "dataframe.query-planning": False}):
+                                        futs.append(self.client.submit(
+                                            _dask_dcor_chunk_task,
+                                            sp,
+                                            target,
+                                            feats,
+                                            int(self.dcor_max_samples),
+                                            int(tile),
+                                            getattr(self.settings.features, 'sessions', None),
+                                            prefix_map,
+                                            'timestamp',
+                                            getattr(self.settings.features, 'session_auto_mask', None),
+                                            getattr(self.settings.features.sessions, 'open_flag_map', None),
+                                            workers=target_worker,
+                                            key=key,
+                                        ))
                             results = self.client.gather(futs) if futs else []
+                            # Optional: persist worker assignment map for dashboard/debug
+                            try:
+                                if futs and bool(getattr(self, 'stage1_dashboard_per_feature', False)) and self.client is not None:
+                                    who = self.client.who_has(futs)
+                                    # who is dict[key] -> list of worker addresses
+                                    assign = {str(getattr(f, 'key', f"k{i}")): list(map(str, who.get(getattr(f, 'key', ''), []))) for i, f in enumerate(futs)}
+                                    # Persist small artifact
+                                    if bool(getattr(self, 'debug_write_artifacts', True)):
+                                        from pathlib import Path as _Path
+                                        import json as _json
+                                        out_root = _Path(getattr(self.settings.output, 'output_path', './output'))
+                                        subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                        ccy = None
+                                        try:
+                                            ccy = self._mt_currency_pair(df)
+                                        except Exception:
+                                            ccy = None
+                                        out_dir = (out_root / ccy / subdir / 'stage1') if ccy else (out_root / subdir / 'stage1')
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        with open(out_dir / 'dcor_worker_assignment.json', 'w') as f:
+                                            _json.dump(assign, f, indent=2)
+                                    # Log small sample
+                                    try:
+                                        items = list(assign.items())[:10]
+                                        self._log_info("Stage 1 worker assignment (sample)", items=items)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             for part in results:
                                 all_scores.update({k: float(v) for k, v in part.items() if v == v})
                         else:
                             # Single-GPU fallback on driver - Quando não há cluster Dask disponível
                             gdf = cudf.from_pandas(sample_pdf)  # Converte pandas para cuDF (GPU)
+                            # Apply session masks prior to dCor calculation
+                            try:
+                                sessions_cfg = getattr(self.settings.features, 'sessions', None)
+                                prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {})) if sessions_cfg else {}
+                                from .session_mask import build_driver_masks_from_df, driver_for_feature
+                                drivers = list({driver_for_feature(f, prefix_map) for f in candidates if driver_for_feature(f, prefix_map)}) if prefix_map else []
+                                if drivers:
+                                    masks = build_driver_masks_from_df(gdf, 'timestamp', sessions_cfg.get('drivers', {}) if sessions_cfg else {}, drivers,
+                                                                       open_flag_map=getattr(self.settings.features.sessions, 'open_flag_map', None))
+                                    for f in candidates:
+                                        drv = driver_for_feature(f, prefix_map) if prefix_map else None
+                                        if drv and drv in masks:
+                                            try:
+                                                gdf[f] = gdf[f].where(masks[drv], np.nan)
+                                            except Exception:
+                                                pass
+                            except Exception:
+                                pass
                             res_df = _dcor_partition_gpu(gdf, target, candidates, int(self.dcor_max_samples), int(tile))  # Calcula dCor em GPU
                             row_b = res_df.to_pandas().iloc[0].to_dict()  # Converte resultado para dicionário
                             all_scores = {c: float(row_b.get(f"dcor_{c}", float('nan'))) for c in candidates}  # Extrai scores dCor por feature
@@ -3614,6 +4356,30 @@ class StatisticalTests(BaseFeatureEngine):
                             except Exception:
                                 pass
                             self._log_info("Stage 1 NaN score report", nan=int(cov_summary['nan_count']), total=int(cov_summary['total_candidates']), worst=cov_summary['worst_coverage'])
+                            # Log sample of NaN-scored features to understand patterns
+                            try:
+                                self._log_info("Stage 1 NaN-scored features", features=nan_feats)
+                            except Exception:
+                                pass
+                            # Persist explicit NaN features list (capped)
+                            try:
+                                if bool(getattr(self, 'debug_write_artifacts', True)):
+                                    from pathlib import Path
+                                    import json as _json
+                                    out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                    subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                    ccy = None
+                                    try:
+                                        ccy = self._mt_currency_pair(df)
+                                    except Exception:
+                                        ccy = None
+                                    out_dir = (out_root / ccy / subdir / 'stage1' / target) if ccy else (out_root / subdir / 'stage1' / target)
+                                    out_dir.mkdir(parents=True, exist_ok=True)
+                                    with open(out_dir / 'nan_features.json', 'w') as f:
+                                        _json.dump({'features': nan_feats}, f, indent=2)
+                                    self._record_artifact('stage1', str(out_dir / 'nan_features.json'), kind='json')
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
@@ -3758,7 +4524,29 @@ class StatisticalTests(BaseFeatureEngine):
                             # Sample small block for CPU computations
                             import cudf as _cudf
                             max_rows = int(getattr(self, 'selection_max_rows', 100000))
-                            sub = df[[target] + retained]
+                            # Include timestamp and open-flag columns to allow masking
+                            extras = []
+                            try:
+                                extras.append('timestamp')
+                            except Exception:
+                                pass
+                            try:
+                                ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                                extra_flags: List[str] = []
+                                for _k, _v in ofm.items():
+                                    if isinstance(_v, str):
+                                        extra_flags.append(str(_v))
+                                    elif isinstance(_v, list):
+                                        extra_flags.extend([str(x) for x in _v])
+                                extras.extend([c for c in extra_flags if c in df.columns])
+                            except Exception:
+                                pass
+                            if 'timestamp' in extras and 'timestamp' not in df.columns:
+                                try:
+                                    extras.remove('timestamp')
+                                except Exception:
+                                    pass
+                            sub = df[(extras + [target] + retained)]
                             sample_pdf = None
                             try:
                                 if hasattr(sub, 'map_partitions'):
@@ -3966,20 +4754,21 @@ class StatisticalTests(BaseFeatureEngine):
                                     except Exception:
                                         prefix_map = {}
                                     target_worker = workers_list[i % len(workers_list)] if workers_list else None
-                                    futs.append(self.client.submit(
-                                        _dask_perm_chunk_task,
-                                        sp_perm,
-                                        target,
-                                        feats,
-                                        int(self.dcor_permutations),
-                                        int(self.dcor_max_samples),
-                                        int(tile),
-                                        getattr(self.settings.features, 'sessions', None),
-                                        prefix_map,
-                                        'timestamp',
-                                        getattr(self.settings.features, 'session_auto_mask', None),
-                                        workers=target_worker,
-                                    ))
+                                futs.append(self.client.submit(
+                                    _dask_perm_chunk_task,
+                                    sp_perm,
+                                    target,
+                                    feats,
+                                    int(self.dcor_permutations),
+                                    int(self.dcor_max_samples),
+                                    int(tile),
+                                    getattr(self.settings.features, 'sessions', None),
+                                    prefix_map,
+                                    'timestamp',
+                                    getattr(self.settings.features, 'session_auto_mask', None),
+                                    getattr(self.settings.features.sessions, 'open_flag_map', None),
+                                    workers=target_worker,
+                                ))
                                 parts = self.client.gather(futs) if futs else []
                                 # Build a single-row DataFrame from dicts
                                 merged = {}
@@ -3990,7 +4779,48 @@ class StatisticalTests(BaseFeatureEngine):
                             else:
                                 # Single-GPU fallback
                                 import cudf as _cudf
-                                gdf = _cudf.from_pandas(sample_pdf[[target] + perm_top]) if sample_pdf is not None else df[[target] + perm_top].head(int(self.selection_max_rows)).compute()
+                                # Include timestamp and open-flag columns to allow masking before permutation
+                                extras = []
+                                try:
+                                    extras.append('timestamp')
+                                except Exception:
+                                    pass
+                                try:
+                                    ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                                    extra_flags: List[str] = []
+                                    for _k, _v in ofm.items():
+                                        if isinstance(_v, str):
+                                            extra_flags.append(str(_v))
+                                        elif isinstance(_v, list):
+                                            extra_flags.extend([str(x) for x in _v])
+                                    extras.extend([c for c in extra_flags if (sample_pdf is not None and c in sample_pdf.columns) or (c in df.columns)])
+                                except Exception:
+                                    pass
+                                # Build cuDF sample
+                                if sample_pdf is not None:
+                                    cols = [c for c in (extras + [target] + perm_top) if c in sample_pdf.columns]
+                                    gdf = _cudf.from_pandas(sample_pdf[cols])
+                                else:
+                                    cols = [c for c in (extras + [target] + perm_top) if c in df.columns]
+                                    gdf = df[cols].tail(int(self.selection_max_rows)).compute()
+                                # Apply session masks
+                                try:
+                                    sessions_cfg = getattr(self.settings.features, 'sessions', None)
+                                    prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {})) if sessions_cfg else {}
+                                    from .session_mask import build_driver_masks_from_df, driver_for_feature
+                                    drivers = list({driver_for_feature(f, prefix_map) for f in perm_top if driver_for_feature(f, prefix_map)}) if prefix_map else []
+                                    if drivers:
+                                        masks = build_driver_masks_from_df(gdf, 'timestamp', sessions_cfg.get('drivers', {}) if sessions_cfg else {}, drivers,
+                                                                           open_flag_map=getattr(self.settings.features.sessions, 'open_flag_map', None))
+                                        for f in perm_top:
+                                            drv = driver_for_feature(f, prefix_map) if prefix_map else None
+                                            if drv and drv in masks:
+                                                try:
+                                                    gdf[f] = gdf[f].where(masks[drv], np.nan)
+                                                except Exception:
+                                                    pass
+                                except Exception:
+                                    pass
                                 perm_result = _perm_pvalues_partition_gpu(gdf, target, perm_top, int(self.dcor_permutations), int(self.dcor_max_samples), int(tile))
                                 perm_pdf = perm_result.to_pandas()
                             try:
@@ -4063,21 +4893,123 @@ class StatisticalTests(BaseFeatureEngine):
                         except Exception:
                             pass
 
-                        # Bring target+features to single GPU partition and take a bounded head (all on GPU)
-                        sub = self._single_partition(df[[target] + retained])
+                        # Bring target+features (+timestamp/open-flags) to single GPU partition and take a bounded head (all on GPU)
+                        extras = []
                         try:
-                            if hasattr(sub, 'head'):
-                                sample_cudf = sub.head(max_rows)
+                            extras.append('timestamp')
+                        except Exception:
+                            pass
+                        try:
+                            ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                            extra_flags: List[str] = []
+                            for _k, _v in ofm.items():
+                                if isinstance(_v, str):
+                                    extra_flags.append(str(_v))
+                                elif isinstance(_v, list):
+                                    extra_flags.extend([str(x) for x in _v])
+                            extras.extend([c for c in extra_flags if c in df.columns])
+                        except Exception:
+                            pass
+                        if 'timestamp' in extras and 'timestamp' not in df.columns:
+                            try:
+                                extras.remove('timestamp')
+                            except Exception:
+                                pass
+                        sub = self._single_partition(df[(extras + [target] + retained)])
+                        try:
+                            if hasattr(sub, 'tail'):
+                                sample_cudf = sub.tail(max_rows)
                                 if hasattr(sample_cudf, 'compute'):
                                     sample_cudf = sample_cudf.compute()
                             else:
-                                sample_cudf = df[[target] + retained].head(max_rows)
+                                sample_cudf = df[[target] + retained].tail(max_rows)
                         except Exception as _e_head:
                             self._critical_error(f"Stage 2 GPU sampling failed: {_e_head}")
 
-                        # Drop rows with any NaNs in selected columns (GPU)
+                        # Apply per-driver session masks to features and then drop closed rows
+                        driver_features = []
                         try:
-                            sample_cudf = sample_cudf.dropna()
+                            sessions_cfg = getattr(self.settings.features, 'sessions', None)
+                            prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {})) if sessions_cfg else {}
+                            from .session_mask import build_driver_masks_from_df, driver_for_feature
+                            drivers = list({driver_for_feature(f, prefix_map) for f in retained if driver_for_feature(f, prefix_map)}) if prefix_map else []
+                            if drivers:
+                                masks = build_driver_masks_from_df(sample_cudf, 'timestamp', sessions_cfg.get('drivers', {}) if sessions_cfg else {}, drivers,
+                                                                   open_flag_map=getattr(self.settings.features.sessions, 'open_flag_map', None))
+                                for f in retained:
+                                    drv = driver_for_feature(f, prefix_map) if prefix_map else None
+                                    if drv and drv in masks:
+                                        try:
+                                            sample_cudf[f] = sample_cudf[f].where(masks[drv], np.nan)
+                                            driver_features.append(f)  # Track which features were masked
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                        # Drop rows with NaNs only in driver-dependent features (not all features)
+                        try:
+                            if driver_features:
+                                before_rows = int(len(sample_cudf))
+                                sample_cudf = sample_cudf.dropna(subset=driver_features)
+                                after_rows = int(len(sample_cudf))
+                                self._log_info("Stage 2 driver-row filter", before=before_rows, after=after_rows, driver_features=len(driver_features))
+                            # If no driver features were masked, keep all rows (no dropna needed)
+                        except Exception:
+                            pass
+
+                        # Optional: impute NaNs only in non-driver features prior to VIF/MI
+                        try:
+                            feats_impute = [f for f in retained if f not in set(driver_features)]
+                            if feats_impute:
+                                cfg_imp = getattr(self.settings.features, 'impute_non_driver_nans', {}) or {}
+                                enabled = bool(cfg_imp.get('enabled', False)) if isinstance(cfg_imp, dict) else False
+                                if enabled:
+                                    method = str(cfg_imp.get('method', 'median')).lower() if isinstance(cfg_imp, dict) else 'median'
+                                    limit = int(cfg_imp.get('limit_ffill', 0)) if isinstance(cfg_imp, dict) else 0
+                                    if method in ('ffill', 'ffill_bfill', 'bfill'):
+                                        for c in feats_impute:
+                                            try:
+                                                s = sample_cudf[c]
+                                                if method in ('ffill', 'ffill_bfill'):
+                                                    s = s.fillna(method='ffill', limit=(None if limit <= 0 else limit))
+                                                if method in ('bfill', 'ffill_bfill'):
+                                                    s = s.fillna(method='bfill', limit=(None if limit <= 0 else limit))
+                                                sample_cudf[c] = s
+                                            except Exception:
+                                                pass
+                                        self._log_info("Stage 2 imputed non-driver (ffill/bfill)", method=method, features=len(feats_impute))
+                                    else:
+                                        # default: median per column
+                                        for c in feats_impute:
+                                            try:
+                                                med = sample_cudf[c].median()
+                                                if med == med:  # not NaN
+                                                    sample_cudf[c] = sample_cudf[c].fillna(med)
+                                            except Exception:
+                                                pass
+                                        self._log_info("Stage 2 imputed non-driver (median)", features=len(feats_impute))
+                        except Exception:
+                            pass
+
+                        # Optional: drop non-driver columns with missing ratio above threshold
+                        try:
+                            cfg_drop = getattr(self.settings.features, 'drop_non_driver_columns_with_missing', {}) or {}
+                            enabled = bool(cfg_drop.get('enabled', False)) if isinstance(cfg_drop, dict) else False
+                            if enabled:
+                                thr = float(cfg_drop.get('max_missing_ratio', 0.5)) if isinstance(cfg_drop, dict) else 0.5
+                                drop_cols = []
+                                for c in [f for f in retained if f not in set(driver_features)]:
+                                    try:
+                                        miss = float(sample_cudf[c].isna().mean())
+                                        if miss > thr:
+                                            drop_cols.append(c)
+                                    except Exception:
+                                        pass
+                                if drop_cols:
+                                    before = len(retained)
+                                    sample_cudf = sample_cudf.drop(columns=drop_cols, errors='ignore')
+                                    retained = [f for f in retained if f not in set(drop_cols)]
+                                    self._log_info("Stage 2 drop non-driver cols with missing", dropped=len(drop_cols), threshold=thr, retained_after=len(retained), retained_before=before)
                         except Exception:
                             pass
 
@@ -4110,6 +5042,25 @@ class StatisticalTests(BaseFeatureEngine):
                             vif_keep = self._compute_vif_iterative_gpu(X_mat, retained, threshold=float(self.vif_threshold))
                             t_vif_elapsed = _t.time()-t_vif
                             self._log_info("Stage 2 VIF done (GPU)", kept=len(vif_keep), elapsed=f"{t_vif_elapsed:.2f}s")
+                            # Persist Stage 2 VIF artifact (kept/dropped)
+                            try:
+                                from pathlib import Path
+                                import json as _json
+                                ccy = None
+                                try:
+                                    ccy = self._mt_currency_pair(df)
+                                except Exception:
+                                    ccy = None
+                                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                out_dir = (out_root / ccy / subdir / 'stage2' / target) if ccy else (out_root / subdir / 'stage2' / target)
+                                out_dir.mkdir(parents=True, exist_ok=True)
+                                dropped_vif = [f for f in retained if f not in set(vif_keep)]
+                                with open(out_dir / 'vif.json', 'w') as f:
+                                    _json.dump({ 'kept': vif_keep, 'dropped': dropped_vif, 'threshold': float(self.vif_threshold) }, f, indent=2)
+                                self._record_artifact('stage2', str(out_dir / 'vif.json'), kind='json')
+                            except Exception:
+                                pass
 
                             # MI redundancy (GPU)
                             t_mi = _t.time()
@@ -4126,6 +5077,25 @@ class StatisticalTests(BaseFeatureEngine):
                             t_mi_elapsed = _t.time()-t_mi
                             t_s2_total = _t.time()-t0
                             self._log_info("Stage 2 MI done (GPU)", kept=len(mi_keep), elapsed=f"{t_mi_elapsed:.2f}s", total_elapsed=f"{t_s2_total:.2f}s")
+                            # Persist Stage 2 MI artifact (kept/dropped)
+                            try:
+                                from pathlib import Path
+                                import json as _json
+                                ccy = None
+                                try:
+                                    ccy = self._mt_currency_pair(df)
+                                except Exception:
+                                    ccy = None
+                                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                out_dir = (out_root / ccy / subdir / 'stage2' / target) if ccy else (out_root / subdir / 'stage2' / target)
+                                out_dir.mkdir(parents=True, exist_ok=True)
+                                dropped_mi = [f for f in vif_keep if f not in set(mi_keep)]
+                                with open(out_dir / 'mi.json', 'w') as f:
+                                    _json.dump({ 'kept': mi_keep, 'dropped': dropped_mi, 'threshold': float(self.mi_threshold) }, f, indent=2)
+                                self._record_artifact('stage2', str(out_dir / 'mi.json'), kind='json')
+                            except Exception:
+                                pass
 
                             # ---------- Stage 2.5: Dedup BK vs original (same base) ----------
                             try:
@@ -4175,6 +5145,24 @@ class StatisticalTests(BaseFeatureEngine):
                                 if pairs_considered > 0:
                                     self._log_info("Stage 2 BK dedup", pairs=pairs_considered, removed=len([r for r in removed_features if r is not None]))
                                     mi_keep = dedup_keep
+                                    # Persist dedup artifact
+                                    try:
+                                        from pathlib import Path
+                                        import json as _json
+                                        ccy = None
+                                        try:
+                                            ccy = self._mt_currency_pair(df)
+                                        except Exception:
+                                            ccy = None
+                                        out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                        subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                        out_dir = (out_root / ccy / subdir / 'stage2' / target) if ccy else (out_root / subdir / 'stage2' / target)
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        with open(out_dir / 'dedup.json', 'w') as f:
+                                            _json.dump({ 'removed': [r for r in removed_features if r], 'pairs_considered': int(pairs_considered), 'kept_after_dedup': mi_keep }, f, indent=2)
+                                        self._record_artifact('stage2', str(out_dir / 'dedup.json'), kind='json')
+                                    except Exception:
+                                        pass
                             except Exception as _e_dedup:
                                 self._log_warn("Stage 2 BK dedup skipped", error=str(_e_dedup))
 
@@ -4192,15 +5180,64 @@ class StatisticalTests(BaseFeatureEngine):
                             try:
                                 max_rows_s3 = int(min(getattr(self, 'selection_max_rows', 100000), 4096))  # Limita amostra para Stage 3 (máx 4096 linhas)
                                 cols_s3 = [target] + (mi_keep if mi_keep else [])  # Colunas: target + features selecionadas do Stage 2
-                                sub3 = self._single_partition(df[cols_s3]) if cols_s3 else None  # Pega uma partição específica
+                                # Include timestamp and open-flag columns for masking
+                                extras = []
+                                try:
+                                    extras.append('timestamp')
+                                except Exception:
+                                    pass
+                                try:
+                                    ofm = dict(getattr(self.settings.features.sessions, 'open_flag_map', {}) or {})
+                                    extra_flags: List[str] = []
+                                    for _k, _v in ofm.items():
+                                        if isinstance(_v, str):
+                                            extra_flags.append(str(_v))
+                                        elif isinstance(_v, list):
+                                            extra_flags.extend([str(x) for x in _v])
+                                    extras.extend([c for c in extra_flags if c in df.columns])
+                                except Exception:
+                                    pass
+                                if 'timestamp' in extras and 'timestamp' not in df.columns:
+                                    try:
+                                        extras.remove('timestamp')
+                                    except Exception:
+                                        pass
+                                sub3 = self._single_partition(df[(extras + cols_s3)]) if cols_s3 else None  # Pega uma partição específica
                                 if sub3 is not None:
-                                    # Prefer a very small head to minimize device->host transfer
-                                    sample3 = sub3.head(max_rows_s3)  # Pega apenas as primeiras linhas para minimizar transferência GPU->CPU
+                                    # Prefer a very small tail to get most recent data and minimize device->host transfer
+                                    sample3 = sub3.tail(max_rows_s3)  # Pega apenas as últimas linhas (dados mais recentes) para minimizar transferência GPU->CPU
                                     if hasattr(sample3, 'compute'):
                                         sample3 = sample3.compute()  # Executa computação se for Dask
-                                    # Do not drop NaNs globally; ensure only y has finite values (LightGBM/XGB handle NaNs in X)
+                                    # Apply session masks on GPU sample prior to host conversion
+                                    driver_features_stage3 = []
+                                    try:
+                                        sessions_cfg = getattr(self.settings.features, 'sessions', None)
+                                        prefix_map = dict(getattr(self.settings.features.sessions, 'feature_prefix_map', {})) if sessions_cfg else {}
+                                        from .session_mask import build_driver_masks_from_df, driver_for_feature
+                                        drivers = list({driver_for_feature(f, prefix_map) for f in mi_keep if driver_for_feature(f, prefix_map)}) if (prefix_map and mi_keep) else []
+                                        if drivers:
+                                            masks = build_driver_masks_from_df(sample3, 'timestamp', sessions_cfg.get('drivers', {}) if sessions_cfg else {}, drivers,
+                                                                               open_flag_map=getattr(self.settings.features.sessions, 'open_flag_map', None))
+                                            for f in mi_keep:
+                                                drv = driver_for_feature(f, prefix_map) if prefix_map else None
+                                                if drv and drv in masks:
+                                                    try:
+                                                        sample3[f] = sample3[f].where(masks[drv], np.nan)
+                                                        driver_features_stage3.append(f)  # Track which features were masked
+                                                    except Exception:
+                                                        pass
+                                    except Exception:
+                                        pass
                                     pdf3 = sample3.to_pandas()  # Converte para pandas (CPU)
                                     if not pdf3.empty and mi_keep:
+                                        # Enforce sampling only on rows where driver-dependent features are open (not all features)
+                                        try:
+                                            if driver_features_stage3:
+                                                pdf3 = pdf3.dropna(subset=driver_features_stage3)
+                                            # If no driver features were masked, keep all rows (no dropna needed)
+                                        except Exception:
+                                            pass
+                                        # Ensure only y has finite values (keep robustness)
                                         y_mask = np.isfinite(pdf3[target].to_numpy())  # Máscara para valores finitos no target
                                         pdf3 = pdf3.loc[y_mask]  # Remove linhas com target NaN
                                         if not pdf3.empty:
@@ -4208,9 +5245,9 @@ class StatisticalTests(BaseFeatureEngine):
                                             y_s = pdf3[target]  # Target para treinar modelo
                             except Exception as _e_s3:
                                 self._log_warn("Stage 3 sampling failed; attempting with minimal sample", error=str(_e_s3))
-                                # Second attempt: try a single-row head
+                                # Second attempt: try a single-row tail (most recent)
                                 try:
-                                    one3 = df[[target] + mi_keep].head(1)
+                                    one3 = df[[target] + mi_keep].tail(1)
                                     if hasattr(one3, 'compute'):
                                         one3 = one3.compute()
                                     pdf1 = one3.to_pandas()
@@ -4278,6 +5315,55 @@ class StatisticalTests(BaseFeatureEngine):
                                 'selected_features': ','.join(final_sel),
                                 'selected_features_count': len(final_sel),
                             })
+
+                            # Persist consolidated feature timeline up to Stage 3
+                            try:
+                                from pathlib import Path
+                                import json as _json
+                                ccy = None
+                                try:
+                                    ccy = self._mt_currency_pair(df)
+                                except Exception:
+                                    ccy = None
+                                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                                subdir = str(getattr(self, 'artifacts_dir', 'artifacts'))
+                                out_dir = (out_root / ccy / subdir / 'timeline' / target) if ccy else (out_root / subdir / 'timeline' / target)
+                                out_dir.mkdir(parents=True, exist_ok=True)
+                                # Reconstruct drops by stage (best-effort)
+                                s1_retained = list(retained) if 'retained' in locals() else []
+                                s1_candidates = list(candidates)
+                                s1_dropped = [c for c in s1_candidates if c not in set(s1_retained)]
+                                s2_vif_kept = list(vif_keep) if 'vif_keep' in locals() else []
+                                s2_vif_dropped = [f for f in s1_retained if f not in set(s2_vif_kept)] if s1_retained else []
+                                s2_mi_kept = list(mi_keep) if 'mi_keep' in locals() else []
+                                s2_mi_dropped = [f for f in s2_vif_kept if f not in set(s2_mi_kept)] if s2_vif_kept else []
+                                s3_selected = list(final_sel) if 'final_sel' in locals() else []
+                                s3_dropped = [f for f in s2_mi_kept if f not in set(s3_selected)] if s2_mi_kept else []
+                                timeline = {
+                                    'stage1': {
+                                        'candidates': s1_candidates,
+                                        'retained': s1_retained,
+                                        'dropped': s1_dropped,
+                                    },
+                                    'stage2': {
+                                        'vif_kept': s2_vif_kept,
+                                        'vif_dropped': s2_vif_dropped,
+                                        'mi_kept': s2_mi_kept,
+                                        'mi_dropped': s2_mi_dropped,
+                                    },
+                                    'stage3': {
+                                        'selected': s3_selected,
+                                        'dropped': s3_dropped,
+                                    }
+                                }
+                                with open(out_dir / 'feature_timeline.json', 'w') as f:
+                                    _json.dump(timeline, f, indent=2)
+                                try:
+                                    self._record_artifact('timeline', str(out_dir / 'feature_timeline.json'), kind='json')
+                                except Exception:
+                                    pass
+                            except Exception as _e_tl:
+                                self._log_warn("Timeline persist failed", error=str(_e_tl))
 
                             # ---------- Stage 4: Stability Selection (optional) ----------
                             if bool(getattr(self, 'stage4_enabled', False)) and len(mi_keep) > 0 and len(final_sel) > 0:
@@ -4357,6 +5443,25 @@ class StatisticalTests(BaseFeatureEngine):
                                 self._record_metrics('selection', metrics)
                             except Exception:
                                 pass
+
+                            # Optional: add rolling correlations post Stage 1 using dCor (if enabled)
+                            try:
+                                use_post_rc = bool(getattr(self.settings.features, 'post_stage1_rolling_corr', False))
+                                mode_rc = str(getattr(self.settings.features, 'rolling_corr_pair_selection', 'first')).lower()
+                            except Exception:
+                                use_post_rc = False
+                                mode_rc = 'first'
+                            if use_post_rc and mode_rc == 'dcor':
+                                try:
+                                    # Choose dCor source consistent with selection phase
+                                    scores_src = dict(roll_scores) if (self.stage1_rolling_enabled and self.stage1_use_rolling_scores and roll_scores) else {k: float(v) for k, v in ((f, row.get(f"dcor_{f}", np.nan)) for f in candidates) if np.isfinite(v)}
+                                except Exception:
+                                    scores_src = {}
+                                if scores_src:
+                                    try:
+                                        df = self._add_post_stage1_rolling(df, scores_src)
+                                    except Exception as _e_post:
+                                        self._log_warn("Post-Stage1 rolling correlations failed", error=str(_e_post))
             else:
                 self._log_warn("Target column not found for dCor ranking", target=self.selection_target_column)
         except Exception as e:
@@ -4372,6 +5477,97 @@ class StatisticalTests(BaseFeatureEngine):
         return df
 
     # ---------------- Stage 4: Stability Selection ----------------
+    def _add_post_stage1_rolling(self, df, dcor_scores: Dict[str, float]):
+        """Add a limited set of rolling correlation features guided by Stage 1 dCor.
+
+        - Picks one representative per category using dCor scores.
+        - Builds up to 4 pairs across categories and uses first 2 windows from config.
+        """
+        try:
+            import dask_cudf as _dask_cudf
+            import cudf as _cudf
+            import numpy as _np
+            from itertools import product as _product
+            from .stationarization import _rolling_corr_simple_partition as _rc_part
+        except Exception:
+            return df
+
+        try:
+            available_columns = list(df.columns)
+        except Exception:
+            return df
+
+        price_features = [c for c in available_columns if any(t in str(c).lower() for t in ['close','open','high','low']) and str(c).startswith('y_')]
+        volume_features = [c for c in available_columns if any(t in str(c).lower() for t in ['volume','tick']) and str(c).startswith('y_')]
+        return_features = [c for c in available_columns if any(t in str(c).lower() for t in ['ret','return']) and str(c).startswith('y_')]
+        volatility_features = [c for c in available_columns if any(t in str(c).lower() for t in ['vol','rv','volatility']) and str(c).startswith('y_')]
+        spread_features = [c for c in available_columns if 'spread' in str(c).lower() and str(c).startswith('y_')]
+        ofi_features = [c for c in available_columns if 'ofi' in str(c).lower() and str(c).startswith('y_')]
+
+        def _pick_best(cands):
+            if not cands:
+                return None
+            best, best_score = None, -_np.inf
+            for c in cands:
+                s = dcor_scores.get(c, None)
+                if s is not None and s > best_score:
+                    best, best_score = c, s
+            return best or (cands[0] if cands else None)
+
+        r_best = _pick_best(return_features)
+        v_best = _pick_best(volume_features)
+        o_best = _pick_best(ofi_features)
+        s_best = _pick_best(spread_features)
+        vol_best = _pick_best(volatility_features)
+        p_best = _pick_best(price_features)
+
+        pairs = []
+        if r_best and v_best:
+            pairs.append((r_best, v_best))
+        if r_best and o_best:
+            pairs.append((r_best, o_best))
+        if s_best and vol_best:
+            pairs.append((s_best, vol_best))
+        if p_best and v_best:
+            pairs.append((p_best, v_best))
+        if r_best and s_best:
+            pairs.append((r_best, s_best))
+        if v_best and s_best:
+            pairs.append((v_best, s_best))
+
+        try:
+            windows = list(getattr(self.settings.features, 'rolling_windows', [20, 50, 100]))
+            min_periods = int(getattr(self.settings.features, 'rolling_min_periods', 1))
+        except Exception:
+            windows, min_periods = [20, 50], 1
+
+        max_pairs = 4
+        count = 0
+        for col1, col2 in pairs:
+            for w in windows[:2]:
+                new_col = f"rolling_corr_{col1}_{col2}_{w}w"
+                try:
+                    df[new_col] = df[[col1, col2]].map_partitions(
+                        _rc_part,
+                        col1,
+                        col2,
+                        int(w),
+                        int(min_periods),
+                        new_col,
+                        meta=_cudf.DataFrame({new_col: _cudf.Series([], dtype='f4')}),
+                    )[new_col]
+                    count += 1
+                    if count >= max_pairs:
+                        break
+                except Exception:
+                    pass
+            if count >= max_pairs:
+                break
+        try:
+            self._log_info("Post-Stage1 rolling correlations added", pairs_used=int(count))
+        except Exception:
+            pass
+        return df
     def _stage4_stability(self, df_dask, X_df, y_s, candidates: List[str], target: str) -> Dict[str, Any]:
         import numpy as _np
         from pathlib import Path

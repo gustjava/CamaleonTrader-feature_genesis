@@ -133,10 +133,57 @@ top
 netstat -tulpn
 
 # ====================================================================================
+# 9. COMANDOS PARA MONITORAMENTO DUAL (TMUX)
+# ====================================================================================
+
+# Executar pipeline com monitoramento dual (logs + dashboard)
+./run_pipeline_vast.sh
+
+# Monitorar logs do pipeline em tempo real
+tail -f /tmp/vast_pipeline_*.log
+
+# Ver logs de uma instância específica
+tail -f /tmp/vast_pipeline_12345.log
+
+# Ver últimas linhas dos logs
+tail -n 50 /tmp/vast_pipeline_*.log
+
+# Filtrar logs por tipo
+grep -E "(ERROR|WARN|INFO)" /tmp/vast_pipeline_*.log
+
+# Ver logs de erro apenas
+grep -E "ERROR" /tmp/vast_pipeline_*.log
+
+# Ver progresso do pipeline
+grep -E "(PROGRESS|STAGE|FEATURES)" /tmp/vast_pipeline_*.log
+
+# ====================================================================================
+# 10. COMANDOS PARA MONITORAMENTO AVANÇADO
+# ====================================================================================
+
+# Monitorar logs em tempo real (filtrado)
+tail -f /tmp/vast_pipeline_*.log | grep -E "(PROGRESS|STAGE|FEATURES|ALERTS)"
+
+# Monitorar apenas erros e alertas
+tail -f /tmp/vast_pipeline_*.log | grep -E "(ERROR|WARN|ALERT|CRITICAL)"
+
+# Monitorar evolução de features
+tail -f /tmp/vast_pipeline_*.log | grep -E "(features.*→|INPUT:|OUTPUT:)"
+
+# Monitorar performance
+tail -f /tmp/vast_pipeline_*.log | grep -E "(PERFORMANCE|GPU memory|RAM)"
+
+# Dashboard simples com watch
+watch -n 5 'echo "=== PIPELINE STATUS ==="; ps aux | grep orchestration/main.py | grep -v grep; echo ""; echo "=== ÚLTIMOS LOGS ==="; tail -5 /tmp/vast_pipeline_*.log 2>/dev/null || echo "Nenhum log encontrado"'
+
+# ====================================================================================
 # EXEMPLO DE FLUXO COMPLETO:
 # ====================================================================================
 # 1. vast ssh 25709061
 # 2. pkill -9 -f 'orchestration/main.py'
 # 3. ps aux | grep orchestration/main.py
-# 4. watch -n 1 'nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits'
+# 4. ./run_pipeline_vast.sh  (executa pipeline e salva logs)
+# 5. tail -f /tmp/vast_pipeline_*.log  (monitorar logs em outro terminal)
+# 6. ssh -L 8888:localhost:8888 user@host  (acessar dashboard remotamente)
+# 8. watch -n 1 'nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu,temperature.gpu --format=csv,noheader,nounits'
 # ====================================================================================

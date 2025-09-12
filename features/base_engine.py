@@ -658,3 +658,27 @@ class BaseFeatureEngine(ABC):
             'memory_usage': self.memory_usage,
             'engine_name': self.__class__.__name__
         }
+
+    # ---- Small helpers to extract context from Dask/cuDF DataFrames ----
+    def _mt_currency_pair(self, df) -> Optional[str]:
+        """Best-effort extraction of the currency pair identifier from a DataFrame.
+
+        Tries to read a small head() and fetch a 'currency_pair' column if present.
+        Returns None if not available.
+        """
+        try:
+            col = 'currency_pair'
+            if hasattr(df, 'columns') and (col in df.columns):
+                try:
+                    sample = df[[col]].head(1)
+                except Exception:
+                    sample = None
+                if sample is not None:
+                    if hasattr(sample, 'compute'):
+                        sample = sample.compute()
+                    if len(sample) > 0 and col in sample.columns:
+                        val = sample[col].iloc[0]
+                        return str(val)
+        except Exception:
+            pass
+        return None

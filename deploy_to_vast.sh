@@ -143,6 +143,52 @@ echo "✅ Túnel SSH persistente criado (PID: $TUNNEL_PID)"
 echo "📝 Logs do túnel: /tmp/vast_tunnel_${INSTANCE_ID}.log"
 echo "💡 Para parar o túnel: kill \$(cat $TUNNEL_PID_FILE)"
 
+# --- CRIAR TÚNEL PARA DASHBOARD DASK ---
+echo -e "\n🔗  Criando túnel SSH para dashboard Dask..."
+DASHBOARD_TUNNEL_PID_FILE="/tmp/vast_dashboard_tunnel_${INSTANCE_ID}.pid"
+DASHBOARD_LOCAL_PORT="8888"
+DASHBOARD_REMOTE_PORT="8888"
+
+# Mata qualquer túnel de dashboard anterior para esta instância
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    OLD_DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE")
+    if kill -0 "$OLD_DASHBOARD_PID" 2>/dev/null; then
+        echo "Matando túnel de dashboard anterior (PID: $OLD_DASHBOARD_PID)..."
+        kill "$OLD_DASHBOARD_PID"
+        sleep 2
+    fi
+    rm -f "$DASHBOARD_TUNNEL_PID_FILE"
+fi
+
+# Verifica se a porta local já está em uso
+if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+    echo "⚠️  Porta $DASHBOARD_LOCAL_PORT já está em uso. Tentando porta 8889..."
+    DASHBOARD_LOCAL_PORT="8889"
+    if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+        echo "⚠️  Porta $DASHBOARD_LOCAL_PORT também está em uso. Tentando porta 8890..."
+        DASHBOARD_LOCAL_PORT="8890"
+    fi
+fi
+
+# Cria o túnel do dashboard em background com nohup
+nohup ssh $SSH_OPTS -L $DASHBOARD_LOCAL_PORT:localhost:$DASHBOARD_REMOTE_PORT -N "root@$SSH_HOST" > /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log 2>&1 &
+DASHBOARD_TUNNEL_PID=$!
+echo "$DASHBOARD_TUNNEL_PID" > "$DASHBOARD_TUNNEL_PID_FILE"
+
+# Aguarda um pouco para o túnel se estabelecer
+echo "Aguardando túnel do dashboard se estabelecer..."
+sleep 3
+
+# Verifica se o túnel do dashboard está funcionando
+if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+    echo "✅ Túnel SSH para dashboard Dask criado (PID: $DASHBOARD_TUNNEL_PID)"
+    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    echo "🌐 Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
+else
+    echo "⚠️  Túnel do dashboard não conseguiu se estabelecer, mas continuando..."
+    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+fi
+
 echo -e "\n🔄  Sincronizando código local com a instância remota via rsync..."
 rsync -avz --delete -e "ssh $SSH_OPTS" \
   --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
@@ -279,15 +325,28 @@ ssh $SSH_OPTS "root@$SSH_HOST" "$REMOTE_EXEC_CMD"
 
 echo -e "\n✅ Sessão de desenvolvimento finalizada."
 echo -e "\n📋 RESUMO:"
-echo "   • Túnel SSH persistente: ATIVO (PID: $TUNNEL_PID)"
-echo "   • Arquivo PID: $TUNNEL_PID_FILE"
-echo "   • Logs do túnel: /tmp/vast_tunnel_${INSTANCE_ID}.log"
-echo "   • Porta local: $LOCAL_MYSQL_PORT → Porta remota: $REMOTE_MYSQL_PORT"
+echo "   • Túnel SSH MySQL: ATIVO (PID: $TUNNEL_PID)"
+echo "   • Arquivo PID MySQL: $TUNNEL_PID_FILE"
+echo "   • Logs do túnel MySQL: /tmp/vast_tunnel_${INSTANCE_ID}.log"
+echo "   • Porta local MySQL: $LOCAL_MYSQL_PORT → Porta remota: $REMOTE_MYSQL_PORT"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE" 2>/dev/null || echo "N/A")
+    echo "   • Túnel SSH Dashboard: ATIVO (PID: $DASHBOARD_PID)"
+    echo "   • Arquivo PID Dashboard: $DASHBOARD_TUNNEL_PID_FILE"
+    echo "   • Logs do túnel Dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    echo "   • Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
+fi
 echo ""
 echo "💡 COMANDOS ÚTEIS:"
-echo "   • Verificar se túnel está ativo: ps aux | grep 'ssh.*$SSH_HOST'"
-echo "   • Parar túnel: kill \$(cat $TUNNEL_PID_FILE)"
-echo "   • Ver logs do túnel: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
+echo "   • Verificar se túneis estão ativos: ps aux | grep 'ssh.*$SSH_HOST'"
+echo "   • Parar túnel MySQL: kill \$(cat $TUNNEL_PID_FILE)"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    echo "   • Parar túnel Dashboard: kill \$(cat $DASHBOARD_TUNNEL_PID_FILE)"
+fi
+echo "   • Ver logs do túnel MySQL: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    echo "   • Ver logs do túnel Dashboard: tail -f /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+fi
 echo "   • Gerenciar túneis: ./manage_tunnels.sh list|stop|stop-all"
 echo ""
-echo "⚠️  IMPORTANTE: O túnel continuará rodando mesmo após fechar esta sessão!"
+echo "⚠️  IMPORTANTE: Os túneis continuarão rodando mesmo após fechar esta sessão!"

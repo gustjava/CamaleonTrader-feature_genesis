@@ -40,7 +40,8 @@ dask:
   # Worker configuration
   gpus_per_worker: 1  # Uma GPU por worker (otimizado para isolamento)
   threads_per_worker: 1  # Uma thread por worker (evita conflitos GPU)
-  memory_limit: "2GB"  # Limite de memória RAM por worker
+  memory_limit: "0GB"  # Desabilitado - usar memory_limit_fraction
+  memory_limit_fraction: 0.25  # 25% da RAM do sistema por worker (adaptável)
   
   # RMM (RAPIDS Memory Manager) settings - Gerenciamento de memória GPU
   # Tamanhos fixos desabilitados - usando apenas configurações proporcionais
@@ -89,6 +90,8 @@ features:
     low_freq: 6  # Frequência baixa (período longo) - remove tendências
     high_freq: 32  # Frequência alta (período curto) - remove ruído
     k: 12  # Tamanho do kernel do filtro
+  # Batch sizes for graph checkpointing (smaller = more frequent persists)
+  feature_engineering_batch_size: 8
   # Stage 0: Feature Engineering (generalized) - Engine 2 do pipeline
   feature_engineering:
     baxter_king:
@@ -96,45 +99,18 @@ features:
       low_freq: 32  # Período da frequência baixa (remove tendências > 32 períodos)
       high_freq: 6  # Período da frequência alta (remove ruído < 6 períodos)
       causal: true  # Shift temporal para evitar look-ahead bias
-      apply_to_all: true  # Aplica BK a todas as colunas numéricas elegíveis
-      fill_borders: true  # Preenche bordas NaN com valores apropriados (forward/backward fill)
+      apply_to_all: false  # Aplicar BK somente às colunas listadas em source_columns
+      fill_borders: false  # Não preencher bordas para evitar qualquer risco de look-ahead
       # Apply BK to these source columns (if present) - Colunas específicas para BK
       source_columns:
-        - 'y_close'  # Preço de fechamento do target
-        - 'log_stabilized_y_close'  # Log do preço estacionarizado
-        - 'y_open'  # Preço de abertura do target
-        - 'y_high'  # Preço máximo do target
-        - 'y_low'
-        - 'y_weighted_close'
-        - 'y_typical_price'
-        - 'y_vwap_20'
-        - 'y_vwap_distance'
-        - 'y_vwap_60m_distance'
-        - 'y_bb_lower_20_2'
-        - 'y_bb_upper_20_2'
-        - 'y_bb_width_20'
-        - 'y_atr_14'
-        - 'y_true_range'
-        - 'y_parkinson_30m'
-        - 'y_garman_klass_vol'
-        - 'y_gk_vol_30m'
-        - 'y_rv_30m'
-        - 'y_tick_volatility'
-        - 'y_donchian_lower_20'
-        - 'y_donchian_upper_20'
-        - 'y_donchian_width_20'
-        - 'y_donchian_channels_20'
-        - 'y_avg_spread'
-        - 'y_max_spread'
-        - 'y_min_spread'
-        - 'y_spread_lvl'
-        - 'y_body_size'
-        - 'y_range_size'
-        - 'y_range_pct'
-        - 'y_gap_open'
-        - 'y_price_change'
-        - 'y_price_changes_count'
-        - 'y_price_velocity'
+        - 'log_stabilized_y_close'  # Preço em log estabilizado (nível)
+        - 'y_close'                 # Preço de fechamento (nível)
+        - 'y_weighted_close'        # Proxy de nível
+        - 'y_typical_price'         # Proxy de nível
+        - 'y_open'                  # Preço de abertura (nível)
+        - 'y_high'                  # Máxima (nível)
+        - 'y_low'                   # Mínima (nível)
+        - 'y_spread_lvl'            # Nível do spread (se usado como série de nível)
   
   # GARCH model configuration
   garch:
@@ -238,6 +214,66 @@ features:
           3: [[810, 1200]]
           4: [[810, 1200]]
         holidays: []
+      brent:
+        weekmask: [0,1,2,3,4]
+        # Approximate ICE Brent: 01:00–23:00 UTC
+        open_windows:
+          0: [[60, 1380]]
+          1: [[60, 1380]]
+          2: [[60, 1380]]
+          3: [[60, 1380]]
+          4: [[60, 1380]]
+        holidays: []
+      ust10y:
+        weekmask: [0,1,2,3,4]
+        # Approximate US cash bonds: 12:00–22:00 UTC
+        open_windows:
+          0: [[720, 1320]]
+          1: [[720, 1320]]
+          2: [[720, 1320]]
+          3: [[720, 1320]]
+          4: [[720, 1320]]
+        holidays: []
+      bund:
+        weekmask: [0,1,2,3,4]
+        # Approximate DE cash: 07:00–16:30 UTC
+        open_windows:
+          0: [[420, 990]]
+          1: [[420, 990]]
+          2: [[420, 990]]
+          3: [[420, 990]]
+          4: [[420, 990]]
+        holidays: []
+      ukgilt:
+        weekmask: [0,1,2,3,4]
+        # Approximate UK cash: 08:00–16:30 UTC
+        open_windows:
+          0: [[480, 990]]
+          1: [[480, 990]]
+          2: [[480, 990]]
+          3: [[480, 990]]
+          4: [[480, 990]]
+        holidays: []
+      dax:
+        weekmask: [0,1,2,3,4]
+        # Approximate cash: 08:00–16:30 UTC
+        open_windows:
+          0: [[480, 990]]
+          1: [[480, 990]]
+          2: [[480, 990]]
+          3: [[480, 990]]
+          4: [[480, 990]]
+        holidays: []
+      xau:
+        weekmask: [0,1,2,3,4]
+        # Approximate nearly 23h: 01:00–23:00 UTC
+        open_windows:
+          0: [[60, 1380]]
+          1: [[60, 1380]]
+          2: [[60, 1380]]
+          3: [[60, 1380]]
+          4: [[60, 1380]]
+        holidays: []
     # Map feature substrings to driver keys
     feature_prefix_map:
       dxy: dxy
@@ -248,6 +284,25 @@ features:
       _brent: brent
       ust10y: ust10y
       _ust10y: ust10y
+      bund: bund
+      _bund: bund
+      ukgilt: ukgilt
+      gilt: ukgilt
+      _ukgilt: ukgilt
+      dax: dax
+      _dax: dax
+      xau: xau
+      _xau: xau
+    # Map driver keys to existing boolean open-flag columns (preferred when present)
+    open_flag_map:
+      dxy: is_dxy_open
+      spx: is_spx_open
+      brent: is_brent_open
+      ust10y: [is_ust_open, is_ust10y_open]
+      bund: is_bund_open
+      ukgilt: is_ukgilt_open
+      dax: is_dax_open
+      xau: is_xau_open
   # Data-driven session auto-mask (UTC-agnostic; usa gaps/NaNs por janela)
   session_auto_mask:
     enabled: true
@@ -257,14 +312,41 @@ features:
   stage1_log_all_scores: true
   stage1_log_top_k: 500
   stage1_use_rolling_scores: true
+  # Session-aware coverage thresholds and sampling expansion
+  stage1_min_coverage_ratio_driver: 0.10
+  stage1_min_open_fraction_for_sampling: 0.20
+  # Stage 2 pre-VIF/MI NaN handling for non-driver features
+  impute_non_driver_nans:
+    enabled: true
+    method: median   # median|ffill|bfill|ffill_bfill
+    limit_ffill: 0   # 0 = unlimited
+  drop_non_driver_columns_with_missing:
+    enabled: false
+    max_missing_ratio: 0.5
   # Dataset schema/feature gating (leakage control)
   dataset_target_columns: []         # list of label/target columns present in the dataset
   dataset_target_prefixes: ["m1_", "m2_", "m3_", "m4_", "m5_", "m6_", "m7_", "m8_", "m9_"]  # model targets m1..m9
   feature_allowlist: []              # exact feature names allowed (if non-empty, acts as allowlist)
   feature_allow_prefixes: []         # prefixes allowed (any match passes allowlist)
-  feature_denylist: ["y_tick_volume", "y_total_volume", "y_minutes_since_open"]  # exclude raw volume features and session offset
-  feature_deny_prefixes: ["y_ret_fwd_"]  # exclude all forward-return labels by default
-  feature_deny_regex: []             # regex patterns to exclude (optional)
+  feature_denylist: [
+    "y_tick_volume",
+    "y_total_volume",
+    "y_minutes_since_open",
+    # Skip FVG features from Stage 1 dCor candidates (keep in dataset)
+    "y_fvg_age_bars",
+    "y_fvg_confidence_score",
+    "y_fvg_distance_pips",
+    "y_fvg_width_pips",
+    # Explicit bad/incorrect features from source
+    "y_jarque_bera_30m",
+    "dxy_ret_1m_var_240",
+    # Not a feature: internal fracdiff parameter broadcast
+    "y_fracdiff_d"
+  ]  # exclude raw volume features, session offset, selected FVG metrics, bad inputs, and non-features
+  feature_deny_prefixes: ["y_ret_fwd_", "is_", "y_is_", "bk_filter_", "adf_stat_"]  # exclude forward labels, flags (is_*), BK outputs, and raw rolling ADF
+  feature_deny_regex: ["_mask$", "_flag$"]  # generic masks/flags (optional)
+  # Stage 1 only: skip from dCor candidates (do not drop from dataset)
+  stage1_feature_denylist: ["y_ls_strength_pips"]
   metrics_prefixes: ["dcor_", "dcor_roll_", "dcor_pvalue_", "stage1_", "cpcv_"]
   # Always-keep protections (bypass Stage 1 drop and ensure retention)
   always_keep_features: []
@@ -279,7 +361,13 @@ features:
   fracdiff_cache_max_entries: 32
   fracdiff_partition_threshold: 4096
   # Rolling correlation pair selection: 'first' (order-based) or 'dcor' (top by Stage 1 dCor)
-  rolling_corr_pair_selection: first
+  rolling_corr_pair_selection: dcor
+  # Compute rolling correlations after Stage 1 using dCor rankings
+  post_stage1_rolling_corr: true
+  # Broadcast dCor scores to enable downstream use (required for 'dcor' mode)
+  stage1_broadcast_scores: true
+  # Dashboard: submit Stage 1 dCor tasks per-feature (more tasks; enable only for debug)
+  stage1_dashboard_per_feature: true
   # MI clustering (Stage 2) scalable options
   mi_cluster_enabled: true
   mi_cluster_method: agglo
@@ -414,6 +502,7 @@ logging:
 # Performance monitoring and metrics collection
 monitoring:
   metrics_enabled: true
+  dashboard_enabled: true  # Set to false to disable dashboard and reduce WebSocket logs
   dashboard_port: 8888
   health_check_interval: 30
 
@@ -434,6 +523,7 @@ development:
   enable_profiling: false
   log_memory_usage: true
   validate_data: true
+  debug_dashboard: true
 
 # Pipeline Engine Configuration
 # Individual engine settings and execution order

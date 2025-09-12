@@ -59,31 +59,88 @@ class ContextualLoggerAdapter(logging.LoggerAdapter):
         else:
             return logger_name
     
-        def process(self, msg: str, kwargs: Dict[str, Any]) -> tuple:
-            """
-            Process the log message and inject context.
+    def process(self, msg: str, kwargs: Dict[str, Any]) -> tuple:
+        """
+        Process the log message and inject context.
+        
+        Args:
+            msg: The log message
+            kwargs: Additional keyword arguments
             
-            Args:
-                msg: The log message
-                kwargs: Additional keyword arguments
-                
-            Returns:
-                Tuple of (processed_message, processed_kwargs)
-            """
-            # Get current context
-            context = get_context()
-            
-            # Merge context with extra fields
-            extra = kwargs.get('extra', {})
-            extra.update(context)
-            extra['component'] = self.component
-            
-            # Add timestamp if not present
-            if 'timestamp' not in extra:
-                extra['timestamp'] = datetime.utcnow().isoformat() + 'Z'
-            
-            kwargs['extra'] = extra
-            return msg, kwargs
+        Returns:
+            Tuple of (processed_message, processed_kwargs)
+        """
+        # Get current context
+        context = get_context()
+        
+        # Merge context with extra fields (avoid overwriting existing fields)
+        extra = kwargs.get('extra', {})
+        # Only add context fields that don't already exist in extra
+        for key, value in context.items():
+            if key not in extra:
+                extra[key] = value
+        extra['component'] = self.component
+        
+        # Add timestamp if not present
+        if 'timestamp' not in extra:
+            extra['timestamp'] = datetime.utcnow().isoformat() + 'Z'
+        
+        kwargs['extra'] = extra
+        return msg, kwargs
+
+
+class DetailedPipelineLogger:
+    """
+    High-level structured logging facade for pipeline transparency.
+
+    This wraps a standard logger/adapter and provides semantic methods
+    aligned with the pipeline documentation goals.
+    """
+
+    def __init__(self, logger: Union[logging.Logger, ContextualLoggerAdapter]):
+        self._logger = logger
+
+    # ---- Stage lifecycle ----
+    def log_stage_start(self, stage: str, input_shape: Optional[tuple] = None, config: Optional[dict] = None):
+        info_event(self._logger, Events.ENGINE_START, f"Stage start: {stage}", engine=stage, input_shape=input_shape, config=config)
+
+    def log_stage_end(self, stage: str, output_shape: Optional[tuple] = None, metrics: Optional[dict] = None):
+        info_event(self._logger, Events.ENGINE_END, f"Stage end: {stage}", engine=stage, output_shape=output_shape, **(metrics or {}))
+
+    # ---- Transformations ----
+    def log_transformation(self, engine: str, operation: str,
+                           input_cols: Optional[list] = None, output_cols: Optional[list] = None,
+                           metrics: Optional[dict] = None, duration: Optional[float] = None):
+        fields: Dict[str, Any] = {
+            'engine': engine,
+            'operation': operation,
+            'input_cols': input_cols,
+            'output_cols': output_cols,
+            'duration_ms': int(duration * 1000) if isinstance(duration, (int, float)) else None,
+        }
+        if metrics:
+            fields.update(metrics)
+        info_event(self._logger, "engine.transformation", f"{engine}: {operation}", **fields)
+
+    # ---- Feature evolution ----
+    def log_feature_evolution(self, before: int, after: int,
+                              added: Optional[list] = None, removed: Optional[list] = None, modified: Optional[list] = None):
+        fields = {
+            'cols_before': before,
+            'cols_after': after,
+            'new_cols': after - before if (before is not None and after is not None) else None,
+            'added': (added or [])[:50],  # cap to avoid huge logs
+            'removed': (removed or [])[:50],
+            'modified': (modified or [])[:50],
+        }
+        info_event(self._logger, "engine.feature_evolution", "Feature evolution", **fields)
+
+    # ---- Config impact ----
+    def log_config_impact(self, param: str, value: Any, effect: str, metrics: Optional[dict] = None):
+        fields: Dict[str, Any] = {'param': param, 'value': value, 'effect': effect}
+        if metrics:
+            fields.update(metrics)
+        info_event(self._logger, "pipeline.config.impact", f"Config impact: {param}", **fields)
 
 
 class LogRecordFactory:
@@ -163,19 +220,18 @@ def setup_logging_factory():
     logging.setLogRecordFactory(LogRecordFactory.create_record)
 
 
-def get_logger(name: str, component: Optional[str] = None) -> ContextualLoggerAdapter:
+def get_logger(name: str, component: Optional[str] = None) -> logging.Logger:
     """
-    Get a contextual logger adapter for the given name.
+    Get a simple logger for the given name.
     
     Args:
         name: Logger name (usually __name__)
-        component: Optional component name override
+        component: Optional component name override (ignored for simple logging)
         
     Returns:
-        ContextualLoggerAdapter instance
+        Standard logging.Logger instance
     """
-    base_logger = logging.getLogger(name)
-    return ContextualLoggerAdapter(base_logger, component)
+    return logging.getLogger(name)
 
 
 # Event-based logging helpers
@@ -191,7 +247,8 @@ def info_event(logger: Union[logging.Logger, ContextualLoggerAdapter],
         **fields: Additional structured fields
     """
     if isinstance(logger, ContextualLoggerAdapter):
-        logger.info(message, extra={'event': event, **fields})
+        # ContextualLoggerAdapter already has event field, don't overwrite
+        logger.info(message, extra=fields)
     else:
         logger.info(message, extra={'event': event, **fields})
 
@@ -208,7 +265,8 @@ def warn_event(logger: Union[logging.Logger, ContextualLoggerAdapter],
         **fields: Additional structured fields
     """
     if isinstance(logger, ContextualLoggerAdapter):
-        logger.warning(message, extra={'event': event, **fields})
+        # ContextualLoggerAdapter already has event field, don't overwrite
+        logger.warning(message, extra=fields)
     else:
         logger.warning(message, extra={'event': event, **fields})
 
@@ -225,7 +283,8 @@ def error_event(logger: Union[logging.Logger, ContextualLoggerAdapter],
         **fields: Additional structured fields
     """
     if isinstance(logger, ContextualLoggerAdapter):
-        logger.error(message, extra={'event': event, **fields})
+        # ContextualLoggerAdapter already has event field, don't overwrite
+        logger.error(message, extra=fields)
     else:
         logger.error(message, extra={'event': event, **fields})
 
@@ -242,7 +301,8 @@ def critical_event(logger: Union[logging.Logger, ContextualLoggerAdapter],
         **fields: Additional structured fields
     """
     if isinstance(logger, ContextualLoggerAdapter):
-        logger.critical(message, extra={'event': event, **fields})
+        # ContextualLoggerAdapter already has event field, don't overwrite
+        logger.critical(message, extra=fields)
     else:
         logger.critical(message, extra={'event': event, **fields})
 
@@ -259,7 +319,8 @@ def debug_event(logger: Union[logging.Logger, ContextualLoggerAdapter],
         **fields: Additional structured fields
     """
     if isinstance(logger, ContextualLoggerAdapter):
-        logger.debug(message, extra={'event': event, **fields})
+        # ContextualLoggerAdapter already has event field, don't overwrite
+        logger.debug(message, extra=fields)
     else:
         logger.debug(message, extra={'event': event, **fields})
 

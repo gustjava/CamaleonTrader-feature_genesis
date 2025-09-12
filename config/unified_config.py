@@ -64,7 +64,9 @@ class DaskConfig:
     """Dask-CUDA cluster configuration."""
     gpus_per_worker: int = 1
     threads_per_worker: int = 1
-    memory_limit: str = "8GB"
+    memory_limit: str = "0GB"  # Desabilitado - usar memory_limit_fraction
+    # New: proportional memory sizing (fraction of system RAM). If > 0, this overrides fixed memory_limit.
+    memory_limit_fraction: float = 0.25             # e.g., 0.25 -> 25% of system RAM per worker
     rmm_pool_size: str = "0GB"  # Desabilitado - usar rmm_pool_fraction
     rmm_initial_pool_size: str = "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
     rmm_maximum_pool_size: str = "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
@@ -93,6 +95,10 @@ class FeatureConfig:
         'windows': [15, 30, 60],
         'min_periods': 1
     })
+    # Post-Stage1 rolling correlations guided by dCor (optional)
+    post_stage1_rolling_corr: bool = False
+    # Debug/visibility: show per-feature dCor tasks in dashboard (off by default)
+    stage1_dashboard_per_feature: bool = False
     frac_diff: Dict[str, Any] = field(default_factory=lambda: {
         'd_values': [0.1, 0.2, 0.3, 0.4, 0.5],
         'threshold': 1e-5,
@@ -199,11 +205,16 @@ class FeatureConfig:
     stage1_rolling_max_windows: int = 20
     stage1_agg: str = "median"  # one of: mean, median, min, max, p25, p75
     stage1_use_rolling_scores: bool = True
+    # If open fraction for candidate drivers in the Stage 1 sample falls below this,
+    # expand the sampling window (use more recent partitions) before pre-gating
+    stage1_min_open_fraction_for_sampling: float = 0.20
     # Logging controls for Stage 1
     stage1_log_top_k: int = 20
     stage1_log_all_scores: bool = False
     # Stage 1 quality gates
     stage1_min_coverage_ratio: float = 0.30   # min fraction of valid (target & feature finite) pairs
+    # Session-aware coverage: threshold for driver-based features (applies pre-gate, using open-session masks)
+    stage1_min_coverage_ratio_driver: float = 0.10
     stage1_min_variance: float = 1e-12        # variance threshold to avoid constant features
     stage1_min_unique_values: int = 2         # require at least 2 unique finite values
     stage1_min_rolling_windows: int = 5       # min finite rolling windows required per feature
@@ -223,6 +234,10 @@ class FeatureConfig:
     # Selection protection (always keep)
     always_keep_features: List[str] = field(default_factory=list)
     always_keep_prefixes: List[str] = field(default_factory=list)
+    # Stage 1 zero-handling and trading-hours sampling
+    stage1_treat_zero_as_nan_prefixes: List[str] = field(default_factory=list)
+    stage1_min_nonzero_ratio: float = 0.0  # 0.0 disables; else require minimal non-zero fraction in sample
+    stage1_include_hours: List[List[int]] = field(default_factory=list)  # e.g., [[7,17]] to include 07:00-16:59
     # Stage 1 visibility and debugging
     stage1_broadcast_scores: bool = False     # add dcor_* columns to the frame
     stage1_broadcast_rolling: bool = False    # add dcor_roll_* and cnt_* columns
@@ -279,8 +294,24 @@ class FeatureConfig:
     })
     # Session configuration for external drivers
     sessions: Dict[str, Any] = field(default_factory=dict)
+    # Stage 2 imputation for non-driver features (pre-VIF/MI)
+    impute_non_driver_nans: Dict[str, Any] = field(default_factory=lambda: {
+        'enabled': False,
+        'method': 'median',   # median|ffill|bfill|ffill_bfill
+        'limit_ffill': 0      # 0 = unlimited
+    })
+    # Stage 1 only: deny exact features from dCor candidates (do not drop from dataset)
+    stage1_feature_denylist: List[str] = field(default_factory=list)
+    # Optional: drop non-driver columns exceeding missing-ratio threshold (pre-VIF/MI)
+    drop_non_driver_columns_with_missing: Dict[str, Any] = field(default_factory=lambda: {
+        'enabled': False,
+        'max_missing_ratio': 0.5
+    })
     # Index gap imputation configuration (Kalman session-aware)
     index_imputation: Dict[str, Any] = field(default_factory=dict)
+    # Dask checkpointing batch sizes (controls graph growth during engines)
+    feature_engineering_batch_size: int = 16
+    stationarization_batch_size: int = 16
 
 
 @dataclass 
@@ -349,7 +380,8 @@ class LoggingConfig:
 class MonitoringConfig:
     """Monitoring and metrics configuration."""
     metrics_enabled: bool = True
-    dashboard_port: int = 8788
+    dashboard_enabled: bool = True
+    dashboard_port: int = 8888
     health_check_interval: int = 30
 
 
@@ -402,6 +434,8 @@ class DevelopmentConfig:
     enable_profiling: bool = False
     log_memory_usage: bool = True
     validate_data: bool = True
+    # Dashboard/task-stream visibility helper (disables task fusion when true)
+    debug_dashboard: bool = False
 
 
 @dataclass
@@ -632,8 +666,31 @@ def load_config_from_file(config_path: Optional[str] = None) -> UnifiedConfig:
             raise ValueError("Configuration file is empty")
         
         config = load_config_from_dict(config_dict)
+
+        # Validate configuration (extended validation)
+        try:
+            from .config_validator import ConfigValidator
+            validator = ConfigValidator()
+            vres = validator.validate_pipeline_config(config)
+            for issue in vres.issues:
+                level = (issue.level or 'INFO').upper()
+                msg = f"[{level}] {issue.message} (path={issue.path})"
+                if level == 'ERROR':
+                    logger.error(msg)
+                elif level == 'WARN':
+                    logger.warning(msg)
+                else:
+                    logger.info(msg)
+            if not vres.is_valid:
+                logger.warning("Proceeding with configuration despite validation errors")
+
+            # Optimization suggestions (non-fatal)
+            for s in validator.suggest_optimizations(config):
+                logger.info(f"[SUGGESTION] {s}")
+        except Exception as _e:
+            logger.debug(f"Config extended validation not available: {_e}")
         
-        # Validate configuration
+        # Validate configuration (basic required keys)
         if not config.validate():
             raise ValueError("Configuration validation failed")
         
