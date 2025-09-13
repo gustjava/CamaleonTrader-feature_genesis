@@ -162,11 +162,19 @@ class StatisticalAnalysis:
                         if i == j:
                             row.append(1.0)
                         else:
-                            # Compute correlation
-                            data1 = df[col1].to_cupy()
-                            data2 = df[col2].to_cupy()
-                            
-                            # Remove NaN values
+                            # Compute correlation (mask DXY closed if available)
+                            try:
+                                subset = df[[col1, col2]]
+                                if 'is_dxy_open' in df.columns and ('dxy' in col1.lower() or 'dxy' in col2.lower()):
+                                    subset = subset[subset['is_dxy_open'] == 1]
+                                subset = subset.dropna()
+                                data1 = subset[col1].to_cupy()
+                                data2 = subset[col2].to_cupy()
+                            except Exception:
+                                # Fallback to individual columns
+                                data1 = df[col1].dropna().to_cupy()
+                                data2 = df[col2].dropna().to_cupy()
+                            # Remove any remaining NaNs (defensive)
                             valid_mask = ~(cp.isnan(data1) | cp.isnan(data2))
                             if cp.sum(valid_mask) > 10:
                                 clean_data1 = data1[valid_mask]
@@ -188,7 +196,14 @@ class StatisticalAnalysis:
             key_series = ['y_close', 'y_ret_1m']
             for col in key_series:
                 if col in df.columns:
-                    data = df[col].to_cupy()
+                    try:
+                        s = df[col]
+                        if 'is_dxy_open' in df.columns and 'dxy' in col.lower():
+                            s = s[df['is_dxy_open'] == 1]
+                        s = s.dropna()
+                        data = s.to_cupy()
+                    except Exception:
+                        data = df[col].dropna().to_cupy()
                     valid_data = data[~cp.isnan(data)]
                     
                     if len(valid_data) > 0:
@@ -220,7 +235,7 @@ class StatisticalAnalysis:
                 numeric_cols = []
                 for col in df.columns:
                     try:
-                        data = df[col].to_cupy()
+                        data = df[col].dropna().to_cupy()
                         if cp.isfinite(data).any():
                             numeric_cols.append(col)
                     except Exception:
@@ -246,10 +261,13 @@ class StatisticalAnalysis:
                         row.append(1.0)
                     else:
                         try:
-                            data1 = df[col1].to_cupy()
-                            data2 = df[col2].to_cupy()
-                            
-                            # Remove NaN values
+                            subset = df[[col1, col2]]
+                            if 'is_dxy_open' in df.columns and ('dxy' in col1.lower() or 'dxy' in col2.lower()):
+                                subset = subset[subset['is_dxy_open'] == 1]
+                            subset = subset.dropna()
+                            data1 = subset[col1].to_cupy()
+                            data2 = subset[col2].to_cupy()
+                            # Remove NaNs defensivamente
                             valid_mask = ~(cp.isnan(data1) | cp.isnan(data2))
                             if cp.sum(valid_mask) > 10:
                                 clean_data1 = data1[valid_mask]
@@ -324,7 +342,13 @@ class StatisticalAnalysis:
             summaries = {}
             for col in columns:
                 try:
-                    data = df[col].to_cupy()
+                    s = df[col]
+                    if 'is_dxy_open' in df.columns and 'dxy' in str(col).lower():
+                        s = s[df['is_dxy_open'] == 1]
+                    s = s.dropna()
+                    if len(s) == 0:
+                        raise ValueError("No data after mask/dropna")
+                    data = s.to_cupy()
                     valid_data = data[~cp.isnan(data)]
                     
                     if len(valid_data) > 0:
@@ -416,7 +440,19 @@ class StatisticalAnalysis:
             
             for col in columns:
                 try:
-                    data = df[col].to_cupy()
+                    s = df[col]
+                    if 'is_dxy_open' in df.columns and 'dxy' in str(col).lower():
+                        s = s[df['is_dxy_open'] == 1]
+                    s = s.dropna()
+                    if len(s) == 0:
+                        # Nothing to test
+                        df[f'{col}_jb_stat'] = float('nan')
+                        df[f'{col}_jb_pvalue'] = float('nan')
+                        df[f'{col}_ad_stat'] = float('nan')
+                        df[f'{col}_ad_pvalue'] = float('nan')
+                        df[f'{col}_is_normal'] = False
+                        continue
+                    data = s.to_cupy()
                     valid_data = data[~cp.isnan(data)]
                     
                     if len(valid_data) > 10:  # Minimum sample size for normality tests
@@ -493,4 +529,32 @@ class StatisticalAnalysis:
             
         except Exception as e:
             self._log_error(f"Error in comprehensive statistical analysis: {e}")
+            return df
+
+    def apply_preselection_stat_features(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        """Lightweight statistical features for pre-selection broadcasting.
+
+        - Skips expensive correlation matrices
+        - Applies normality tests (masked for DXY when `is_dxy_open` exists)
+        - Adds statistical summaries (mean/std/skew/kurt) for key columns
+        """
+        try:
+            self._log_info("Starting pre-selection statistical features (lightweight)...")
+
+            # Normality on key columns
+            key_columns = [col for col in df.columns if any(term in col.lower() for term in ['y_close', 'y_ret', 'frac_diff'])]
+            if key_columns:
+                df = self.apply_normality_tests(df, key_columns)
+
+            # Statistical summaries
+            summaries = self.compute_statistical_summaries(df, key_columns)
+            for col, summary in summaries.items():
+                for stat_name, stat_value in summary.items():
+                    if stat_name != 'count':
+                        df[f'{col}_{stat_name}'] = stat_value
+
+            self._log_info("Pre-selection statistical features completed")
+            return df
+        except Exception as e:
+            self._log_error(f"Error in pre-selection statistical features: {e}")
             return df

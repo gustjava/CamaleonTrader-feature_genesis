@@ -118,16 +118,22 @@ def _tail_k_to_pandas(pdf, k: int):
 
 def _adf_tstat_window_host(vals: np.ndarray) -> float:
     """Compute ADF t-statistic for a time series window on CPU."""
-    n = len(vals)
+    # Drop NaN/inf inside the window to avoid poisoning the statistic
+    try:
+        x = np.asarray(vals, dtype=np.float64)
+    except Exception:
+        return np.nan
+    x = x[np.isfinite(x)]
+    n = len(x)
     if n < 3:  # Need at least 3 points for ADF test
         return np.nan
-    prev = float(vals[0])  # Previous value for differencing
+    prev = float(x[0])  # Previous value for differencing
     sum_z = sum_y = sum_zz = sum_yy = sum_zy = 0.0  # Initialize sums for regression
     m = n - 1  # Number of differences
     for i in range(1, n):
         z = prev  # Lagged value (x_t-1)
-        y = float(vals[i]) - prev  # First difference (Δx_t)
-        prev = float(vals[i])  # Update previous value
+        y = float(x[i]) - prev  # First difference (Δx_t)
+        prev = float(x[i])  # Update previous value
         sum_z += z  # Sum of lagged values
         sum_y += y  # Sum of differences
         sum_zz += z * z  # Sum of squared lagged values
@@ -189,6 +195,19 @@ def _jb_pvalue_window_host(vals: np.ndarray) -> float:
         return p
     except Exception:
         return float('nan')
+
+def _jb_rolling_partition(series: cudf.Series, window: int, min_periods: int) -> cudf.Series:
+    """Apply Jarque–Bera p-value to rolling windows of a time series (CPU func on cuDF).
+
+    Uses the existing host implementation `_jb_pvalue_window_host` applied via cuDF rolling.
+    """
+    try:
+        return series.rolling(window=window, min_periods=min_periods).apply(
+            lambda x: _jb_pvalue_window_host(np.asarray(x))
+        )
+    except Exception:
+        import cupy as _cp
+        return cudf.Series(_cp.full(len(series), _cp.nan))
 
 
 def _compute_forward_log_return_partition(pdf: cudf.DataFrame, price_col: str, horizon: int, out_col: str) -> cudf.DataFrame:

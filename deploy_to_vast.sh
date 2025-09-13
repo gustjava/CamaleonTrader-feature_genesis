@@ -191,7 +191,7 @@ fi
 
 echo -e "\n🔄  Sincronizando código local com a instância remota via rsync..."
 rsync -avz --delete -e "ssh $SSH_OPTS" \
-  --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
+  --exclude='.git/' --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
   "$LOCAL_PROJECT_DIR/" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
 echo "✅ Sincronização de código completa."
 

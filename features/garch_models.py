@@ -449,7 +449,7 @@ class GARCHModels(BaseFeatureEngine):
         # Diagnostics on a bounded head (same cap as fit)
         try:
             price_sample = one[price_col].head(self.max_samples)
-            price_series = price_sample.compute().to_pandas()
+            price_series = price_sample.to_pandas()
             n_total = int(len(price_series))
             n_nonnull = int(price_series.notna().sum())
             n_null = int(n_total - n_nonnull)

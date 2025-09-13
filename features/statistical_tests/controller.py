@@ -21,7 +21,7 @@ from .adf_tests import ADFTests
 from .distance_correlation import DistanceCorrelation
 from .feature_selection import FeatureSelection
 from .statistical_analysis import StatisticalAnalysis
-from .utils import _free_gpu_memory_worker, _tail_k, _tail_k_to_pandas
+from .utils import _free_gpu_memory_worker, _tail_k, _tail_k_to_pandas, _jb_rolling_partition
 from utils.logging_utils import get_logger, info_event, warn_event, error_event, Events
 from utils import log_context
 
@@ -80,6 +80,12 @@ class StatisticalTests(BaseFeatureEngine):
             self.dcor_top_k = int(getattr(uc.features, 'dcor_top_k', 50))
             self.dcor_include_permutation = bool(getattr(uc.features, 'dcor_include_permutation', False))
             self.dcor_permutations = int(getattr(uc.features, 'dcor_permutations', 0))
+            # Rolling JB configuration
+            self.jb_base_column = getattr(uc.features, 'jb_base_column', None)
+            try:
+                self.jb_windows = list(getattr(uc.features, 'jb_windows', []) or [])
+            except Exception:
+                self.jb_windows = []
             
             # Feature selection parameters
             self.selection_max_rows = int(getattr(uc.features, 'selection_max_rows', 100000))
@@ -187,6 +193,9 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage1_agg = 'median'
             self.stage1_use_rolling_scores = True
             self.stage1_dashboard_per_feature = False
+            # JB defaults
+            self.jb_base_column = 'y_ret_1m'
+            self.jb_windows = []
 
     def _log_info(self, message: str, **kwargs):
         """Log info message with optional context."""
@@ -336,6 +345,33 @@ class StatisticalTests(BaseFeatureEngine):
             # 1. ADF TESTS IN BATCH
             df = self.adf_tests._apply_comprehensive_adf_tests(df)
             
+            # 1b. JB rolling p-values (cuDF path)
+            try:
+                jb_windows = list(getattr(self, 'jb_windows', []) or [])
+            except Exception:
+                jb_windows = []
+            if jb_windows:
+                base = getattr(self, 'jb_base_column', None) or ('y_ret_1m' if 'y_ret_1m' in df.columns else None)
+                if base is None:
+                    # fallback: first column containing 'ret'
+                    for c in df.columns:
+                        if 'ret' in str(c).lower():
+                            base = c
+                            break
+                if base is not None and base in df.columns:
+                    self._log_info(f"JB (cuDF): Computing rolling JB for base={base} windows={jb_windows}")
+                    for w in jb_windows:
+                        try:
+                            win = int(w)
+                            minp = max(10, int(0.5 * win))
+                            safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(base))
+                            out = f"jb_p_{safe}_w{win}"
+                            if out in df.columns:
+                                continue
+                            df[out] = _jb_rolling_partition(df[base], win, minp)
+                        except Exception as e:
+                            self._log_warn("JB (cuDF) rolling failed", window=str(w), error=str(e))
+            
             # 2. DISTANCE CORRELATION TESTS
             df = self.distance_correlation._apply_comprehensive_distance_correlation(df)
             
@@ -438,7 +474,7 @@ class StatisticalTests(BaseFeatureEngine):
 
         processed_count = 0
         skipped_count = 0
-        
+
         for col in adf_cols:
             # Use a unique, safe output column name to avoid collisions across frac_diff variants
             try:
@@ -469,6 +505,94 @@ class StatisticalTests(BaseFeatureEngine):
 
         if adf_cols:
             self._log_info(f"ADF: Completed processing {processed_count} features, skipped {skipped_count} (already exist)")
+
+        # --- Rolling JB p-value on base return column(s) ---
+        try:
+            jb_windows = list(getattr(self, 'jb_windows', []) or [])
+        except Exception:
+            jb_windows = []
+        if jb_windows:
+            # Determine base column
+            try:
+                cols = list(df.columns)
+            except Exception:
+                cols = []
+            base = None
+            cfg_base = getattr(self, 'jb_base_column', None)
+            if cfg_base and (cfg_base in cols):
+                base = cfg_base
+            elif 'y_ret_1m' in cols:
+                base = 'y_ret_1m'
+            else:
+                # fallback: first column containing 'ret'
+                for c in cols:
+                    if 'ret' in str(c).lower():
+                        base = c
+                        break
+            if base is None:
+                self._log_warn("JB: No suitable base return column found; skipping rolling JB features")
+            else:
+                self._log_info(f"JB: Computing rolling JB p-values for base={base} windows={jb_windows}")
+                for w in jb_windows:
+                    try:
+                        win = int(w)
+                        minp = max(10, int(0.5 * win))
+                        safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(base))
+                        out = f"jb_p_{safe}_w{win}"
+                        if out in df.columns:
+                            continue
+                        # Apply mask for DXY base if available (mask closed periods to null)
+                        base_series = df[base]
+                        try:
+                            if ('is_dxy_open' in df.columns) and ('dxy' in str(base).lower()):
+                                base_series = base_series.where(df['is_dxy_open'].astype('bool'), None)
+                        except Exception:
+                            pass
+                        df[out] = base_series.map_partitions(
+                            _jb_rolling_partition,
+                            win,
+                            minp,
+                            meta=(out, 'f8')
+                        )
+                    except Exception as e:
+                        self._log_warn("JB rolling failed for a window", window=str(w), error=str(e))
+
+        # --- Pre-selection Statistical Analysis (broadcast constants; no corr matrix) ---
+        try:
+            self._log_info("Pre-selection: computing statistical analysis features on tail sample…")
+            stats_sample = self._sample_tail_across_partitions(df, min(self.selection_max_rows, 50000), max_parts=8)
+            if stats_sample is not None and len(stats_sample) > 0:
+                before_cols = set(map(str, stats_sample.columns))
+                # Use lightweight preselection stats (no correlation matrices here)
+                stats_enriched = self.statistical_analysis.apply_preselection_stat_features(stats_sample)
+                after_cols = set(map(str, stats_enriched.columns))
+                added = sorted(list(after_cols - before_cols))
+                consts = {}
+                for c in added:
+                    try:
+                        col = stats_enriched[c]
+                        val = None
+                        if hasattr(col, 'iloc') and len(col) > 0:
+                            val = col.iloc[0]
+                        if val is None:
+                            continue
+                        try:
+                            consts[c] = float(val)
+                        except Exception:
+                            consts[c] = val
+                    except Exception:
+                        continue
+                if consts:
+                    df = df.assign(**consts)
+                    self._log_info(f"Pre-selection: broadcasted {len(consts)} statistical features")
+                    try:
+                        df = df.persist()
+                    except Exception:
+                        pass
+            else:
+                self._log_warn("Pre-selection: tail sample empty; skipping statistical features broadcast")
+        except Exception as e:
+            self._log_warn("Pre-selection statistical analysis failed; continuing", error=str(e))
 
         # --- Distance Correlation Analysis ---
         if primary_target and primary_target in df.columns:
@@ -587,7 +711,9 @@ class StatisticalTests(BaseFeatureEngine):
             if not_included_skipped:
                 self._log_info(f"Not included columns (no matching patterns): {not_included_skipped[:10]}")
             
-            self._log_info(f"Final candidates for dCor: {candidates[:15]}")
+            self._log_info(f"Final candidates for dCor computation: {candidates[:15]}")
+            self._log_info(f"Total features entering dCor computation: {len(candidates)}")
+            self._log_info(f"Note: These {len(candidates)} features will be used for distance correlation analysis")
             
             return candidates
             
@@ -633,7 +759,9 @@ class StatisticalTests(BaseFeatureEngine):
                 items = [(k.replace('dcor_', ''), v) for k, v in dcor_map.items() if np.isfinite(v)]
                 items.sort(key=lambda kv: kv[1], reverse=True)
                 show = items[:max(1, min(topk, 10))]
-                self._log_info(f"dCor tail sample computed: top{len(show)}", top=show)
+                # Inline the list in the message so it always appears in logs
+                top_pairs = ", ".join([f"{name}:{val:.4f}" for name, val in show])
+                self._log_info(f"dCor tail sample top{len(show)}: {top_pairs}")
             except Exception:
                 pass
 
@@ -657,6 +785,23 @@ class StatisticalTests(BaseFeatureEngine):
             candidates = self._find_candidate_features(df)
             if not candidates:
                 self._critical_error("No candidate features available for selection")
+            
+            # Log initial candidates to verify filtering worked
+            self._log_info(f"Feature selection pipeline: Starting with {len(candidates)} candidates from filtering")
+            self._log_info(f"First 10 candidates: {candidates[:10]}")
+            
+            # Check if any forbidden features are in candidates (this should not happen)
+            forbidden_in_candidates = []
+            for col in candidates:
+                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')) or 
+                    col in self.feature_denylist or
+                    any(col.startswith(prefix) for prefix in self.feature_deny_prefixes)):
+                    forbidden_in_candidates.append(col)
+            
+            if forbidden_in_candidates:
+                self._log_warn(f"WARNING: Found {len(forbidden_in_candidates)} forbidden features in candidates: {forbidden_in_candidates}")
+            else:
+                self._log_info("✓ All candidates passed initial filtering (no forbidden features found)")
 
             # Apply feature selection to a sample of the data (span more partitions safely)
             sample_df = self._sample_head_across_partitions(df, self.selection_max_rows, max_parts=16)
@@ -760,7 +905,21 @@ class StatisticalTests(BaseFeatureEngine):
                     self._log_warn("All fallback validations failed. Accepting all candidates as last resort...")
                     valid_candidates = candidates
                     self._log_info(f"Last resort: using all {len(candidates)} original candidates")
-
+                    
+                    # Double-check: ensure we're not reintroducing forbidden features
+                    forbidden_in_last_resort = []
+                    for col in valid_candidates:
+                        if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')) or 
+                            col in self.feature_denylist or
+                            any(col.startswith(prefix) for prefix in self.feature_deny_prefixes)):
+                            forbidden_in_last_resort.append(col)
+                    
+                    if forbidden_in_last_resort:
+                        self._log_error(f"CRITICAL: Last resort reintroduced {len(forbidden_in_last_resort)} forbidden features: {forbidden_in_last_resort}")
+                        # Remove forbidden features even in last resort
+                        valid_candidates = [c for c in valid_candidates if c not in forbidden_in_last_resort]
+                        self._log_info(f"Removed forbidden features from last resort. Final count: {len(valid_candidates)}")
+            
             # Get distance correlation scores (robust to NA/pd.NA/cudf.NA)
             dcor_scores = {}
             if len(sample_df) > 0:
@@ -776,7 +935,7 @@ class StatisticalTests(BaseFeatureEngine):
                             dcor_scores[col] = float(score)
                         except Exception:
                             dcor_scores[col] = 0.0
-
+            
             # Apply feature selection pipeline
             selection_results = self.feature_selection.apply_feature_selection_pipeline(
                 sample_df, target, valid_candidates, dcor_scores

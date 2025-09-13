@@ -140,7 +140,7 @@ features:
     max_iterations: 100
   
   # Statistical tests parameters
-  distance_corr_max_samples: 10000
+  distance_corr_max_samples: 20000
   distance_corr_tile_size: 2048
   selection_target_column: y_ret_fwd_15m
   # Optional list to run multi-target sweep (per run, per pair)

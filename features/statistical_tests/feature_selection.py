@@ -48,30 +48,6 @@ class FeatureSelection:
         self._log_error(message, **kwargs)
         raise RuntimeError(f"FeatureSelection Critical Error: {message}")
 
-    def _compute_vif_iterative(self, X: np.ndarray, cols: List[str], threshold: float) -> List[str]:
-        """Remove columns with VIF above threshold using correlation matrix (CPU)."""
-        keep = cols.copy()  # Start with all columns
-        it = 0  # Iteration counter
-        self._log_info("VIF iterative start", features=len(keep), threshold=round(float(threshold), 3))
-        while True:
-            if len(keep) < 2:  # Need at least 2 features for VIF calculation
-                break
-            # Compute correlation matrix for remaining features
-            corr = np.corrcoef(X[:, [cols.index(c) for c in keep]].T)
-            try:
-                inv = np.linalg.pinv(corr)  # Pseudo-inverse of correlation matrix
-            except Exception:
-                break  # Stop if matrix inversion fails
-            vifs = np.diag(inv)  # VIF values are diagonal elements of inverse correlation matrix
-            vmax = float(np.max(vifs))  # Find maximum VIF
-            if vmax <= threshold or not np.isfinite(vmax):  # Stop if VIF is below threshold or invalid
-                break
-            idx = int(np.argmax(vifs))  # Find index of feature with highest VIF
-            removed = keep.pop(idx)  # Remove feature with highest VIF
-            it += 1
-            self._log_info("VIF removal", iter=it, feature=removed, vif=round(vmax, 3), remaining=len(keep))
-        self._log_info("VIF iterative done", kept=len(keep))
-        return keep  # Return remaining features
 
     def _compute_mi_redundancy(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
         """Remove non-linear redundancy via pairwise MI (keeps higher dCor in pair)."""
@@ -235,6 +211,9 @@ class FeatureSelection:
 
         # 4) Escolhe representante por cluster (maior dCor)
         reps: List[str] = []
+        cluster_details = []
+        removed_by_clustering = []
+        
         for lbl in np.unique(labels):
             idxs = np.where(labels == lbl)[0]
             cluster_feats = [cand[i] for i in idxs]
@@ -243,9 +222,30 @@ class FeatureSelection:
             else:
                 rep = cluster_feats[0]
             reps.append(rep)
+            
+            # Track cluster details
+            cluster_removed = [f for f in cluster_feats if f != rep]
+            removed_by_clustering.extend(cluster_removed)
+            cluster_details.append({
+                'cluster_id': int(lbl),
+                'representative': rep,
+                'removed': cluster_removed,
+                'size': len(cluster_feats)
+            })
 
         # Garante que representantes pertencem ao conjunto original de candidatos pós‑VIF
         reps = [r for r in reps if r in candidates]
+        
+        # Log detailed MI clustering results
+        self._log_info("MI clustering completed", 
+                      original_count=len(candidates),
+                      clustered_count=len(cand),
+                      final_representatives=len(reps),
+                      removed_by_clustering=len(removed_by_clustering),
+                      cluster_details=cluster_details,
+                      removed_features=removed_by_clustering,
+                      kept_features=reps)
+        
         return reps
 
     def _to_cupy_matrix(self, gdf: cudf.DataFrame, cols: List[str], dtype: str = 'f4') -> Tuple[cp.ndarray, List[str]]:
@@ -280,7 +280,11 @@ class FeatureSelection:
             preview = ",".join(invalid[:10])
             more = max(0, len(invalid) - 10)
             details = f"{preview}{'... (+%d more)' % more if more > 0 else ''}"
-            self._log_info("Dropping non-numeric/invalid columns for GPU matrix", count=len(invalid), examples=details)
+            self._log_info("Dropping non-numeric/invalid columns for GPU matrix", 
+                          count=len(invalid), 
+                          examples=details,
+                          invalid_columns=invalid,
+                          valid_columns=used)
         if not arrays:
             # No usable columns – escalate as critical
             msg = "to_cupy matrix failed: no usable numeric columns"
@@ -300,7 +304,12 @@ class FeatureSelection:
         VIF_i is taken as the ith diagonal of inv(corr(X)). Uses pinvh for stability.
         """
         keep = list(features)  # Start with all features
+        removed_features = []  # Track removed features
         idx = cp.arange(X.shape[1])  # Feature indices
+        
+        self._log_info(f"VIF: Starting with {len(features)} features", 
+                      threshold=threshold, 
+                      features=features[:10])
         # Pre-standardize to unit variance (robust corr computation)
         try:
             Xw = X
@@ -335,6 +344,7 @@ class FeatureSelection:
                     break
                 imax = int(cp.argmax(vif_diag).item())  # Find index of feature with highest VIF
                 removed = keep.pop(imax)  # Remove feature with highest VIF
+                removed_features.append((removed, round(vmax, 3)))  # Track removed feature with VIF value
                 # Drop column from Z to update for next iteration
                 cols = [i for i in range(Z.shape[1]) if i != imax]
                 Z = Z[:, cols]  # Remove corresponding column from standardized data
@@ -342,7 +352,13 @@ class FeatureSelection:
             except Exception as e:
                 self._log_warn("VIF GPU failed; keeping current set", error=str(e))
                 break  # Stop if computation fails
-        self._log_info("VIF iterative done (GPU)", kept=len(keep))
+        # Log detailed VIF results
+        self._log_info("VIF iterative done (GPU)", 
+                      original_count=len(features),
+                      removed_count=len(removed_features),
+                      kept_count=len(keep),
+                      removed_features=removed_features,
+                      kept_features=keep)
         return keep  # Return remaining features
 
     def _mi_nmi_gpu(self, x: cp.ndarray, y: cp.ndarray, bins: int = 64) -> float:
@@ -460,9 +476,30 @@ class FeatureSelection:
         importances: dict = {}  # Store feature importances
         model = None
         
-        # Optimize data types for performance - convert to float32 for GPU acceleration
-        X = X_df[candidates].values.astype(np.float32)
-        y = y_series.values.astype(np.float32)
+        # Build CPU numpy arrays for sklearn/LightGBM (avoid CuPy arrays)
+        try:
+            import cudf as _cudf
+            # Convert to pandas if coming from cuDF
+            if isinstance(X_df, _cudf.DataFrame):
+                Xp = X_df[candidates].to_pandas()
+            else:
+                Xp = X_df[candidates]
+            if hasattr(y_series, 'to_pandas'):
+                yp = y_series.to_pandas()
+            else:
+                yp = y_series
+            # Align and drop NaNs/Infs jointly
+            import numpy as _np
+            data = Xp.copy()
+            data['__target__'] = yp
+            data.replace([_np.inf, -_np.inf], _np.nan, inplace=True)
+            data = data.dropna()
+            y = data.pop('__target__').to_numpy(dtype=_np.float32, copy=False)
+            X = data.to_numpy(dtype=_np.float32, copy=False)
+        except Exception as e:
+            # Fallback: best-effort to numpy
+            X = X_df[candidates].to_pandas().to_numpy(dtype=np.float32, copy=False)
+            y = y_series.to_pandas().to_numpy(dtype=np.float32, copy=False)
         
         # Apply sampling for large datasets to control computational cost
         max_rows = int(getattr(self, 'selection_max_rows', 100000))
@@ -536,11 +573,12 @@ class FeatureSelection:
                           task=task, selected=len(selected), threshold=round(threshold, 6))
             
         except Exception as e:
-            self._log_warn("LightGBM feature selection failed", error=str(e))
-            # Fallback: return all candidates
+            # Treat embedded model failure as critical to stop the pipeline
+            self._critical_error("LightGBM feature selection failed", error=str(e))
+            # Unreachable, but keep signature expectations
             selected = candidates
             importances = {f: 1.0 for f in candidates}
-            backend_used = 'fallback'
+            backend_used = 'error'
         
         return selected, importances, backend_used
 
@@ -576,16 +614,48 @@ class FeatureSelection:
                 return results
             
             # Stage 2: VIF-based multicollinearity removal
+            self._log_info(f"VIF: Starting with {len(candidates)} candidates from feature selection")
             X_matrix, used_cols = self._to_cupy_matrix(df, candidates)
             if X_matrix.shape[1] == 0 or len(used_cols) == 0:
                 self._critical_error("to_cupy matrix failed; no usable numeric features for VIF", candidates=len(candidates))
+            
+            self._log_info(f"VIF: After GPU matrix conversion: {len(used_cols)} usable features out of {len(candidates)} candidates")
+            self._log_info(f"VIF: Complete list of features entering VIF processing: {used_cols}")
+            
+            # CRITICAL: Verify no data leakage - check for forbidden features
+            forbidden_features = []
+            for col in used_cols:
+                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
+                    forbidden_features.append(col)
+            
+            if forbidden_features:
+                self._critical_error(f"DATA LEAKAGE DETECTED: {len(forbidden_features)} forbidden features in VIF: {forbidden_features}")
+            else:
+                self._log_info(f"✓ LEAKAGE CHECK PASSED: No forbidden features found in {len(used_cols)} VIF candidates")
+            
             vif_selected = self._compute_vif_iterative_gpu(X_matrix, used_cols, self.vif_threshold)
             results['stage2_vif_selected'] = vif_selected
-            self._log_info("VIF selection completed", original=len(candidates), selected=len(vif_selected))
+            self._log_info("VIF selection completed", 
+                          original_candidates=len(candidates),
+                          usable_for_vif=len(used_cols),
+                          vif_selected=len(vif_selected))
             
             # Stage 2: MI-based redundancy removal
             if len(results['stage2_vif_selected']) > 1:
                 try:
+                    # CRITICAL: Verify no data leakage in MI input
+                    mi_input_features = results['stage2_vif_selected']
+                    forbidden_in_mi = []
+                    for col in mi_input_features:
+                        if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
+                            forbidden_in_mi.append(col)
+                    
+                    if forbidden_in_mi:
+                        self._critical_error(f"DATA LEAKAGE DETECTED: {len(forbidden_in_mi)} forbidden features in MI: {forbidden_in_mi}")
+                    else:
+                        self._log_info(f"✓ MI LEAKAGE CHECK PASSED: No forbidden features in {len(mi_input_features)} MI candidates")
+                        self._log_info(f"MI: Complete list of features entering MI processing: {mi_input_features}")
+                    
                     mi_selected = self._compute_mi_cluster_representatives(
                         df, results['stage2_vif_selected'], dcor_scores or {}
                     )
@@ -625,6 +695,19 @@ class FeatureSelection:
                 'total_removed': len(candidates) - len(results['stage3_final_selected']),
                 'reduction_ratio': round(1.0 - len(results['stage3_final_selected']) / len(candidates), 3)
             })
+            
+            # FINAL LEAKAGE CHECK: Verify final output has no forbidden features
+            final_features = results['stage3_final_selected']
+            forbidden_in_final = []
+            for col in final_features:
+                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
+                    forbidden_in_final.append(col)
+            
+            if forbidden_in_final:
+                self._critical_error(f"DATA LEAKAGE DETECTED IN FINAL OUTPUT: {len(forbidden_in_final)} forbidden features: {forbidden_in_final}")
+            else:
+                self._log_info(f"✓ FINAL LEAKAGE CHECK PASSED: No forbidden features in final {len(final_features)} selected features")
+                self._log_info(f"FINAL: Complete list of selected features: {final_features}")
             
             self._log_info("Feature selection pipeline completed", 
                           final_count=len(results['stage3_final_selected']),

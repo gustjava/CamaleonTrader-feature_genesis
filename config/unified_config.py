@@ -124,7 +124,7 @@ class FeatureConfig:
         'log_price': True,
     })
     distance_corr: Dict[str, Any] = field(default_factory=lambda: {
-        'max_samples': 10000
+        'max_samples': 20000
     })
     emd: Dict[str, Any] = field(default_factory=lambda: {
         'max_imfs': 10,
@@ -233,9 +233,17 @@ class FeatureConfig:
         "y_total_volume",
         "y_minutes_since_open",
     ])
-    feature_deny_prefixes: List[str] = field(default_factory=lambda: ['y_ret_fwd_'])
+    feature_deny_prefixes: List[str] = field(default_factory=lambda: [
+        'y_ret_fwd_',
+        'adf_',        # exclude rolling ADF metrics from candidate processing
+        'adf_stat_',   # explicit legacy prefix variant
+    ])
     feature_deny_regex: List[str] = field(default_factory=list)
-    metrics_prefixes: List[str] = field(default_factory=lambda: ['dcor_', 'dcor_roll_', 'dcor_pvalue_', 'stage1_', 'cpcv_'])
+    metrics_prefixes: List[str] = field(default_factory=lambda: [
+        'dcor_', 'dcor_roll_', 'dcor_pvalue_',
+        'adf_', 'adf_stat_',   # ADF metrics are diagnostics, not model features
+        'stage1_', 'cpcv_'
+    ])
     # Selection protection (always keep)
     always_keep_features: List[str] = field(default_factory=list)
     always_keep_prefixes: List[str] = field(default_factory=list)
