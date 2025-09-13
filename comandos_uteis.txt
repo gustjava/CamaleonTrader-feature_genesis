@@ -123,9 +123,6 @@ systemctl status nvidia-persistenced
 # Ver logs do sistema
 journalctl -f
 
-# Ver logs do Docker (se usando)
-docker logs CONTAINER_ID
-
 # Ver uso de recursos em tempo real
 top
 

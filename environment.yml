@@ -116,9 +116,6 @@ dependencies:
   - kafka-python>=2.0.0
   - pika>=1.3.0
   
-  # Containerization
-  - docker>=6.1.0
-  
   # Cloud platform support
   - google-cloud-storage>=2.10.0
   - azure-storage-blob>=12.17.0

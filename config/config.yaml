@@ -61,11 +61,11 @@ dask:
   memory_spill_fraction: 0.9  # Inicia spill quando RAM atinge 90%
   local_directory: "/tmp/dask-worker-space"  # Diretório para spill de dados
   
-  # Network protocol settings - usar TCP para estabilidade
-  protocol: "tcp"
-  enable_tcp_over_ucx: false
+  # Network protocol settings - usar UCX para transfers GPU↔GPU/host
+  protocol: "ucx"
+  enable_tcp_over_ucx: true
   enable_infiniband: false
-  enable_nvlink: false
+  enable_nvlink: false  # RTX 3060 não possui NVLink
 
 # Feature Engineering Configuration
 # Parameters for all feature engineering engines
