@@ -74,6 +74,55 @@ def _hermitian_pinv_gpu(R: cp.ndarray, eps: float = 1e-6) -> cp.ndarray:
         # Fallback to SVD-based pseudoinverse if eigen decomposition fails
         return cp.linalg.pinv(R)
 
+
+# ---- Sampling helpers (module-level to avoid lambda pickling quirks) ----
+def _tail_k(pdf, k: int):
+    """Return tail(k) of a partition (preserve backend: cuDF or pandas).
+
+    Also emits lightweight worker events so we can see GPU activity
+    in the scheduler logs even if the dashboard metrics are noisy.
+    """
+    try:
+        from distributed import get_worker as _gw
+        _w = _gw()
+        _addr = getattr(_w, 'address', 'unknown')
+    except Exception:
+        _w, _addr = None, 'unknown'
+    try:
+        import cupy as _cp
+        _gpu = int(_cp.cuda.runtime.getDevice())
+    except Exception:
+        _gpu = -1
+    try:
+        if _w is not None:
+            _w.log_event("stage1", {"event": "tail_start", "worker": _addr, "gpu": _gpu, "in_rows": int(len(pdf)), "k": int(k)})
+    except Exception:
+        pass
+    out = pdf.tail(int(k))
+    try:
+        if _w is not None:
+            _w.log_event("stage1", {"event": "tail_done", "worker": _addr, "gpu": _gpu, "out_rows": int(len(out))})
+    except Exception:
+        pass
+    return out
+
+
+def _tail_k_to_pandas(pdf, k: int):
+    """Tail(k) and convert to pandas on worker to avoid GPU-object gather.
+
+    Useful when running with TCP protocol or when the client cannot safely
+    receive GPU-backed cuDF objects (reduces device-serialization overhead).
+    """
+    try:
+        out = pdf.tail(int(k))
+    except Exception:
+        try:
+            n = int(k)
+        except Exception:
+            n = 100000
+        out = pdf.iloc[-n:]
+    return out.to_pandas() if hasattr(out, 'to_pandas') else out
+
 def _adf_tstat_window_host(vals: np.ndarray) -> float:
     """Compute ADF t-statistic for a time series window on CPU."""
     n = len(vals)
@@ -258,33 +307,6 @@ def _adf_aggregates_partition(pdf: cudf.DataFrame, tcol: str, base: str, windows
         return cudf.DataFrame(fallback)
 
 
-def _distance_correlation_cpu(x: np.ndarray, y: np.ndarray, max_samples: int = 10000) -> float:
-    """Compute distance correlation on CPU for small samples."""
-    # Basic CPU dCor for small samples
-    x = x.astype(np.float64)  # Convert to float64 for numerical stability
-    y = y.astype(np.float64)  # Convert to float64 for numerical stability
-    mask = np.isfinite(x) & np.isfinite(y)  # Remove NaN and infinite values
-    x = x[mask]
-    y = y[mask]
-    n = len(x)
-    if n < 3:  # Need at least 3 points for distance correlation
-        return float('nan')
-    if n > max_samples:  # Limit sample size for performance
-        x = x[-max_samples:]  # Take last max_samples points
-        y = y[-max_samples:]
-        n = max_samples
-    # Distance matrices - compute pairwise distances
-    a = np.abs(x[:, None] - x[None, :])  # Distance matrix for x
-    b = np.abs(y[:, None] - y[None, :])  # Distance matrix for y
-    # Double centering: subtract row means, column means, and add grand mean
-    A = a - a.mean(axis=0) - a.mean(axis=1)[:, None] + a.mean()
-    B = b - b.mean(axis=0) - b.mean(axis=1)[:, None] + b.mean()
-    dcov2_xy = (A * B).mean()  # Distance covariance squared
-    dcov2_xx = (A * A).mean()  # Distance variance of x squared
-    dcov2_yy = (B * B).mean()  # Distance variance of y squared
-    if dcov2_xx <= 0 or dcov2_yy <= 0:  # Check for valid variances
-        return 0.0
-    return float(np.sqrt(dcov2_xy) / np.sqrt(np.sqrt(dcov2_xx * dcov2_yy)))  # Distance correlation
 
 
 
@@ -381,17 +403,47 @@ def _distance_correlation_gpu(x: cp.ndarray, y: cp.ndarray, tile: int = 2048, ma
 def _dcor_partition_gpu(pdf: cudf.DataFrame, target: str, candidates: List[str], max_samples: int, tile: int) -> cudf.DataFrame:
     """Compute distance correlation between target and candidate features using GPU for a partition."""
     out = {}
+    results_log = []  # Store results for logging
+    
+    # Get GPU info
+    try:
+        import cupy as cp
+        current_gpu = cp.cuda.runtime.getDevice()
+        gpu_info = f"GPU {current_gpu}"
+    except Exception:
+        gpu_info = "GPU unknown"
+    
     try:
         y = pdf[target].astype('f8').to_cupy()  # Convert target to CuPy array
+        print(f"🎮 {gpu_info}: Starting dCor computation for {len(candidates)} features")
     except Exception:
         return cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])  # Return NaN if conversion fails
-    for c in candidates:  # Iterate through candidate features
+    
+    for i, c in enumerate(candidates):  # Iterate through candidate features
         try:
             x = pdf[c].astype('f8').to_cupy()  # Convert candidate to CuPy array
-            out[f"dcor_{c}"] = _distance_correlation_gpu(x, y, tile=tile, max_n=max_samples)  # Compute GPU distance correlation
+            dcor_value = _distance_correlation_gpu(x, y, tile=tile, max_n=max_samples)  # Compute GPU distance correlation
+            out[f"dcor_{c}"] = dcor_value
+            
+            # Store result for logging
+            results_log.append(f"{c}: {dcor_value:.6f}")
+            
         except Exception:
             out[f"dcor_{c}"] = float('nan')  # Return NaN if computation fails
-    return cudf.DataFrame([out])  # Return results as DataFrame
+            results_log.append(f"{c}: NaN")
+    
+    # Store results in a way that can be accessed by the main process
+    try:
+        # Add results as metadata to the DataFrame
+        result_df = cudf.DataFrame([out])
+        result_df.attrs['dcor_results'] = results_log
+        result_df.attrs['target'] = target
+        result_df.attrs['n_features'] = len(candidates)
+        result_df.attrs['gpu_info'] = gpu_info
+        print(f"🎮 {gpu_info}: Completed dCor computation for {len(candidates)} features")
+        return result_df
+    except Exception:
+        return cudf.DataFrame([out])  # Return results as DataFrame
 
 
 def _dcor_rolling_partition_gpu(
@@ -439,7 +491,10 @@ def _dcor_rolling_partition_gpu(
         except Exception:
             X_cols[c] = None
 
-    for c in candidates:
+    print(f"GPU Rolling dCor: Processing {len(candidates)} features with window={window}")
+    for i, c in enumerate(candidates):
+        if i % 50 == 0:  # Log every 50 features to avoid spam
+            print(f"GPU Rolling dCor: Processing feature {i+1}/{len(candidates)}: {c}")
         x_all = X_cols.get(c, None)
         if x_all is None:
             score_map[f"dcor_roll_{c}"] = float('nan')
@@ -491,7 +546,7 @@ def _dcor_rolling_partition_gpu(
 # ---------------- Dask multi-GPU task helpers (feature-parallel) ----------------
 def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: int, tile: int,
                           sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
-                          session_auto_mask: Dict = None, open_flag_map: Dict = None) -> Dict[str, float]:
+                          session_auto_mask: Dict = None, open_flag_map: Dict = None, log_assign: bool = False) -> Dict[str, float]:
     """Compute dCor for a chunk of features on a single worker/GPU.
 
     Accepts a pandas DataFrame to ease serialization; converts to cuDF on worker
@@ -500,6 +555,30 @@ def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: in
     try:
         import cudf as _cudf
         gdf = _cudf.from_pandas(pdf_pd)
+        # Always log worker + GPU assignment for this feature chunk
+        try:
+            from dask.distributed import get_worker as _get_worker
+            _w = _get_worker()
+            _addr = str(getattr(_w, 'address', 'unknown'))
+        except Exception:
+            _addr = 'unknown'
+        try:
+            import cupy as _cp
+            _gpu = int(_cp.cuda.runtime.getDevice())
+        except Exception:
+            _gpu = None
+        
+        print(f"🚀 GPU dCor START: Worker={_addr} GPU={_gpu} Features={len(feats)} ({feats[:3]}{'...' if len(feats)>3 else ''})")
+        
+        try:
+            logger.info(f"Stage1 dCor task start | worker={_addr} gpu={_gpu} feats={feats[:3]}{'...' if len(feats)>3 else ''}")
+            # Also emit event to dashboard event stream
+            try:
+                _w.log_event("stage1", {"event": "dcor_start", "worker": _addr, "gpu": _gpu, "feats": feats[:5]})
+            except Exception:
+                pass
+        except Exception:
+            pass
         # Apply session masks (prefer open flags; fallback to schedule; plus data-driven)
         try:
             if sessions_cfg and feature_prefix_map:
@@ -535,6 +614,14 @@ def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: in
         tile = _adaptive_tile(int(tile))
         res_df = _dcor_partition_gpu(gdf, target, feats, int(max_samples), int(tile))
         row = res_df.to_pandas().iloc[0].to_dict()
+        
+        print(f"✅ GPU dCor COMPLETED: Worker={_addr} GPU={_gpu} Features={len(feats)}")
+        
+        if log_assign:
+            try:
+                logger.info(f"Stage1 dCor task done | feats={feats[:3]}{'...' if len(feats)>3 else ''}")
+            except Exception:
+                pass
         return {f: float(row.get(f"dcor_{f}", float("nan"))) for f in feats}
     except Exception:
         return {f: float('nan') for f in feats}
@@ -543,11 +630,34 @@ def _dask_dcor_chunk_task(pdf_pd, target: str, feats: List[str], max_samples: in
 def _dask_dcor_rolling_chunk_task(pdf_pd, target: str, feats: List[str], window: int, step: int, min_periods: int,
                                   min_valid_pairs: int, max_rows: int, max_windows: int, agg: str, max_samples: int, tile: int,
                                   sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
-                                  session_auto_mask: Dict = None, open_flag_map: Dict = None) -> Dict[str, Any]:
+                                  session_auto_mask: Dict = None, open_flag_map: Dict = None, log_assign: bool = False) -> Dict[str, Any]:
     """Compute rolling dCor aggregated scores for a chunk of features on a single worker/GPU."""
     try:
         import cudf as _cudf
         gdf = _cudf.from_pandas(pdf_pd)
+        # Always log worker + GPU assignment for rolling dCor
+        try:
+            from dask.distributed import get_worker as _get_worker
+            _w = _get_worker()
+            _addr = str(getattr(_w, 'address', 'unknown'))
+        except Exception:
+            _addr = 'unknown'
+        try:
+            import cupy as _cp
+            _gpu = int(_cp.cuda.runtime.getDevice())
+        except Exception:
+            _gpu = None
+        
+        print(f"🔄 GPU Rolling dCor START: Worker={_addr} GPU={_gpu} Features={len(feats)} Window={window}")
+        
+        try:
+            logger.info(f"Stage1 dCor rolling start | worker={_addr} gpu={_gpu} feats={feats[:3]}{'...' if len(feats)>3 else ''} w={window}")
+            try:
+                _w.log_event("stage1", {"event": "dcor_roll_start", "worker": _addr, "gpu": _gpu, "feats": feats[:5], "window": int(window)})
+            except Exception:
+                pass
+        except Exception:
+            pass
         # Apply session masks (prefer open flags; fallback to schedule; plus data-driven)
         try:
             if sessions_cfg and feature_prefix_map:
@@ -588,6 +698,11 @@ def _dask_dcor_rolling_chunk_task(pdf_pd, target: str, feats: List[str], window:
         for f in feats:
             out[f"dcor_roll_{f}"] = float(row.get(f"dcor_roll_{f}", float('nan')))
             out[f"dcor_roll_cnt_{f}"] = int(row.get(f"dcor_roll_cnt_{f}", 0))
+        if log_assign:
+            try:
+                logger.info(f"Stage1 dCor rolling done | feats={feats[:3]}{'...' if len(feats)>3 else ''} w={window}")
+            except Exception:
+                pass
         return out
     except Exception:
         out: Dict[str, Any] = {}
@@ -599,11 +714,31 @@ def _dask_dcor_rolling_chunk_task(pdf_pd, target: str, feats: List[str], window:
 
 def _dask_perm_chunk_task(pdf_pd, target: str, feats: List[str], n_perm: int, max_samples: int, tile: int,
                           sessions_cfg: Dict = None, feature_prefix_map: Dict = None, ts_col: str = 'timestamp',
-                          session_auto_mask: Dict = None, open_flag_map: Dict = None) -> Dict[str, float]:
+                          session_auto_mask: Dict = None, open_flag_map: Dict = None, log_assign: bool = False) -> Dict[str, float]:
     """Compute permutation p-values for a chunk of features on a single worker/GPU."""
     try:
         import cudf as _cudf
         gdf = _cudf.from_pandas(pdf_pd)
+        if log_assign:
+            try:
+                from dask.distributed import get_worker as _get_worker
+                _w = _get_worker()
+                _addr = str(getattr(_w, 'address', 'unknown'))
+            except Exception:
+                _addr = 'unknown'
+            try:
+                import cupy as _cp
+                _gpu = int(_cp.cuda.runtime.getDevice())
+            except Exception:
+                _gpu = None
+            try:
+                logger.info(f"Stage1 perm start | worker={_addr} gpu={_gpu} feats={feats[:3]}{'...' if len(feats)>3 else ''} perm={n_perm}")
+                try:
+                    _w.log_event("stage1", {"event": "perm_start", "worker": _addr, "gpu": _gpu, "feats": feats[:5], "n_perm": int(n_perm)})
+                except Exception:
+                    pass
+            except Exception:
+                pass
         # Apply session masks (prefer open flags; fallback to schedule; plus data-driven)
         try:
             if sessions_cfg and feature_prefix_map:
@@ -638,6 +773,11 @@ def _dask_perm_chunk_task(pdf_pd, target: str, feats: List[str], n_perm: int, ma
         tile = _adaptive_tile(int(tile))
         res_df = _perm_pvalues_partition_gpu(gdf, target, feats, int(n_perm), int(max_samples), int(tile))
         row = res_df.to_pandas().iloc[0].to_dict()
+        if log_assign:
+            try:
+                logger.info(f"Stage1 perm done | feats={feats[:3]}{'...' if len(feats)>3 else ''}")
+            except Exception:
+                pass
         return {f: float(row.get(f"dcor_pvalue_{f}", float('nan'))) for f in feats}
     except Exception:
         return {f: float('nan') for f in feats}
@@ -3458,15 +3598,38 @@ class StatisticalTests(BaseFeatureEngine):
         # Single-fit dCor sanity check removed; proceed to completion.
         self._log_info("StatisticalTests complete.")
 
-        # --- Jarque–Bera aggregates on returns (e.g., y_ret_1m) ---
+        # --- Jarque–Bera aggregates on returns (configurable base) ---
         try:
             available_columns = list(df.columns)
-            ret_candidates = [c for c in available_columns if c == 'y_ret_1m'] or [c for c in available_columns if (c.startswith('y_') and ('ret' in c.lower()))]
-            if ret_candidates:
-                rcol = ret_candidates[0]
-                base = str(rcol).replace('y_', '')
+            # Configurable base column for JB; fallback to y_ret_1m or first return-like
+            try:
+                cfg_base_col = str(getattr(self.settings.features, 'jb_base_column', '') or '').strip()
+            except Exception:
+                cfg_base_col = ''
+            rcol = None
+            base = None
+            if cfg_base_col:
+                if cfg_base_col in available_columns:
+                    rcol = cfg_base_col
+                    base = str(rcol).replace('y_', '')
+                else:
+                    try:
+                        self._log_warn("Configured JB base column not found; falling back", jb_base_column=cfg_base_col)
+                    except Exception:
+                        pass
+            if rcol is None:
+                ret_candidates = [c for c in available_columns if c == 'y_ret_1m'] or [c for c in available_columns if (c.startswith('y_') and ('ret' in c.lower()))]
+                if ret_candidates:
+                    rcol = ret_candidates[0]
+                    base = str(rcol).replace('y_', '')
+            if rcol is not None and base is not None:
+                # Resolve windows: prefer explicit jb_windows, else rolling_windows
                 try:
-                    windows = list(getattr(self.settings.features, 'rolling_windows', [60, 120]))
+                    jb_w = getattr(self.settings.features, 'jb_windows', None)
+                    if jb_w:
+                        windows = list(jb_w)
+                    else:
+                        windows = list(getattr(self.settings.features, 'rolling_windows', [60, 120]))
                 except Exception:
                     windows = [60, 120]
                 # Build meta for aggregates
@@ -3501,7 +3664,7 @@ class StatisticalTests(BaseFeatureEngine):
                     if c in agg.columns:
                         df[c] = agg[c]
                 try:
-                    self._log_info("JB aggregates added", base=base, windows=windows[:2])
+                    self._log_info("JB aggregates added", base=base, column=rcol, windows=windows[:2])
                 except Exception:
                     pass
         except Exception as _e_jb:
@@ -3610,7 +3773,9 @@ class StatisticalTests(BaseFeatureEngine):
                                 extras.remove('timestamp')
                             except Exception:
                                 pass
+                        self._log_info("Creating subset DataFrame for sampling", extras=extras, target=target, n_candidates=len(candidates))
                         sub = df[(extras + [target] + candidates)]
+                        self._log_info("Subset DataFrame created successfully")
                         # Prefer the most recent data: take last two partitions and then tail(max_rows)
                         try:
                             nparts = int(getattr(sub, 'npartitions', 1))
@@ -3618,36 +3783,256 @@ class StatisticalTests(BaseFeatureEngine):
                             nparts = 1
                         last_two = sub.partitions[max(0, nparts - 2): nparts] if nparts > 1 else sub
                         sample_pdf = None
+                        self._log_info("Partitions selected for sampling", nparts=nparts, using_last_two=nparts > 1)
+                        # Primary path: per-partition tail to avoid global tail planning
                         try:
-                            # Dask >= 2022 supports npartitions arg; use it to scan both parts
-                            tail_ddf = last_two.tail(max_rows, npartitions=-1)
-                            sample_pdf = tail_ddf.compute().to_pandas()
-                        except Exception:
-                            # Fallback: take a tail from each partition and compose
                             try:
                                 per_part = max(1, int(max_rows // max(1, int(getattr(last_two, 'npartitions', 1)))))
                             except Exception:
                                 per_part = max(1, int(max_rows // 2))
-                            import cudf as _cudf
+                            # Decide data movement strategy based on config and protocol
+                            try:
+                                proto = str(getattr(self.settings.dask, 'protocol', 'tcp')).lower()
+                            except Exception:
+                                proto = 'tcp'
+                            gpu_direct = bool(getattr(self.settings.features, 'stage1_gpu_direct', False))
+                            prefer_cudf_gather = gpu_direct and (proto == 'ucx')
+                            self._log_info(
+                                "Starting per-partition tail sampling",
+                                per_part=int(per_part),
+                                max_rows=int(max_rows),
+                                last_two_type=type(last_two).__name__,
+                                worker_to_pandas=not prefer_cudf_gather,
+                                protocol=proto,
+                            )
                             # Build meta including extras (e.g., timestamp, open flags) to avoid schema mismatch
                             try:
                                 cols_all = list(extras + [target] + candidates)
                                 meta = last_two._meta[cols_all]
                             except Exception:
-                                # Fallback: construct a minimal meta with best-effort dtypes
-                                meta_cols = {}
-                                for c in (extras + [target] + candidates):
+                                meta = last_two._meta
+
+                            # Prepare partitioned tail graph; for TCP, convert to pandas on worker to avoid GPU-object gather
+                            try:
+                                from dask import annotate as _annotate
+                                _ctx_annot = _annotate(task_key_name=f"s1-tail-{int(per_part)}")
+                            except Exception:
+                                from contextlib import contextmanager
+                                @contextmanager
+                                def _ctx_annot():
+                                    yield
+                            with _ctx_annot:
+                                if prefer_cudf_gather:
+                                    tails_ddf = last_two.map_partitions(_tail_k, per_part, meta=meta)
+                                else:
+                                    # Build pandas meta robustly
                                     try:
-                                        if c == 'timestamp':
-                                            meta_cols[c] = _cudf.Series([], dtype='datetime64[ns]')
-                                        else:
-                                            meta_cols[c] = _cudf.Series([], dtype='f8')
+                                        import pandas as _pd
+                                        meta_pd_cols = {}
+                                        for c in (extras + [target] + candidates):
+                                            try:
+                                                if c == 'timestamp':
+                                                    meta_pd_cols[c] = _pd.Series([], dtype='datetime64[ns]')
+                                                else:
+                                                    meta_pd_cols[c] = _pd.Series([], dtype='float32')
+                                            except Exception:
+                                                meta_pd_cols[c] = _pd.Series([], dtype='float32')
+                                        meta_pd = _pd.DataFrame(meta_pd_cols)
                                     except Exception:
-                                        meta_cols[c] = _cudf.Series([], dtype='f8')
-                                meta = _cudf.DataFrame(meta_cols)
-                            tails_ddf = last_two.map_partitions(lambda pdf, k=per_part: pdf.tail(int(k)), per_part, meta=meta)
-                            tails_cudf = tails_ddf.compute()
-                            sample_pdf = tails_cudf.tail(max_rows).to_pandas()
+                                        meta_pd = None
+                                    tails_ddf = last_two.map_partitions(_tail_k_to_pandas, per_part, meta=meta_pd)
+
+                            # Persist the sampling graph to shrink upstream dependencies and avoid deep recursion
+                            try:
+                                if getattr(self, 'client', None) is not None:
+                                    self._log_info("Persisting sampling graph before compute")
+                                    tails_ddf = self.client.persist(tails_ddf, optimize_graph=False)
+                                    self._log_info("Persist submit ok")
+                            except Exception:
+                                pass
+                            try:
+                                n_tasks = len(tails_ddf.__dask_graph__())
+                                self._log_info("Stage 1 sampling graph", tasks=int(n_tasks), prefer_cudf_gather=bool(prefer_cudf_gather))
+                            except Exception:
+                                pass
+                            # Snapshot scheduler/workers before compute
+                            try:
+                                sched = self.client.scheduler_info() if self.client is not None else {}
+                                workers = list(sched.get('workers', {}).keys()) if sched else []
+                                self._log_info("Stage 1 sampling starting", nparts=int(nparts), workers=len(workers))
+                            except Exception:
+                                pass
+                            # Note: avoid client.run here to prevent potential stalls; rely on worker events and as_completed logs
+                            _t0 = _t.time()
+                            self._log_info("Computing per-partition tails")
+                            # Try to fetch a quick snapshot of current workers
+                            try:
+                                if getattr(self, 'client', None) is not None:
+                                    info = self.client.scheduler_info()
+                                    addrs = list(info.get('workers', {}).keys())
+                                    self._log_info("Workers snapshot", workers=len(addrs), addrs=addrs[:2])
+                            except Exception:
+                                pass
+                            # Ensure we use the distributed scheduler even if default isn't set
+                            try:
+                                if getattr(self, 'client', None) is not None:
+                                    parts = tails_ddf.to_delayed()
+                                    try:
+                                        self._log_info("Submitting tail futures", parts=int(len(parts)), prefer_cudf_gather=bool(prefer_cudf_gather))
+                                    except Exception:
+                                        pass
+                                    futs = self.client.compute(parts, optimize_graph=False)
+                                    try:
+                                        self._log_info("Tail futures submitted", futures=int(len(futs)))
+                                    except Exception:
+                                        pass
+                                    # Progress logging per-future completion
+                                    try:
+                                        from dask.distributed import as_completed as _as_completed
+                                        done = 0
+                                        total = len(futs)
+                                        for f in _as_completed(futs):
+                                            done += 1
+                                            where = None
+                                            try:
+                                                who = self.client.who_has([f])
+                                                where = who.get(f.key)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                self._log_info("Tail task completed", done=int(done), total=int(total), key=str(f.key), where=where[:1] if isinstance(where, list) else where)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                    parts_res = self.client.gather(futs)
+                                    if prefer_cudf_gather:
+                                        import cudf as _cudf
+                                        tails_df = _cudf.concat(parts_res, ignore_index=False)
+                                    else:
+                                        import pandas as _pd
+                                        tails_df = _pd.concat(parts_res, axis=0)
+                                else:
+                                    import dask as _d
+                                    parts = tails_ddf.to_delayed()
+                                    try:
+                                        self._log_info("Submitting tail parts (no client)", parts=int(len(parts)))
+                                    except Exception:
+                                        pass
+                                    parts_res = _d.compute(*parts, optimize_graph=False)
+                                    if prefer_cudf_gather:
+                                        import cudf as _cudf
+                                        tails_df = _cudf.concat(list(parts_res), ignore_index=False)
+                                    else:
+                                        import pandas as _pd
+                                        tails_df = _pd.concat(list(parts_res), axis=0)
+                            except Exception as _e_comp:
+                                # Bubble up to outer fallback path with context
+                                try:
+                                    import traceback as _tb
+                                    self._log_warn("Stage 1 sampling compute failed", error=str(_e_comp), trace=_tb.format_exc()[-512:])
+                                except Exception:
+                                    pass
+                                raise
+                            # Try capturing recent worker events for visibility (best-effort)
+                            try:
+                                if getattr(self, 'client', None) is not None:
+                                    ev = list(self.client.get_events("stage1") or [])
+                                    if ev:
+                                        recent = [e for _, e in ev[-min(6, len(ev)):]]
+                                        # Summarize event types and GPUs seen
+                                        types = [e.get('event', '?') for e in recent]
+                                        gpus = sorted({e.get('gpu', '?') for e in recent})
+                                        self._log_info("Stage 1 tail worker events", recent_types=types, gpus=gpus)
+                            except Exception:
+                                pass
+                            # Limit to max_rows and convert to pandas if needed
+                            try:
+                                tail_limited = tails_df.tail(max_rows)
+                            except Exception:
+                                # If tail fails on the in-memory type for any reason, fallback to slicing
+                                try:
+                                    n = int(max_rows)
+                                except Exception:
+                                    n = 100000
+                                tail_limited = tails_df.iloc[-n:]
+                            sample_pdf = tail_limited.to_pandas() if hasattr(tail_limited, 'to_pandas') else tail_limited
+                            try:
+                                self._log_info("Stage 1 sample types", tails_type=type(tails_df).__name__, sample_type=type(sample_pdf).__name__)
+                            except Exception:
+                                pass
+                            try:
+                                self._log_info(
+                                    "Stage 1 sampling finished",
+                                    rows=int(len(sample_pdf)),
+                                    cols=int(len(sample_pdf.columns)),
+                                    elapsed=f"{(_t.time()-_t0):.2f}s",
+                                )
+                            except Exception:
+                                pass
+                        except Exception:
+                            # Fallback: Direct GPU sampling without Dask
+                            try:
+                                print(f"DEBUG: Starting direct GPU sampling fallback")
+                                self._log_info(
+                                    "Starting direct GPU sampling fallback",
+                                    max_rows=int(max_rows),
+                                    last_two_type=type(last_two).__name__,
+                                )
+                                
+                                # Get GPU info before processing
+                                try:
+                                    import cupy as cp
+                                    current_gpu = cp.cuda.runtime.getDevice()
+                                    print(f"🎮 Using GPU {current_gpu} for direct sampling")
+                                except Exception:
+                                    print(f"🎮 GPU info not available")
+                                
+                                # Convert to cuDF using partitioned gather to avoid recursion/optimizer issues
+                                print(f"DEBUG: Converting to cuDF for direct GPU sampling (delayed gather)")
+                                try:
+                                    parts = last_two.to_delayed()
+                                    if getattr(self, 'client', None) is not None:
+                                        futs = self.client.compute(parts, optimize_graph=False)
+                                        parts_res = self.client.gather(futs)
+                                    else:
+                                        import dask as _d
+                                        parts_res = _d.compute(*parts, optimize_graph=False)
+                                    import cudf as _cudf
+                                    df_cudf = _cudf.concat(list(parts_res), ignore_index=False)
+                                except Exception:
+                                    # Fallback: try direct compute once
+                                    df_cudf = last_two.compute()
+                                print(f"DEBUG: Converted to cuDF with {len(df_cudf)} rows")
+                                
+                                # Take tail directly on GPU
+                                tail_cudf = df_cudf.tail(max_rows)
+                                print(f"DEBUG: GPU tail sampling completed with {len(tail_cudf)} rows")
+                                
+                                # Convert to pandas only at the very end
+                                sample_pdf = tail_cudf.to_pandas()
+                                print(f"DEBUG: Final conversion to pandas completed")
+                                
+                                try:
+                                    self._log_info(
+                                        "Stage 1 sampling (GPU fallback) finished",
+                                        rows=int(len(sample_pdf)),
+                                        cols=int(len(sample_pdf.columns)),
+                                        elapsed=f"{(_t.time()-_t0):.2f}s",
+                                    )
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                print(f"DEBUG: GPU sampling fallback failed: {e}")
+                                # Last resort: use head instead of tail, but keep on GPU
+                                try:
+                                    print(f"DEBUG: Last resort - using GPU head sampling")
+                                    head_cudf = last_two.head(max_rows).compute()
+                                    sample_pdf = head_cudf.to_pandas()
+                                    print(f"DEBUG: GPU head sampling completed with {len(sample_pdf)} rows")
+                                except Exception:
+                                    print(f"DEBUG: All GPU sampling methods failed")
+                                    pass
                         # If open fraction for candidate drivers is too low, expand sampling window
                         try:
                             # Collect drivers present among candidates
@@ -3750,14 +4135,81 @@ class StatisticalTests(BaseFeatureEngine):
                                 fracs = [(_d, _open_fraction(sample_pdf, _d)) for _d in drivers]
                                 worst = min((f for _, f in fracs), default=1.0)
                                 if worst < min_open_frac:
+                                    # Decide movement strategy once for expansion
+                                    try:
+                                        proto = str(getattr(self.settings.dask, 'protocol', 'tcp')).lower()
+                                    except Exception:
+                                        proto = 'tcp'
+                                    gpu_direct = bool(getattr(self.settings.features, 'stage1_gpu_direct', False))
+                                    prefer_cudf_gather = gpu_direct and (proto == 'ucx')
                                     # expand window progressively up to 6 parts or nparts
                                     for k in (4, 6, nparts):
                                         try:
                                             last_k = sub.partitions[max(0, nparts - k): nparts]
-                                            tail_ddf = last_k.tail(max_rows, npartitions=-1)
-                                            sample_pdf2 = tail_ddf.compute().to_pandas()
+                                            # Use the same per-partition sampling strategy
+                                            try:
+                                                per_part2 = max(1, int(max_rows // max(1, int(getattr(last_k, 'npartitions', 1)))))
+                                            except Exception:
+                                                per_part2 = max(1, int(max_rows // 2))
+                                            try:
+                                                cols_all = list(extras + [target] + candidates)
+                                                meta2 = last_k._meta[cols_all]
+                                            except Exception:
+                                                meta2 = last_k._meta
+                                            if prefer_cudf_gather:
+                                                tails_ddf2 = last_k.map_partitions(_tail_k, per_part2, meta=meta2)
+                                            else:
+                                                # Build pandas meta for expansion path
+                                                try:
+                                                    import pandas as _pd
+                                                    meta2_pd_cols = {}
+                                                    for c in (extras + [target] + candidates):
+                                                        try:
+                                                            if c == 'timestamp':
+                                                                meta2_pd_cols[c] = _pd.Series([], dtype='datetime64[ns]')
+                                                            else:
+                                                                meta2_pd_cols[c] = _pd.Series([], dtype='float32')
+                                                        except Exception:
+                                                            meta2_pd_cols[c] = _pd.Series([], dtype='float32')
+                                                    meta2_pd = _pd.DataFrame(meta2_pd_cols)
+                                                except Exception:
+                                                    meta2_pd = None
+                                                tails_ddf2 = last_k.map_partitions(_tail_k_to_pandas, per_part2, meta=meta2_pd)
+                                            # Persist and compute via client if available; avoid large graph optimize
+                                            try:
+                                                if getattr(self, 'client', None) is not None:
+                                                    tails_ddf2 = self.client.persist(tails_ddf2, optimize_graph=False)
+                                            except Exception:
+                                                pass
+                                            if getattr(self, 'client', None) is not None:
+                                                parts2 = tails_ddf2.to_delayed()
+                                                futs2 = self.client.compute(parts2, optimize_graph=False)
+                                                parts_res2 = self.client.gather(futs2)
+                                                if prefer_cudf_gather:
+                                                    import cudf as _cudf
+                                                    tails_df2 = _cudf.concat(parts_res2, ignore_index=False)
+                                                else:
+                                                    import pandas as _pd
+                                                    tails_df2 = _pd.concat(parts_res2, axis=0)
+                                            else:
+                                                import dask as _d
+                                                parts_res2 = _d.compute(*tails_ddf2.to_delayed(), optimize_graph=False)
+                                                if prefer_cudf_gather:
+                                                    import cudf as _cudf
+                                                    tails_df2 = _cudf.concat(list(parts_res2), ignore_index=False)
+                                                else:
+                                                    import pandas as _pd
+                                                    tails_df2 = _pd.concat(list(parts_res2), axis=0)
+                                            tl2 = tails_df2.tail(max_rows) if hasattr(tails_df2, 'tail') else tails_df2
+                                            sample_pdf2 = tl2.to_pandas() if hasattr(tl2, 'to_pandas') else tl2
                                         except Exception:
-                                            sample_pdf2 = sample_pdf
+                                            # Fallback to global tail if per-partition path fails
+                                            try:
+                                                tail_ddf2 = last_k.tail(max_rows, npartitions=-1)
+                                                sample_pdf2 = tail_ddf2.compute()
+                                                sample_pdf2 = sample_pdf2.to_pandas() if hasattr(sample_pdf2, 'to_pandas') else sample_pdf2
+                                            except Exception:
+                                                sample_pdf2 = sample_pdf
                                         fracs2 = [(_d, _open_fraction(sample_pdf2, _d)) for _d in drivers]
                                         worst2 = min((f for _, f in fracs2), default=1.0)
                                         if worst2 >= min_open_frac or k == nparts:
@@ -4217,6 +4669,7 @@ class StatisticalTests(BaseFeatureEngine):
                                             'timestamp',
                                             getattr(self.settings.features, 'session_auto_mask', None),
                                             getattr(self.settings.features.sessions, 'open_flag_map', None),
+                                            True,
                                             workers=target_worker,
                                             key=key,
                                         ))
@@ -4246,10 +4699,31 @@ class StatisticalTests(BaseFeatureEngine):
                                             'timestamp',
                                             getattr(self.settings.features, 'session_auto_mask', None),
                                             getattr(self.settings.features.sessions, 'open_flag_map', None),
+                                            bool(getattr(self, 'stage1_dashboard_per_feature', False)),
                                             workers=target_worker,
                                             key=key,
                                         ))
-                            results = self.client.gather(futs) if futs else []
+                            # Stream progress: consume futures as they complete
+                            results = []
+                            completed = 0
+                            total = len(futs)
+                            if futs:
+                                try:
+                                    from dask.distributed import as_completed as _as_completed
+                                    for fut in _as_completed(futs):
+                                        try:
+                                            part = fut.result()
+                                            results.append(part)
+                                            completed += 1
+                                            # Log progress every ~10% or every 20 tasks (whichever smaller)
+                                            step = max(1, min(20, total // 10))
+                                            if completed % step == 0 or completed == total:
+                                                self._log_info("Stage 1 dCor progress", done=int(completed), total=int(total))
+                                        except Exception as _e_res:
+                                            self._log_warn("Stage 1 dCor task failed", error=str(_e_res))
+                                except Exception:
+                                    # Fallback to gather
+                                    results = self.client.gather(futs)
                             # Optional: persist worker assignment map for dashboard/debug
                             try:
                                 if futs and bool(getattr(self, 'stage1_dashboard_per_feature', False)) and self.client is not None:
@@ -4302,9 +4776,48 @@ class StatisticalTests(BaseFeatureEngine):
                                                 pass
                             except Exception:
                                 pass
+                            # Get GPU info before processing
+                            try:
+                                import cupy as cp
+                                current_gpu = cp.cuda.runtime.getDevice()
+                                print(f"🎮 Using GPU {current_gpu} for dCor processing")
+                            except Exception:
+                                print(f"🎮 GPU info not available for dCor processing")
+                            
+                            print(f"ABOUT TO START GPU PROCESSING: {len(candidates)} features")
                             res_df = _dcor_partition_gpu(gdf, target, candidates, int(self.dcor_max_samples), int(tile))  # Calcula dCor em GPU
+                            print(f"GPU PROCESSING COMPLETED: {len(candidates)} features")
+                            
+                            # Extract and display dCor results
+                            try:
+                                if hasattr(res_df, 'attrs') and 'dcor_results' in res_df.attrs:
+                                    results_log = res_df.attrs['dcor_results']
+                                    target_name = res_df.attrs.get('target', 'unknown')
+                                    n_features = res_df.attrs.get('n_features', 0)
+                                    
+                                    print(f"🎯 dCor Results for target '{target_name}' ({n_features} features):")
+                                    for result in results_log:
+                                        print(f"  {result}")
+                                else:
+                                    print(f"⚠️  Could not extract dCor results from GPU processing")
+                            except Exception as e:
+                                print(f"⚠️  Error extracting dCor results: {e}")
+                            
                             row_b = res_df.to_pandas().iloc[0].to_dict()  # Converte resultado para dicionário
                             all_scores = {c: float(row_b.get(f"dcor_{c}", float('nan'))) for c in candidates}  # Extrai scores dCor por feature
+                            
+                            # Show top 10 dCor results
+                            try:
+                                valid_scores = {k: v for k, v in all_scores.items() if not np.isnan(v)}
+                                if valid_scores:
+                                    sorted_scores = sorted(valid_scores.items(), key=lambda x: x[1], reverse=True)
+                                    print(f"🏆 Top 10 dCor scores:")
+                                    for i, (feature, score) in enumerate(sorted_scores[:10]):
+                                        print(f"  {i+1:2d}. {feature}: {score:.6f}")
+                                else:
+                                    print(f"⚠️  No valid dCor scores found")
+                            except Exception as e:
+                                print(f"⚠️  Error displaying top scores: {e}")
 
                     # Diagnose NaN scores: compute coverage per feature (pairs with finite target)
                     try:

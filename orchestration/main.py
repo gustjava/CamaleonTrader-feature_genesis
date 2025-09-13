@@ -132,25 +132,28 @@ class DaskClusterManager:
             logger.warning(f"Could not detect system memory: {e}")
             return 8.0  # Default fallback
 
-    def _calculate_memory_limit(self) -> str:
-        """Calculate memory limit per worker based on system RAM and configuration."""
+    def _calculate_memory_limit(self, gpu_count: int) -> str:
+        """Calculate memory limit per worker to always use 80% of total system RAM."""
         try:
             # Check if using fraction-based configuration
             memory_fraction = float(getattr(self.config.dask, 'memory_limit_fraction', 0.0) or 0.0)
             
             if memory_fraction > 0.0:
-                # Use fraction of system RAM
                 system_memory_gb = self._get_system_memory_gb()
-                memory_per_worker_gb = system_memory_gb * memory_fraction
+                
+                # Always use 80% of total system RAM, divided equally among workers
+                total_memory_to_use = system_memory_gb * 0.8  # 80% of system RAM
+                memory_per_worker_gb = total_memory_to_use / gpu_count
                 
                 # Apply safety limits
                 min_memory_gb = 0.5  # Minimum 500MB per worker
-                max_memory_gb = system_memory_gb * 0.8  # Maximum 80% of system RAM
+                memory_per_worker_gb = max(min_memory_gb, memory_per_worker_gb)
                 
-                memory_per_worker_gb = max(min_memory_gb, min(memory_per_worker_gb, max_memory_gb))
+                total_memory_usage = memory_per_worker_gb * gpu_count
+                actual_fraction = total_memory_usage / system_memory_gb
                 
-                logger.info(f"Calculated memory limit per worker: {memory_per_worker_gb:.2f}GB "
-                           f"(system: {system_memory_gb:.2f}GB, fraction: {memory_fraction})")
+                logger.info(f"Dynamic memory calculation: {gpu_count} workers, {memory_per_worker_gb:.2f}GB per worker "
+                           f"(system: {system_memory_gb:.2f}GB, total: {total_memory_usage:.2f}GB, {actual_fraction:.1%})")
                 
                 return f"{memory_per_worker_gb:.2f}GB"
             else:
@@ -202,7 +205,23 @@ class DaskClusterManager:
             safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb))
 
             self._safe_rmm_pool_size_str = f"{safe_pool_gb:.2f}GB"
-            initial_pool_size = int(safe_init_gb * (1024 ** 3))
+
+            # Compute initial pool size (bytes) and align to 256-byte boundary as required by RMM
+            bytes_per_gb = 1024 ** 3
+            raw_init_bytes = int(safe_init_gb * bytes_per_gb)
+            # Ensure alignment to 256 bytes and non-zero
+            def _align_256(n: int) -> int:
+                if n <= 0:
+                    return 256
+                return max(256, (n // 256) * 256)
+            initial_pool_size = _align_256(raw_init_bytes)
+            # Cap initial pool to not exceed intended pool size
+            try:
+                pool_cap_bytes = int(safe_pool_gb * bytes_per_gb)
+                if initial_pool_size > pool_cap_bytes:
+                    initial_pool_size = _align_256(pool_cap_bytes)
+            except Exception:
+                pass
 
             try:
                 reinitialize(
@@ -210,8 +229,10 @@ class DaskClusterManager:
                     initial_pool_size=initial_pool_size,
                     managed_memory=False
                 )
-                logger.info(f"RMM configured (pool): initial={safe_init_gb:.2f}GB, "
-                           f"pool={safe_pool_gb:.2f}GB, cap={cap_gb:.2f}GB, total={total_gb:.2f}GB")
+                logger.info(
+                    f"RMM configured (pool): initial={initial_pool_size/bytes_per_gb:.2f}GB, "
+                    f"pool={safe_pool_gb:.2f}GB, cap={cap_gb:.2f}GB, total={total_gb:.2f}GB"
+                )
             except Exception as e_pool:
                 logger.warning(f"RMM pool init failed; falling back to default CUDA allocator: {e_pool}")
                 os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
@@ -292,8 +313,8 @@ class DaskClusterManager:
             except Exception as e:
                 logger.warning(f"Could not set Dask memory config: {e}")
 
-            # Calculate memory limit per worker
-            memory_limit_str = self._calculate_memory_limit()
+            # Calculate memory limit per worker (dynamic based on GPU count)
+            memory_limit_str = self._calculate_memory_limit(gpu_count)
             
             # Configure dashboard (can be disabled to reduce WebSocket logs)
             dashboard_enabled = getattr(self.config.monitoring, 'dashboard_enabled', True)

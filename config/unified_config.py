@@ -99,6 +99,8 @@ class FeatureConfig:
     post_stage1_rolling_corr: bool = False
     # Debug/visibility: show per-feature dCor tasks in dashboard (off by default)
     stage1_dashboard_per_feature: bool = False
+    # Stage 1 sampling/compute: use GPU-direct path (avoid pandas on driver)
+    stage1_gpu_direct: bool = True
     frac_diff: Dict[str, Any] = field(default_factory=lambda: {
         'd_values': [0.1, 0.2, 0.3, 0.4, 0.5],
         'threshold': 1e-5,
@@ -129,6 +131,9 @@ class FeatureConfig:
         'tolerance': 1e-8,
         'max_iterations': 100
     })
+    # JB (Jarque–Bera) aggregates configuration
+    jb_base_column: Optional[str] = None  # e.g., 'y_ret_1m'; if None, fallback logic selects first return
+    jb_windows: Optional[List[int]] = None  # if None, uses rolling_windows
     # Legacy fields for backward compatibility
     frac_diff_values: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3, 0.4, 0.5])
     frac_diff_threshold: float = 1e-5

@@ -41,17 +41,17 @@ dask:
   gpus_per_worker: 1  # Uma GPU por worker (otimizado para isolamento)
   threads_per_worker: 1  # Uma thread por worker (evita conflitos GPU)
   memory_limit: "0GB"  # Desabilitado - usar memory_limit_fraction
-  memory_limit_fraction: 0.25  # 25% da RAM do sistema por worker (adaptável)
+  memory_limit_fraction: 0.25  # Sempre usa 80% da RAM total, dividido igualmente entre workers
   
   # RMM (RAPIDS Memory Manager) settings - Gerenciamento de memória GPU
   # Tamanhos fixos desabilitados - usando apenas configurações proporcionais
   rmm_pool_size: "0GB"  # Desabilitado - usar rmm_pool_fraction
   rmm_initial_pool_size: "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
   rmm_maximum_pool_size: "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
-  # Configurações proporcionais desabilitadas
-  rmm_pool_fraction: 0.0              # RMM desabilitado
-  rmm_initial_pool_fraction: 0.0      # RMM desabilitado
-  rmm_maximum_pool_fraction: 0.0      # RMM desabilitado
+  # Pool proporcional de memória na GPU (ativado)
+  rmm_pool_fraction: 0.40
+  rmm_initial_pool_fraction: 0.30
+  rmm_maximum_pool_fraction: 0.50
   spilling_enabled: true  # Habilita spill para RAM quando GPU fica cheia
   spilling_target: 0.9  # Alvo de utilização antes do spill
   spilling_max_spill: "32GB"  # Máximo de spill permitido
@@ -61,11 +61,11 @@ dask:
   memory_spill_fraction: 0.9  # Inicia spill quando RAM atinge 90%
   local_directory: "/tmp/dask-worker-space"  # Diretório para spill de dados
   
-  # Network protocol settings - Configurações de rede para comunicação entre workers
-  protocol: "tcp"  # Protocolo TCP para estabilidade
-  enable_tcp_over_ucx: false  # Desabilita TCP sobre UCX
-  enable_infiniband: false  # InfiniBand desabilitado (não disponível)
-  enable_nvlink: false  # Desabilita NVLink para evitar problemas
+  # Network protocol settings - usar TCP para estabilidade
+  protocol: "tcp"
+  enable_tcp_over_ucx: false
+  enable_infiniband: false
+  enable_nvlink: false
 
 # Feature Engineering Configuration
 # Parameters for all feature engineering engines
@@ -73,6 +73,12 @@ features:
   # Rolling window configurations for various calculations
   rolling_windows: [10, 20, 50, 100, 200]
   rolling_min_periods: 1
+  # JB (Jarque–Bera) aggregates base column and windows
+  # Define which series to use as base for JB normality aggregates.
+  # If not present in the dataset, the code falls back to the first available return (prefers y_ret_1m).
+  jb_base_column: frac_diff_y_ret_1m
+  # Optionally override JB windows (defaults to rolling_windows if omitted or empty)
+  # jb_windows: [10, 20]
   
   # Rolling correlation configuration
   rolling_corr:
@@ -368,6 +374,8 @@ features:
   stage1_broadcast_scores: true
   # Dashboard: submit Stage 1 dCor tasks per-feature (more tasks; enable only for debug)
   stage1_dashboard_per_feature: true
+  # Stage 1: GPU-direct sampling (avoid pandas on driver)
+  stage1_gpu_direct: true
   # MI clustering (Stage 2) scalable options
   mi_cluster_enabled: true
   mi_cluster_method: agglo
