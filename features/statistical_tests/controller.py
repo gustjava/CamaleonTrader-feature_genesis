@@ -6,6 +6,7 @@ and feature selection operations, providing a unified interface to the modular c
 """
 
 import logging
+import uuid
 import numpy as np
 import cupy as cp
 import cudf
@@ -80,6 +81,8 @@ class StatisticalTests(BaseFeatureEngine):
             self.dcor_top_k = int(getattr(uc.features, 'dcor_top_k', 50))
             self.dcor_include_permutation = bool(getattr(uc.features, 'dcor_include_permutation', False))
             self.dcor_permutations = int(getattr(uc.features, 'dcor_permutations', 0))
+            # Feature toggles
+            self.enable_adf_rolling = bool(getattr(uc.features, 'enable_adf_rolling', False))
             # Rolling JB configuration
             self.jb_base_column = getattr(uc.features, 'jb_base_column', None)
             try:
@@ -196,22 +199,63 @@ class StatisticalTests(BaseFeatureEngine):
             # JB defaults
             self.jb_base_column = 'y_ret_1m'
             self.jb_windows = []
+            # Feature toggles
+            self.enable_adf_rolling = False
 
     def _log_info(self, message: str, **kwargs):
-        """Log info message with optional context."""
-        logger.info(f"StatisticalTests: {message}", extra=kwargs)
+        """Log info message with optional context and phase/session markers."""
+        sid = getattr(self, '_sid', None)
+        stage = getattr(self, '_stage', None)
+        prefix = []
+        if sid:
+            prefix.append(f"sid={sid}")
+        if stage:
+            prefix.append(f"stage={stage}")
+        pfx = ("[" + "][".join(prefix) + "] ") if prefix else ""
+        logger.info(f"StatisticalTests: {pfx}{message}", extra=kwargs)
     
     def _log_warn(self, message: str, **kwargs):
-        """Log warning message with optional context."""
-        logger.warning(f"StatisticalTests: {message}", extra=kwargs)
+        """Log warning message with optional context and phase/session markers."""
+        sid = getattr(self, '_sid', None)
+        stage = getattr(self, '_stage', None)
+        prefix = []
+        if sid:
+            prefix.append(f"sid={sid}")
+        if stage:
+            prefix.append(f"stage={stage}")
+        pfx = ("[" + "][".join(prefix) + "] ") if prefix else ""
+        logger.warning(f"StatisticalTests: {pfx}{message}", extra=kwargs)
     
     def _log_error(self, message: str, **kwargs):
-        """Log error message with optional context."""
-        logger.error(f"StatisticalTests: {message}", extra=kwargs)
+        """Log error message with optional context and phase/session markers."""
+        sid = getattr(self, '_sid', None)
+        stage = getattr(self, '_stage', None)
+        prefix = []
+        if sid:
+            prefix.append(f"sid={sid}")
+        if stage:
+            prefix.append(f"stage={stage}")
+        pfx = ("[" + "][".join(prefix) + "] ") if prefix else ""
+        logger.error(f"StatisticalTests: {pfx}{message}", extra=kwargs)
     
     def _log_debug(self, message: str, **kwargs):
-        """Log debug message with optional context."""
-        logger.debug(f"StatisticalTests: {message}", extra=kwargs)
+        """Log debug message with optional context and phase/session markers."""
+        sid = getattr(self, '_sid', None)
+        stage = getattr(self, '_stage', None)
+        prefix = []
+        if sid:
+            prefix.append(f"sid={sid}")
+        if stage:
+            prefix.append(f"stage={stage}")
+        pfx = ("[" + "][".join(prefix) + "] ") if prefix else ""
+        logger.debug(f"StatisticalTests: {pfx}{message}", extra=kwargs)
+
+    def _set_stage(self, stage: str):
+        """Set current stage label for logging context."""
+        try:
+            self._stage = str(stage)
+        except Exception:
+            self._stage = stage
     
     def _critical_error(self, message: str, **kwargs):
         """Log critical error and raise exception."""
@@ -340,9 +384,15 @@ class StatisticalTests(BaseFeatureEngine):
             DataFrame with statistical test results
         """
         try:
+            try:
+                self._sid = uuid.uuid4().hex[:8]
+            except Exception:
+                self._sid = None
+            self._set_stage('init')
             self._log_info("Starting comprehensive statistical tests pipeline...")
             
             # 1. ADF TESTS IN BATCH
+            self._set_stage('adf')
             df = self.adf_tests._apply_comprehensive_adf_tests(df)
             
             # 1b. JB rolling p-values (cuDF path)
@@ -373,9 +423,11 @@ class StatisticalTests(BaseFeatureEngine):
                             self._log_warn("JB (cuDF) rolling failed", window=str(w), error=str(e))
             
             # 2. DISTANCE CORRELATION TESTS
+            self._set_stage('dcor')
             df = self.distance_correlation._apply_comprehensive_distance_correlation(df)
             
             # 3. ADDITIONAL STATISTICAL TESTS
+            self._set_stage('final_stats')
             df = self.statistical_analysis.apply_comprehensive_statistical_analysis(df)
             
             self._log_info("Comprehensive statistical tests pipeline completed successfully")
@@ -394,6 +446,12 @@ class StatisticalTests(BaseFeatureEngine):
         Returns:
             DataFrame with statistical test results
         """
+        # Initialize session id and stage markers for this run
+        try:
+            self._sid = uuid.uuid4().hex[:8]
+        except Exception:
+            self._sid = None
+        self._set_stage('init')
         self._log_info("Starting StatisticalTests (Dask)...")
 
         # Validate primary target; support computing log-forward returns if configured
@@ -475,6 +533,7 @@ class StatisticalTests(BaseFeatureEngine):
         processed_count = 0
         skipped_count = 0
 
+        self._set_stage('adf')
         for col in adf_cols:
             # Use a unique, safe output column name to avoid collisions across frac_diff variants
             try:
@@ -507,6 +566,7 @@ class StatisticalTests(BaseFeatureEngine):
             self._log_info(f"ADF: Completed processing {processed_count} features, skipped {skipped_count} (already exist)")
 
         # --- Rolling JB p-value on base return column(s) ---
+        self._set_stage('jb')
         try:
             jb_windows = list(getattr(self, 'jb_windows', []) or [])
         except Exception:
@@ -558,43 +618,10 @@ class StatisticalTests(BaseFeatureEngine):
                         self._log_warn("JB rolling failed for a window", window=str(w), error=str(e))
 
         # --- Pre-selection Statistical Analysis (broadcast constants; no corr matrix) ---
-        try:
-            self._log_info("Pre-selection: computing statistical analysis features on tail sample…")
-            stats_sample = self._sample_tail_across_partitions(df, min(self.selection_max_rows, 50000), max_parts=8)
-            if stats_sample is not None and len(stats_sample) > 0:
-                before_cols = set(map(str, stats_sample.columns))
-                # Use lightweight preselection stats (no correlation matrices here)
-                stats_enriched = self.statistical_analysis.apply_preselection_stat_features(stats_sample)
-                after_cols = set(map(str, stats_enriched.columns))
-                added = sorted(list(after_cols - before_cols))
-                consts = {}
-                for c in added:
-                    try:
-                        col = stats_enriched[c]
-                        val = None
-                        if hasattr(col, 'iloc') and len(col) > 0:
-                            val = col.iloc[0]
-                        if val is None:
-                            continue
-                        try:
-                            consts[c] = float(val)
-                        except Exception:
-                            consts[c] = val
-                    except Exception:
-                        continue
-                if consts:
-                    df = df.assign(**consts)
-                    self._log_info(f"Pre-selection: broadcasted {len(consts)} statistical features")
-                    try:
-                        df = df.persist()
-                    except Exception:
-                        pass
-            else:
-                self._log_warn("Pre-selection: tail sample empty; skipping statistical features broadcast")
-        except Exception as e:
-            self._log_warn("Pre-selection statistical analysis failed; continuing", error=str(e))
+        # (Pre-selection statistical broadcasting removed per request)
 
         # --- Distance Correlation Analysis ---
+        self._set_stage('dcor')
         if primary_target and primary_target in df.columns:
             self._log_info("Starting distance correlation analysis...")
             
@@ -612,6 +639,7 @@ class StatisticalTests(BaseFeatureEngine):
                 self._log_warn("No candidate features found for distance correlation analysis")
 
         # --- Feature Selection Pipeline ---
+        self._set_stage('selection')
         if primary_target and primary_target in df.columns:
             self._log_info("Starting feature selection pipeline...")
             
@@ -622,8 +650,9 @@ class StatisticalTests(BaseFeatureEngine):
                 self._log_info("Feature selection pipeline completed", 
                               final_count=len(selection_results.get('stage3_final_selected', [])))
 
-        # --- Additional Statistical Analysis ---
-        self._log_info("Applying additional statistical analysis...")
+        # --- Final Statistical Analysis (comprehensive) ---
+        self._set_stage('final_stats')
+        self._log_info("Final statistical analysis (comprehensive)…")
         df = df.map_partitions(self.statistical_analysis.apply_comprehensive_statistical_analysis)
 
         self._log_info("StatisticalTests (Dask) completed successfully")
@@ -646,12 +675,15 @@ class StatisticalTests(BaseFeatureEngine):
             def _is_numeric_dt(dt: str) -> bool:
                 s = (dt or '').lower()
                 if not s:
-                    # Unknown dtype: be conservative and exclude
-                    return False
+                    # Unknown dtype in meta: treat as potentially numeric (avoid over-filtering)
+                    return True
                 bad = ('object', 'str', 'string', 'category', 'datetime', 'timedelta', 'date')
                 if any(b in s for b in bad):
                     return False
-                ok = ('int', 'float', 'double', 'bool')
+                ok = (
+                    'int', 'uint', 'float', 'double', 'bool',  # common dtype names
+                    'f4', 'f8', 'i4', 'i8', 'u4', 'u8'          # short dtype mnemonics seen in some metas
+                )
                 return any(k in s for k in ok)
             
             # Filter candidate features
@@ -722,14 +754,21 @@ class StatisticalTests(BaseFeatureEngine):
             return []
 
     def _apply_distance_correlation_analysis(self, df: dask_cudf.DataFrame, target: str, candidates: List[str]) -> dask_cudf.DataFrame:
-        """Apply distance correlation once on a global tail sample, then broadcast constants."""
+        """Compute distance correlation on a global sample and keep scores in-memory only.
+
+        Note: does NOT add `dcor_*` columns to the DataFrame to avoid column explosion.
+        Stores results in `self._last_dcor_scores` for downstream selection.
+        """
         try:
             # Build a tail sample across last partitions to represent recent behavior
             sample_n = int(max(1000, min(self.dcor_max_samples * 2, 200000)))
             sample = self._sample_tail_across_partitions(df, sample_n, max_parts=16)
             if sample is None or len(sample) == 0 or target not in sample.columns:
-                self._log_warn("dCor tail sample empty or target missing; skipping dCor broadcast")
-                return df
+                self._log_warn("dCor tail sample empty or missing target; trying head sample")
+                sample = self._sample_head_across_partitions(df, sample_n, max_parts=16)
+                if sample is None or len(sample) == 0 or target not in sample.columns:
+                    self._log_warn("dCor sampling failed; skipping dCor broadcast")
+                    return df
             # Convert target to CuPy
             try:
                 y = sample[target].astype('f8').to_cupy()
@@ -765,14 +804,12 @@ class StatisticalTests(BaseFeatureEngine):
             except Exception:
                 pass
 
-            # Broadcast constants as new columns across the Dask DataFrame
-            if dcor_map:
-                df = df.assign(**dcor_map)
-                # Persist to avoid recomputation of upstream graph in subsequent stages
-                try:
-                    df = df.persist()
-                except Exception:
-                    pass
+            # Keep in memory only for selection; avoid adding columns to df
+            try:
+                # Convert to feature->score mapping for convenience in selection
+                self._last_dcor_scores = {k.replace('dcor_', ''): v for k, v in dcor_map.items()}
+            except Exception:
+                self._last_dcor_scores = {}
             return df
         except Exception as e:
             self._log_warn(f"Error in distance correlation analysis (tail-based): {e}")
@@ -920,21 +957,27 @@ class StatisticalTests(BaseFeatureEngine):
                         valid_candidates = [c for c in valid_candidates if c not in forbidden_in_last_resort]
                         self._log_info(f"Removed forbidden features from last resort. Final count: {len(valid_candidates)}")
             
-            # Get distance correlation scores (robust to NA/pd.NA/cudf.NA)
-            dcor_scores = {}
-            if len(sample_df) > 0:
+            # Get distance correlation scores (prefer in-memory scores; fallback to columns if present)
+            dcor_scores: Dict[str, float] = {}
+            # First, try the in-memory scores computed during dCor phase
+            try:
+                mem_scores = getattr(self, '_last_dcor_scores', {}) or {}
+                if mem_scores:
+                    for col in valid_candidates:
+                        dcor_scores[col] = float(mem_scores.get(col, 0.0))
+            except Exception:
+                pass
+            # If still empty, fallback to reading from sample columns (legacy path)
+            if not dcor_scores and len(sample_df) > 0:
                 for col in valid_candidates:
                     dcor_col = f"dcor_{col}"
                     if dcor_col in sample_df.columns:
                         try:
                             val = sample_df[dcor_col].iloc[0]
-                            try:
-                                score = float(val)
-                            except Exception:
-                                score = 0.0
-                            dcor_scores[col] = float(score)
+                            score = float(val) if val is not None else 0.0
                         except Exception:
-                            dcor_scores[col] = 0.0
+                            score = 0.0
+                        dcor_scores[col] = score
             
             # Apply feature selection pipeline
             selection_results = self.feature_selection.apply_feature_selection_pipeline(

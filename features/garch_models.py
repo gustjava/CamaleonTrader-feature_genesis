@@ -454,7 +454,7 @@ class GARCHModels(BaseFeatureEngine):
             n_nonnull = int(price_series.notna().sum())
             n_null = int(n_total - n_nonnull)
             # Returns diagnostic
-            px = price_series.fillna(method='ffill').fillna(method='bfill')
+            px = price_series.ffill().bfill()
             if self.log_price:
                 px = np.log(np.maximum(px.to_numpy(dtype=float), 1e-8))
             else:

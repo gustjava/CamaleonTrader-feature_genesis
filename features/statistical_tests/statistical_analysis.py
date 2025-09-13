@@ -147,8 +147,11 @@ class StatisticalAnalysis:
         try:
             self._log_info("Applying additional statistical tests...")
             
-            # Find frac_diff columns for additional analysis
-            frac_diff_cols = [col for col in df.columns if "frac_diff" in col]
+            # Find frac_diff columns for additional analysis (exclude ADF metrics)
+            frac_diff_cols = [
+                col for col in df.columns
+                if ("frac_diff" in str(col)) and (not str(col).startswith(("adf_", "adf_stat_")))
+            ]
             
             if len(frac_diff_cols) > 1:
                 # Compute correlation matrix between frac_diff series
@@ -241,6 +244,8 @@ class StatisticalAnalysis:
                     except Exception:
                         continue
                 columns = numeric_cols
+            # Exclude ADF metrics in any case
+            columns = [c for c in columns if not str(c).startswith(("adf_", "adf_stat_"))]
             
             if len(columns) < 2:
                 return {
@@ -333,6 +338,9 @@ class StatisticalAnalysis:
                     except Exception:
                         continue
                 columns = numeric_cols
+            else:
+                # Exclude ADF metrics from provided list
+                columns = [c for c in columns if not str(c).startswith(("adf_", "adf_stat_"))]
             
             if not columns:
                 return {}
@@ -432,6 +440,9 @@ class StatisticalAnalysis:
                     except Exception:
                         continue
                 columns = numeric_cols
+            else:
+                # Exclude ADF metrics from provided list
+                columns = [c for c in columns if not str(c).startswith(("adf_", "adf_stat_"))]
             
             if not columns:
                 return df
@@ -498,18 +509,25 @@ class StatisticalAnalysis:
             DataFrame with statistical analysis results added
         """
         try:
-            self._log_info("Starting comprehensive statistical analysis...")
+            self._log_info("Starting comprehensive statistical analysis (final stage)...")
             
             # 1. Apply additional statistical tests
             df = self._apply_additional_statistical_tests(df)
             
-            # 2. Apply normality tests to key columns
-            key_columns = [col for col in df.columns if any(term in col.lower() for term in ['y_close', 'y_ret', 'frac_diff'])]
+            # 2. Apply normality tests to key columns (exclude ADF metrics)
+            key_columns = [
+                col for col in df.columns
+                if any(term in str(col).lower() for term in ['y_close', 'y_ret', 'frac_diff'])
+                and (not str(col).startswith(("adf_", "adf_stat_")))
+            ]
             if key_columns:
                 df = self.apply_normality_tests(df, key_columns)
             
-            # 3. Compute correlation matrix for frac_diff columns
-            frac_diff_cols = [col for col in df.columns if "frac_diff" in col]
+            # 3. Compute correlation matrix for frac_diff columns (exclude ADF metrics)
+            frac_diff_cols = [
+                col for col in df.columns
+                if ("frac_diff" in str(col)) and (not str(col).startswith(("adf_", "adf_stat_")))
+            ]
             if len(frac_diff_cols) > 1:
                 corr_results = self.compute_correlation_matrix(df, frac_diff_cols)
                 if corr_results['correlation_matrix']:
@@ -541,8 +559,12 @@ class StatisticalAnalysis:
         try:
             self._log_info("Starting pre-selection statistical features (lightweight)...")
 
-            # Normality on key columns
-            key_columns = [col for col in df.columns if any(term in col.lower() for term in ['y_close', 'y_ret', 'frac_diff'])]
+            # Normality on key columns (exclude ADF metrics)
+            key_columns = [
+                col for col in df.columns
+                if any(term in str(col).lower() for term in ['y_close', 'y_ret', 'frac_diff'])
+                and (not str(col).startswith(("adf_", "adf_stat_")))
+            ]
             if key_columns:
                 df = self.apply_normality_tests(df, key_columns)
 

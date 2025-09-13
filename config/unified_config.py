@@ -161,6 +161,8 @@ class FeatureConfig:
     vif_threshold: float = 5.0
     mi_threshold: float = 0.3
     stage3_top_n: int = 50
+    # ADF rolling feature generation (disabled by default; diagnostics only)
+    enable_adf_rolling: bool = False
     # Stage 3 wrappers (LightGBM tuning)
     stage3_task: str = "auto"  # auto|regression|classification
     stage3_random_state: int = 42
