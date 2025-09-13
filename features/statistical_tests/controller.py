@@ -66,7 +66,7 @@ class StatisticalTests(BaseFeatureEngine):
         """Load configuration parameters from settings."""
         try:
             # Configurable parameters with safe fallbacks
-            self.dcor_max_samples = getattr(settings.features, 'distance_corr_max_samples', 10000)
+            self.dcor_max_samples = getattr(self.settings.features, 'distance_corr_max_samples', 10000)
         except Exception:
             self.dcor_max_samples = 10000  # Default fallback
             
@@ -205,6 +205,46 @@ class StatisticalTests(BaseFeatureEngine):
         self._log_error(message, **kwargs)
         raise RuntimeError(f"StatisticalTests Critical Error: {message}")
 
+    def _sample_head_across_partitions(self, df: dask_cudf.DataFrame, n: int, max_parts: int = 16) -> cudf.DataFrame:
+        """Collect up to n rows by sampling the head of several partitions safely.
+
+        Avoids Dask head() alignment issues with non-unique indices by computing
+        partition heads separately and concatenating on GPU with ignore_index.
+        """
+        try:
+            import dask
+        except Exception:
+            # Fallback to simple head if dask import fails (shouldn't happen here)
+            try:
+                return df.head(int(n))
+            except Exception:
+                return cudf.DataFrame()
+        try:
+            nparts = int(getattr(df, 'npartitions', 1))
+            k = max(1, min(int(max_parts), nparts))
+            per = max(1, int(np.ceil(float(n) / float(k))))
+            parts = list(df.to_delayed())[:k]
+            # Build delayed heads to avoid alignment logic
+            delayed_heads = [dask.delayed(lambda _pdf, _per: _pdf.head(_per))(p, per) for p in parts]
+            gdfs = dask.compute(*delayed_heads)
+            frames = [g for g in gdfs if g is not None]
+            if not frames:
+                return cudf.DataFrame()
+            sample = cudf.concat(frames, ignore_index=True)
+            if len(sample) > int(n):
+                sample = sample.head(int(n))
+            return sample
+        except Exception as e:
+            self._log_warn("sample_head_across_partitions failed; falling back to head", error=str(e))
+            try:
+                return df.head(int(n))
+            except Exception:
+                try:
+                    # Last resort: first partition only
+                    return df.get_partition(0).head(int(n)).compute()
+                except Exception:
+                    return cudf.DataFrame()
+
     def process_cudf(self, df: cudf.DataFrame) -> cudf.DataFrame:
         """
         Process cuDF DataFrame with comprehensive statistical tests.
@@ -287,8 +327,9 @@ class StatisticalTests(BaseFeatureEngine):
                             hint="Check config.features.selection_target_column and dataset labeling",
                             sample_schema=sample_cols[:20]
                         )
-            except Exception:
+            except Exception as e:
                 # If columns access fails unexpectedly, keep going and let later code raise
+                self._log_error(f"Failed to access columns for dCor ranking: {e}")
                 pass
 
         # Multi-target sweep (if configured): run selection per target and persist comparison
@@ -317,16 +358,47 @@ class StatisticalTests(BaseFeatureEngine):
 
         # --- ADF rolling window on fractional difference columns ---
         adf_cols = [c for c in df.columns if "frac_diff" in c]
+        
+        if adf_cols:
+            self._log_info(f"ADF: Found {len(adf_cols)} frac_diff features to process", 
+                          features=adf_cols[:10],  # Show first 10 features
+                          total_count=len(adf_cols))
+        else:
+            self._log_info("ADF: No frac_diff features found to process")
 
+        processed_count = 0
+        skipped_count = 0
+        
         for col in adf_cols:
-            self._log_info(f"ADF rolling on '{col}'...")
-            out = f"adf_stat_{col.split('_')[-1]}"
+            # Use a unique, safe output column name to avoid collisions across frac_diff variants
+            try:
+                safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
+            except Exception:
+                safe = str(col)
+            out = f"adf_stat_{safe}"
+            # Skip if the column already exists to prevent redundant recomputation
+            try:
+                if out in df.columns:
+                    skipped_count += 1
+                    continue
+            except Exception as e:
+                self._log_error(f"Failed to check if column exists: {e}")
+                pass
+            
             df[out] = df[col].map_partitions(
                 self.adf_tests._apply_adf_rolling,
                 252,  # Window size (1 year of trading days)
                 200,  # Minimum periods
                 meta=(out, "f8"),
             )
+            processed_count += 1
+            
+            # Log progress every 10 features to reduce spam
+            if processed_count % 10 == 0:
+                self._log_info(f"ADF: Processed {processed_count}/{len(adf_cols)} features...")
+
+        if adf_cols:
+            self._log_info(f"ADF: Completed processing {processed_count} features, skipped {skipped_count} (already exist)")
 
         # --- Distance Correlation Analysis ---
         if primary_target and primary_target in df.columns:
@@ -336,7 +408,9 @@ class StatisticalTests(BaseFeatureEngine):
             candidate_features = self._find_candidate_features(df)
             
             if candidate_features:
-                self._log_info(f"Found {len(candidate_features)} candidate features for distance correlation")
+                self._log_info(f"Found {len(candidate_features)} candidate features for distance correlation", 
+                              candidates=candidate_features[:15],  # Show first 15 candidates
+                              total_count=len(candidate_features))
                 
                 # Apply distance correlation analysis
                 df = self._apply_distance_correlation_analysis(df, primary_target, candidate_features)
@@ -364,9 +438,27 @@ class StatisticalTests(BaseFeatureEngine):
     def _find_candidate_features(self, df: dask_cudf.DataFrame) -> List[str]:
         """Find candidate features for analysis."""
         try:
-            # Get sample of columns
-            sample_df = df.head(100)
-            all_columns = list(sample_df.columns)
+            # Use schema directly; avoid triggering compute via head()
+            all_columns = list(df.columns)
+            # Build a dtype map to filter non-numeric columns
+            dtype_map = {}
+            try:
+                dts = getattr(df, 'dtypes', None)
+                if dts is not None:
+                    # dask-cuDF returns a pandas Series-like object
+                    dtype_map = {str(k): str(v).lower() for k, v in dts.items()}
+            except Exception:
+                dtype_map = {}
+            def _is_numeric_dt(dt: str) -> bool:
+                s = (dt or '').lower()
+                if not s:
+                    # Unknown dtype: be conservative and exclude
+                    return False
+                bad = ('object', 'str', 'string', 'category', 'datetime', 'timedelta', 'date')
+                if any(b in s for b in bad):
+                    return False
+                ok = ('int', 'float', 'double', 'bool')
+                return any(k in s for k in ok)
             
             # Filter candidate features
             candidates = []
@@ -377,11 +469,11 @@ class StatisticalTests(BaseFeatureEngine):
                     any(col.startswith(prefix) for prefix in self.feature_deny_prefixes)):
                     continue
                 
-                # Include frac_diff columns and other relevant features
-                if ('frac_diff' in col or 
-                    col.startswith(('y_', 'x_')) or
-                    any(col.startswith(prefix) for prefix in self.feature_allow_prefixes)):
-                    candidates.append(col)
+                # Include frac_diff columns and other relevant features, but only numeric types
+                if ('frac_diff' in col or col.startswith(('y_', 'x_')) or any(col.startswith(prefix) for prefix in self.feature_allow_prefixes)):
+                    dt = dtype_map.get(col, '')
+                    if _is_numeric_dt(dt):
+                        candidates.append(col)
             
             return candidates
             
@@ -419,30 +511,53 @@ class StatisticalTests(BaseFeatureEngine):
         try:
             # Get candidate features
             candidates = self._find_candidate_features(df)
-            
             if not candidates:
-                return {}
-            
-            # Apply feature selection to a sample of the data
-            sample_df = df.head(self.selection_max_rows)
-            
-            # Get distance correlation scores
+                self._critical_error("No candidate features available for selection")
+
+            # Apply feature selection to a sample of the data (span more partitions safely)
+            sample_df = self._sample_head_across_partitions(df, self.selection_max_rows, max_parts=16)
+
+            # Sanity-check candidates against the sample: keep only columns castable to float
+            valid_candidates: List[str] = []
+            invalid_candidates: List[str] = []
+            for c in candidates:
+                try:
+                    # Attempt a lightweight dtype cast on sample to ensure numeric compatibility
+                    _ = sample_df[c].astype('f4')
+                    valid_candidates.append(c)
+                except Exception:
+                    invalid_candidates.append(c)
+            if invalid_candidates:
+                # Trim to avoid downstream MI/GPU failures (informational)
+                self._log_info("Dropping non-numeric candidates prior to selection", dropped=len(invalid_candidates))
+
+            if not valid_candidates:
+                self._critical_error("No valid numeric candidates after sanitization")
+
+            # Get distance correlation scores (robust to NA/pd.NA/cudf.NA)
             dcor_scores = {}
-            for col in candidates:
-                dcor_col = f"dcor_{col}"
-                if dcor_col in sample_df.columns:
-                    dcor_scores[col] = float(sample_df[dcor_col].iloc[0]) if len(sample_df) > 0 else 0.0
-            
+            if len(sample_df) > 0:
+                for col in valid_candidates:
+                    dcor_col = f"dcor_{col}"
+                    if dcor_col in sample_df.columns:
+                        try:
+                            val = sample_df[dcor_col].iloc[0]
+                            try:
+                                score = float(val)
+                            except Exception:
+                                score = 0.0
+                            dcor_scores[col] = float(score)
+                        except Exception:
+                            dcor_scores[col] = 0.0
+
             # Apply feature selection pipeline
             selection_results = self.feature_selection.apply_feature_selection_pipeline(
-                sample_df, target, candidates, dcor_scores
+                sample_df, target, valid_candidates, dcor_scores
             )
-            
             return selection_results
-            
         except Exception as e:
-            self._log_warn(f"Error in feature selection pipeline: {e}")
-            return {}
+            # Escalate: this is a critical failure for the stats engine
+            self._critical_error(f"Feature selection pipeline failed: {e}")
 
     def _compute_forward_log_return_partition(self, pdf: cudf.DataFrame, price_col: str, horizon: int, out_col: str) -> cudf.DataFrame:
         """Compute forward log returns for a partition."""
@@ -465,9 +580,9 @@ class StatisticalTests(BaseFeatureEngine):
     def _mt_currency_pair(self, df: dask_cudf.DataFrame) -> str:
         """Extract currency pair identifier from DataFrame."""
         try:
-            # Try to get currency pair from metadata or column names
-            sample_cols = list(df.head(10).columns)
-            for col in sample_cols:
+            # Try to get currency pair from column names without triggering compute
+            cols = list(df.columns)
+            for col in cols:
                 if 'currency' in col.lower() or 'pair' in col.lower():
                     return str(col)
             return 'unknown'

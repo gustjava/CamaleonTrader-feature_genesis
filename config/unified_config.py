@@ -66,7 +66,7 @@ class DaskConfig:
     threads_per_worker: int = 1
     memory_limit: str = "0GB"  # Desabilitado - usar memory_limit_fraction
     # New: proportional memory sizing (fraction of system RAM). If > 0, this overrides fixed memory_limit.
-    memory_limit_fraction: float = 0.25             # e.g., 0.25 -> 25% of system RAM per worker
+    memory_limit_fraction: float = 0.70             # e.g., 0.70 -> 70% of system RAM per worker
     rmm_pool_size: str = "0GB"  # Desabilitado - usar rmm_pool_fraction
     rmm_initial_pool_size: str = "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
     rmm_maximum_pool_size: str = "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction

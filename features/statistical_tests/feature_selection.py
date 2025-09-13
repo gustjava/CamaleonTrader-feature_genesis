@@ -78,14 +78,32 @@ class FeatureSelection:
         try:
             from sklearn.feature_selection import mutual_info_regression  # Import MI computation
         except Exception as e:
-            self._log_warn("MI not available, skipping redundancy MI", error=str(e))
-            return candidates  # Return all candidates if MI not available
+            self._critical_error("MI not available for redundancy computation", error=str(e))
+            return candidates  # unreachable
 
         keep = set(candidates)  # Start with all candidates
         # Cap number of pairs (quadratic); if large, limit candidates
         max_cands = min(len(candidates), 200)  # Limit to 200 candidates for performance
         cand_limited = candidates[:max_cands]  # Take first max_cands candidates
-        X = X_df[cand_limited].values  # Convert to numpy array
+        # Drop rows with NaNs across selected columns to satisfy sklearn
+        try:
+            X_sub = X_df[cand_limited].dropna()
+        except Exception as e:
+            self._critical_error("Failed to drop NaNs for MI redundancy", error=str(e))
+            X_sub = X_df[cand_limited]
+        # Ensure CPU NumPy array for sklearn
+        try:
+            import cudf as _cudf
+            if isinstance(X_sub, _cudf.DataFrame):
+                X = X_sub.to_pandas().values
+            else:
+                X = X_sub.values  # pandas/NumPy path
+        except Exception:
+            # Fallback try without cudf import
+            try:
+                X = X_sub.to_pandas().values
+            except Exception as e:
+                self._critical_error("Failed to build CPU matrix for MI redundancy", error=str(e))
         n = len(cand_limited)
         # Compute pairwise MI approx: MI(X_i, X_j) by treating one as target
         for i in range(n):  # For each feature as target
@@ -95,8 +113,8 @@ class FeatureSelection:
                 y = X[:, i]  # Target feature
                 mi = mutual_info_regression(X, y, discrete_features=False)  # Compute MI with all features
             except Exception as e:
-                self._log_warn("MI row failed", feature=cand_limited[i], error=str(e))
-                continue  # Skip this feature if MI computation fails
+                self._critical_error("MI row failed", feature=cand_limited[i], error=str(e))
+                # unreachable
             for j in range(i + 1, n):  # Compare with remaining features
                 f_i, f_j = cand_limited[i], cand_limited[j]
                 if f_i in keep and f_j in keep and mi[j] >= mi_threshold:  # If both features still exist and MI above threshold
@@ -123,8 +141,8 @@ class FeatureSelection:
             from sklearn.feature_selection import mutual_info_regression
             from sklearn.cluster import AgglomerativeClustering
         except Exception as e:
-            self._log_warn("MI clustering unavailable, falling back to pairwise redundancy", error=str(e))
-            return self._compute_mi_redundancy(X_df, candidates, dcor_scores, mi_threshold=float(self.mi_threshold))
+            self._critical_error("MI clustering unavailable", error=str(e))
+            return self._compute_mi_redundancy(X_df, candidates, dcor_scores, mi_threshold=float(self.mi_threshold))  # unreachable
 
         if len(candidates) <= 2:
             return candidates
@@ -136,7 +154,24 @@ class FeatureSelection:
             ordered = list(candidates)
         max_c = max(2, int(self.mi_max_candidates))
         cand = ordered[:min(len(ordered), max_c)]
-        X = X_df[cand].values
+        # Drop rows with NaNs across selected columns to satisfy sklearn
+        try:
+            X_sub = X_df[cand].dropna()
+        except Exception as e:
+            self._critical_error("Failed to drop NaNs for MI clustering", error=str(e))
+            X_sub = X_df[cand]
+        # Ensure CPU NumPy array for sklearn
+        try:
+            import cudf as _cudf
+            if isinstance(X_sub, _cudf.DataFrame):
+                X = X_sub.to_pandas().values
+            else:
+                X = X_sub.values
+        except Exception:
+            try:
+                X = X_sub.to_pandas().values
+            except Exception as e:
+                self._critical_error("Failed to build CPU matrix for MI clustering", error=str(e))
         n = X.shape[0]
         p = X.shape[1]
         if p < 2:
@@ -161,8 +196,8 @@ class FeatureSelection:
                         y = X[:, ii]
                         mi_block = mutual_info_regression(X[:, j0:j1], y, discrete_features=False)
                     except Exception as e:
-                        self._log_warn("MI block failed", i=ii, j0=j0, j1=j1, error=str(e))
-                        mi_block = np.zeros(j1 - j0, dtype=np.float32)
+                        self._critical_error("MI block failed", i=int(ii), j0=int(j0), j1=int(j1), error=str(e))
+                        # unreachable
                     MI[ii, j0:j1] = np.maximum(MI[ii, j0:j1], mi_block.astype(np.float32))
                 done_blocks += 1
                 # Log progress roughly every 10% of blocks
@@ -213,20 +248,49 @@ class FeatureSelection:
         reps = [r for r in reps if r in candidates]
         return reps
 
-    def _to_cupy_matrix(self, gdf: cudf.DataFrame, cols: List[str], dtype: str = 'f4') -> cp.ndarray:
+    def _to_cupy_matrix(self, gdf: cudf.DataFrame, cols: List[str], dtype: str = 'f4') -> Tuple[cp.ndarray, List[str]]:
         """Build a CuPy matrix (n_rows x n_cols) from cuDF columns without CPU copies.
 
-        Uses per-column .to_cupy() and stacks along axis=1 to avoid host transfer.
+        Strict mode: any non-numeric/invalid column triggers a critical error to stop the pipeline.
+        Returns (X, used_cols) on success.
         """
+        used: List[str] = []
+        arrays = []
+        invalid: List[str] = []
+        last_err = None
+        for c in cols:
+            try:
+                s = gdf[c]
+                sc = s.astype(dtype, copy=False)
+                arrays.append(sc.to_cupy())
+                used.append(c)
+            except Exception as e:
+                last_err = e
+                invalid.append(str(c))
+                # do not log per-column; escalate after scan
+                continue
+        if invalid:
+            # escalate as critical with details
+            msg = "Found non-numeric/invalid candidate columns for GPU matrix"
+            preview = ",".join(invalid[:10])
+            more = max(0, len(invalid) - 10)
+            details = f"{preview}{'... (+%d more)' % more if more > 0 else ''}"
+            if last_err is not None:
+                self._critical_error(msg, count=len(invalid), examples=details, last_error=str(last_err))
+            else:
+                self._critical_error(msg, count=len(invalid), examples=details)
+        if not arrays:
+            # No usable columns – escalate as critical
+            msg = "to_cupy matrix failed: no usable numeric columns"
+            if last_err is not None:
+                msg = f"{msg} (last error: {last_err})"
+            self._critical_error(msg, requested=len(cols))
         try:
-            arrays = [gdf[c].astype(dtype).to_cupy() for c in cols]
-            if not arrays:
-                return cp.empty((len(gdf), 0), dtype=dtype)
             X = cp.stack(arrays, axis=1)
-            return X
         except Exception as e:
-            self._log_warn("to_cupy matrix failed; returning empty", error=str(e))
-            return cp.empty((0, 0), dtype=dtype)
+            self._critical_error("Failed to stack GPU matrix", error=str(e), used=len(used))
+            X = cp.empty((0, 0), dtype=dtype)
+        return X, used
 
     def _compute_vif_iterative_gpu(self, X: cp.ndarray, features: List[str], threshold: float = 5.0) -> List[str]:
         """Iteratively remove features with VIF above threshold using GPU ops.
@@ -510,56 +574,42 @@ class FeatureSelection:
                 return results
             
             # Stage 2: VIF-based multicollinearity removal
-            try:
-                X_matrix = self._to_cupy_matrix(df, candidates)
-                if X_matrix.shape[1] > 0:
-                    vif_selected = self._compute_vif_iterative_gpu(X_matrix, candidates, self.vif_threshold)
-                    results['stage2_vif_selected'] = vif_selected
-                    self._log_info("VIF selection completed", 
-                                  original=len(candidates), selected=len(vif_selected))
-                else:
-                    results['stage2_vif_selected'] = candidates
-            except Exception as e:
-                self._log_warn("VIF selection failed", error=str(e))
-                results['stage2_vif_selected'] = candidates
+            X_matrix, used_cols = self._to_cupy_matrix(df, candidates)
+            if X_matrix.shape[1] == 0 or len(used_cols) == 0:
+                self._critical_error("to_cupy matrix failed; no usable numeric features for VIF", candidates=len(candidates))
+            vif_selected = self._compute_vif_iterative_gpu(X_matrix, used_cols, self.vif_threshold)
+            results['stage2_vif_selected'] = vif_selected
+            self._log_info("VIF selection completed", original=len(candidates), selected=len(vif_selected))
             
             # Stage 2: MI-based redundancy removal
-            try:
-                if len(results['stage2_vif_selected']) > 1:
+            if len(results['stage2_vif_selected']) > 1:
+                try:
                     mi_selected = self._compute_mi_cluster_representatives(
                         df, results['stage2_vif_selected'], dcor_scores or {}
                     )
                     results['stage2_mi_selected'] = mi_selected
-                    self._log_info("MI redundancy removal completed", 
-                                  original=len(results['stage2_vif_selected']), 
-                                  selected=len(mi_selected))
-                else:
-                    results['stage2_mi_selected'] = results['stage2_vif_selected']
-            except Exception as e:
-                self._log_warn("MI redundancy removal failed", error=str(e))
+                    self._log_info("MI redundancy removal completed", original=len(results['stage2_vif_selected']), selected=len(mi_selected))
+                except Exception as e:
+                    self._critical_error("MI redundancy removal failed", error=str(e))
+            else:
                 results['stage2_mi_selected'] = results['stage2_vif_selected']
             
             # Stage 3: Embedded feature selection
-            try:
-                if len(results['stage2_mi_selected']) > 1:
+            if len(results['stage2_mi_selected']) > 1:
+                try:
                     final_selected, importances, backend = self._stage3_selectfrommodel(
                         df, df[target_col], results['stage2_mi_selected']
                     )
                     results['stage3_final_selected'] = final_selected
                     results['importances'] = importances
                     results['selection_stats']['backend_used'] = backend
-                    self._log_info("Embedded feature selection completed", 
-                                  original=len(results['stage2_mi_selected']), 
-                                  selected=len(final_selected), backend=backend)
-                else:
-                    results['stage3_final_selected'] = results['stage2_mi_selected']
-                    results['importances'] = {f: 1.0 for f in results['stage2_mi_selected']}
-                    results['selection_stats']['backend_used'] = 'single_feature'
-            except Exception as e:
-                self._log_warn("Embedded feature selection failed", error=str(e))
+                    self._log_info("Embedded feature selection completed", original=len(results['stage2_mi_selected']), selected=len(final_selected), backend=backend)
+                except Exception as e:
+                    self._critical_error("Embedded feature selection failed", error=str(e))
+            else:
                 results['stage3_final_selected'] = results['stage2_mi_selected']
                 results['importances'] = {f: 1.0 for f in results['stage2_mi_selected']}
-                results['selection_stats']['backend_used'] = 'fallback'
+                results['selection_stats']['backend_used'] = 'single_feature'
             
             # Compute selection statistics
             results['selection_stats'].update({

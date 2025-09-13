@@ -107,8 +107,6 @@ class ADFTests:
     def _apply_adf_rolling(self, s: cudf.Series, window: int = 252, min_periods: int = 200) -> cudf.Series:
         """Apply ADF test to rolling windows of a time series."""
         try:
-            self._log_info(f"Applying ADF rolling test", window=window, min_periods=min_periods)
-            
             # Use the utility function for rolling ADF
             return _adf_rolling_partition(s, window, min_periods)
             

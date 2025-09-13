@@ -516,7 +516,8 @@ class GARCHModels(BaseFeatureEngine):
                     min_return_rows=int(self.min_return_rows),
                     used_max_samples=int(self.max_samples),
                 )
-        except Exception:
+        except Exception as e:
+            self._log_error(f"Failed to log GARCH metrics: {e}")
             pass
 
         # Record metrics and optional artifact summary
@@ -533,7 +534,8 @@ class GARCHModels(BaseFeatureEngine):
                 with open(summary_path, 'w') as f:  # Abre arquivo para escrita
                     _json.dump(params, f, indent=2)  # Escreve parâmetros em JSON
                 self._record_artifact('garch', str(summary_path), kind='json')  # Registra artefato
-        except Exception:
+        except Exception as e:
+            self._log_error(f"Failed to write GARCH artifacts: {e}")
             pass  # Ignora erros na gravação de artefatos
 
         # Broadcast scalars to original DataFrame (all rows)
@@ -595,7 +597,8 @@ class GARCHModels(BaseFeatureEngine):
                     with open(summary_path, 'w') as f:
                         _json.dump(metrics, f, indent=2)
                     self._record_artifact('garch', str(summary_path), kind='json')
-        except Exception:
+        except Exception as e:
+            self._log_error(f"Failed to write comprehensive GARCH artifacts: {e}")
             pass
 
         # Add all GARCH features to DataFrame

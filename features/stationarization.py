@@ -216,6 +216,7 @@ class StationarizationEngine(BaseFeatureEngine):
             try:
                 self._w_cache_order.remove(key)  # Remove da posição atual
             except ValueError:
+                self._log_debug("Key not found in cache order list during LRU update")
                 pass  # Ignora se não estava na lista
             self._w_cache_order.append(key)  # Adiciona ao final (mais recente)
             return w  # Retorna pesos do cache
@@ -232,7 +233,8 @@ class StationarizationEngine(BaseFeatureEngine):
                 # Libera memória do array antigo explicitamente
                 del self._w_cache[old_key]  # Remove do cache
                 cp.get_default_memory_pool().free_all_blocks()  # Libera memória GPU
-            except Exception:
+            except Exception as e:
+                self._log_error(f"Failed to clean up GPU memory cache: {e}")
                 pass  # Ignora erros de limpeza
         return w  # Retorna pesos calculados
     

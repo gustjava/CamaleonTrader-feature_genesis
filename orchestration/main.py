@@ -141,8 +141,8 @@ class DaskClusterManager:
             if memory_fraction > 0.0:
                 system_memory_gb = self._get_system_memory_gb()
                 
-                # Always use 80% of total system RAM, divided equally among workers
-                total_memory_to_use = system_memory_gb * 0.8  # 80% of system RAM
+                # Use configured fraction of total system RAM, divided equally among workers
+                total_memory_to_use = system_memory_gb * memory_fraction
                 memory_per_worker_gb = total_memory_to_use / gpu_count
                 
                 # Apply safety limits
@@ -153,7 +153,7 @@ class DaskClusterManager:
                 actual_fraction = total_memory_usage / system_memory_gb
                 
                 logger.info(f"Dynamic memory calculation: {gpu_count} workers, {memory_per_worker_gb:.2f}GB per worker "
-                           f"(system: {system_memory_gb:.2f}GB, total: {total_memory_usage:.2f}GB, {actual_fraction:.1%})")
+                           f"(system: {system_memory_gb:.2f}GB, total: {total_memory_usage:.2f}GB, {actual_fraction:.1%}, fraction: {memory_fraction:.1%})")
                 
                 return f"{memory_per_worker_gb:.2f}GB"
             else:
@@ -220,7 +220,8 @@ class DaskClusterManager:
                 pool_cap_bytes = int(safe_pool_gb * bytes_per_gb)
                 if initial_pool_size > pool_cap_bytes:
                     initial_pool_size = _align_256(pool_cap_bytes)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to adjust initial pool size: {e}")
                 pass
 
             try:
@@ -343,7 +344,8 @@ class DaskClusterManager:
             # Explicitly set protocol (e.g., 'tcp' for stability)
             try:
                 cluster_kwargs['protocol'] = str(self.config.dask.protocol)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to set cluster protocol: {e}")
                 pass
 
             if self.config.dask.protocol == "ucx":
@@ -385,7 +387,7 @@ class DaskClusterManager:
 
             # Register worker plugin to expose GPU metrics and active task to dashboard
             try:
-                self.client.register_worker_plugin(PipelineWorkerPlugin(poll_interval_s=2.0), name="pipeline-metrics")
+                self.client.register_plugin(PipelineWorkerPlugin(poll_interval_s=2.0), name="pipeline-metrics")
                 logger.info("Registered PipelineWorkerPlugin for dashboard custom metrics")
             except Exception as e:
                 logger.warning(f"Could not register PipelineWorkerPlugin: {e}")
