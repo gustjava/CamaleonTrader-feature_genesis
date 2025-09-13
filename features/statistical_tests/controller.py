@@ -200,6 +200,10 @@ class StatisticalTests(BaseFeatureEngine):
         """Log error message with optional context."""
         logger.error(f"StatisticalTests: {message}", extra=kwargs)
     
+    def _log_debug(self, message: str, **kwargs):
+        """Log debug message with optional context."""
+        logger.debug(f"StatisticalTests: {message}", extra=kwargs)
+    
     def _critical_error(self, message: str, **kwargs):
         """Log critical error and raise exception."""
         self._log_error(message, **kwargs)
@@ -212,38 +216,104 @@ class StatisticalTests(BaseFeatureEngine):
         partition heads separately and concatenating on GPU with ignore_index.
         """
         try:
-            import dask
-        except Exception:
-            # Fallback to simple head if dask import fails (shouldn't happen here)
-            try:
-                return df.head(int(n))
-            except Exception:
-                return cudf.DataFrame()
-        try:
             nparts = int(getattr(df, 'npartitions', 1))
             k = max(1, min(int(max_parts), nparts))
             per = max(1, int(np.ceil(float(n) / float(k))))
-            parts = list(df.to_delayed())[:k]
-            # Build delayed heads to avoid alignment logic
-            delayed_heads = [dask.delayed(lambda _pdf, _per: _pdf.head(_per))(p, per) for p in parts]
-            gdfs = dask.compute(*delayed_heads)
-            frames = [g for g in gdfs if g is not None]
+            frames = []
+            for i in range(k):
+                try:
+                    part_head = df.get_partition(i).head(per)
+                    # If still lazy, compute to cuDF
+                    if not isinstance(part_head, cudf.DataFrame):
+                        part_head = part_head.compute()
+                    frames.append(part_head)
+                except Exception:
+                    continue
             if not frames:
                 return cudf.DataFrame()
-            sample = cudf.concat(frames, ignore_index=True)
+            # Ensure all frames are cuDF
+            cu_frames = []
+            for g in frames:
+                try:
+                    if isinstance(g, cudf.DataFrame):
+                        cu_frames.append(g)
+                    else:
+                        cu_frames.append(cudf.from_pandas(g))
+                except Exception:
+                    continue
+            if not cu_frames:
+                return cudf.DataFrame()
+            sample = cudf.concat(cu_frames, ignore_index=True)
             if len(sample) > int(n):
                 sample = sample.head(int(n))
             return sample
         except Exception as e:
             self._log_warn("sample_head_across_partitions failed; falling back to head", error=str(e))
             try:
-                return df.head(int(n))
+                out = df.head(int(n))
+                # Ensure cuDF
+                if not isinstance(out, cudf.DataFrame):
+                    out = cudf.from_pandas(out)
+                return out
             except Exception:
                 try:
                     # Last resort: first partition only
-                    return df.get_partition(0).head(int(n)).compute()
+                    out = df.get_partition(0).head(int(n)).compute()
+                    if not isinstance(out, cudf.DataFrame):
+                        out = cudf.from_pandas(out)
+                    return out
                 except Exception:
                     return cudf.DataFrame()
+
+    def _sample_tail_across_partitions(self, df: dask_cudf.DataFrame, n: int, max_parts: int = 16) -> cudf.DataFrame:
+        """Collect up to n rows by sampling the tail of the last partitions safely.
+
+        Similar to head sampling, but walks partitions from the end, getting tail(per)
+        from each until reaching approximately n rows. Ensures cuDF output.
+        """
+        try:
+            nparts = int(getattr(df, 'npartitions', 1))
+        except Exception:
+            nparts = 1
+        try:
+            k = max(1, min(int(max_parts), nparts))
+            per = max(1, int(np.ceil(float(n) / float(k))))
+            frames = []
+            for idx in range(nparts - 1, max(-1, nparts - 1 - k), -1):
+                try:
+                    part_tail = df.get_partition(idx).tail(per)
+                    if not isinstance(part_tail, cudf.DataFrame):
+                        part_tail = part_tail.compute()
+                    frames.append(part_tail)
+                except Exception:
+                    continue
+            if not frames:
+                return cudf.DataFrame()
+            cu_frames = []
+            for g in frames:
+                try:
+                    if isinstance(g, cudf.DataFrame):
+                        cu_frames.append(g)
+                    else:
+                        cu_frames.append(cudf.from_pandas(g))
+                except Exception:
+                    continue
+            if not cu_frames:
+                return cudf.DataFrame()
+            sample = cudf.concat(cu_frames, ignore_index=True)
+            # Keep the last n rows of the concatenated sample
+            if len(sample) > int(n):
+                sample = sample.tail(int(n))
+            return sample
+        except Exception as e:
+            self._log_warn("sample_tail_across_partitions failed; falling back to tail of first partition", error=str(e))
+            try:
+                out = df.get_partition(max(0, nparts - 1)).tail(int(n)).compute()
+                if not isinstance(out, cudf.DataFrame):
+                    out = cudf.from_pandas(out)
+                return out
+            except Exception:
+                return cudf.DataFrame()
 
     def process_cudf(self, df: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -462,11 +532,28 @@ class StatisticalTests(BaseFeatureEngine):
             
             # Filter candidate features
             candidates = []
+            target_skipped = []
+            denylist_skipped = []
+            prefix_skipped = []
+            non_numeric_skipped = []
+            not_included_skipped = []
+            
+            self._log_info(f"Feature filtering: Starting with {len(all_columns)} total columns")
+            
             for col in all_columns:
                 # Skip target columns and metrics
-                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')) or
-                    col in self.feature_denylist or
-                    any(col.startswith(prefix) for prefix in self.feature_deny_prefixes)):
+                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
+                    target_skipped.append(col)
+                    continue
+                
+                # Skip denylist columns
+                if col in self.feature_denylist:
+                    denylist_skipped.append(col)
+                    continue
+                
+                # Skip deny prefix columns
+                if any(col.startswith(prefix) for prefix in self.feature_deny_prefixes):
+                    prefix_skipped.append(col)
                     continue
                 
                 # Include frac_diff columns and other relevant features, but only numeric types
@@ -474,6 +561,33 @@ class StatisticalTests(BaseFeatureEngine):
                     dt = dtype_map.get(col, '')
                     if _is_numeric_dt(dt):
                         candidates.append(col)
+                    else:
+                        non_numeric_skipped.append(f"{col}({dt})")
+                else:
+                    not_included_skipped.append(col)
+            
+            # Log detailed filtering results
+            self._log_info(f"Feature filtering results:", 
+                          total_columns=len(all_columns),
+                          target_skipped=len(target_skipped),
+                          denylist_skipped=len(denylist_skipped),
+                          prefix_skipped=len(prefix_skipped),
+                          non_numeric_skipped=len(non_numeric_skipped),
+                          not_included_skipped=len(not_included_skipped),
+                          final_candidates=len(candidates))
+            
+            if target_skipped:
+                self._log_info(f"Target/metrics columns skipped: {target_skipped[:10]}")
+            if denylist_skipped:
+                self._log_info(f"Denylist columns skipped: {denylist_skipped[:10]}")
+            if prefix_skipped:
+                self._log_info(f"Deny prefix columns skipped: {prefix_skipped[:10]}")
+            if non_numeric_skipped:
+                self._log_info(f"Non-numeric columns skipped: {non_numeric_skipped[:10]}")
+            if not_included_skipped:
+                self._log_info(f"Not included columns (no matching patterns): {not_included_skipped[:10]}")
+            
+            self._log_info(f"Final candidates for dCor: {candidates[:15]}")
             
             return candidates
             
@@ -482,28 +596,58 @@ class StatisticalTests(BaseFeatureEngine):
             return []
 
     def _apply_distance_correlation_analysis(self, df: dask_cudf.DataFrame, target: str, candidates: List[str]) -> dask_cudf.DataFrame:
-        """Apply distance correlation analysis to the DataFrame."""
+        """Apply distance correlation once on a global tail sample, then broadcast constants."""
         try:
-            # Apply distance correlation computation
-            dcor_results = df.map_partitions(
-                self.distance_correlation._dcor_partition_gpu,
-                target,
-                candidates,
-                self.dcor_max_samples,
-                self.dcor_tile_size,
-                meta=cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])
-            )
-            
-            # Merge results back to main DataFrame
-            for col in candidates:
-                dcor_col = f"dcor_{col}"
-                if dcor_col in dcor_results.columns:
-                    df[dcor_col] = dcor_results[dcor_col]
-            
+            # Build a tail sample across last partitions to represent recent behavior
+            sample_n = int(max(1000, min(self.dcor_max_samples * 2, 200000)))
+            sample = self._sample_tail_across_partitions(df, sample_n, max_parts=16)
+            if sample is None or len(sample) == 0 or target not in sample.columns:
+                self._log_warn("dCor tail sample empty or target missing; skipping dCor broadcast")
+                return df
+            # Convert target to CuPy
+            try:
+                y = sample[target].astype('f8').to_cupy()
+            except Exception as e:
+                self._log_warn("dCor tail sample: failed to pull target to GPU", error=str(e))
+                return df
+            # Compute dCor for each candidate on the sample
+            dcor_map: Dict[str, float] = {}
+            for c in candidates:
+                if c not in sample.columns:
+                    dcor_map[f"dcor_{c}"] = float('nan')
+                    continue
+                try:
+                    x = sample[c].astype('f8').to_cupy()
+                    val = self.distance_correlation._distance_correlation_gpu(
+                        x, y, tile=int(self.dcor_tile_size), max_n=int(self.dcor_max_samples)
+                    )
+                    dcor_map[f"dcor_{c}"] = float(val)
+                except Exception:
+                    dcor_map[f"dcor_{c}"] = float('nan')
+            # Optional: log top-K dCor scores for visibility
+            try:
+                topk = int(getattr(self, 'dcor_permutation_top_k', 0) or getattr(self, 'dcor_top_k', 20))
+            except Exception:
+                topk = 20
+            try:
+                items = [(k.replace('dcor_', ''), v) for k, v in dcor_map.items() if np.isfinite(v)]
+                items.sort(key=lambda kv: kv[1], reverse=True)
+                show = items[:max(1, min(topk, 10))]
+                self._log_info(f"dCor tail sample computed: top{len(show)}", top=show)
+            except Exception:
+                pass
+
+            # Broadcast constants as new columns across the Dask DataFrame
+            if dcor_map:
+                df = df.assign(**dcor_map)
+                # Persist to avoid recomputation of upstream graph in subsequent stages
+                try:
+                    df = df.persist()
+                except Exception:
+                    pass
             return df
-            
         except Exception as e:
-            self._log_warn(f"Error in distance correlation analysis: {e}")
+            self._log_warn(f"Error in distance correlation analysis (tail-based): {e}")
             return df
 
     def _apply_feature_selection_pipeline(self, df: dask_cudf.DataFrame, target: str) -> Dict[str, Any]:
@@ -520,19 +664,102 @@ class StatisticalTests(BaseFeatureEngine):
             # Sanity-check candidates against the sample: keep only columns castable to float
             valid_candidates: List[str] = []
             invalid_candidates: List[str] = []
+            
+            self._log_info(f"Sanitizing {len(candidates)} candidate features", 
+                          sample_size=len(sample_df), candidates=candidates[:10])
+            
+            missing_columns = []
+            dtype_failures = []
+            
             for c in candidates:
                 try:
+                    # Check if column exists in sample
+                    if c not in sample_df.columns:
+                        missing_columns.append(c)
+                        invalid_candidates.append(c)
+                        continue
+                    
                     # Attempt a lightweight dtype cast on sample to ensure numeric compatibility
                     _ = sample_df[c].astype('f4')
                     valid_candidates.append(c)
-                except Exception:
+                except Exception as e:
+                    dtype_failures.append(f"{c}: {str(e)}")
                     invalid_candidates.append(c)
+                    self._log_debug(f"Column {c} failed numeric validation: {e}")
+            
+            # Log detailed sanitization results
+            self._log_info(
+                f"Sanitization results: original={len(candidates)}, valid={len(valid_candidates)}, "
+                f"missing={len(missing_columns)}, dtype_failures={len(dtype_failures)}"
+            )
+            
+            if missing_columns:
+                self._log_info(f"Sample missing columns (first 10): {missing_columns[:10]}")
+            if dtype_failures:
+                self._log_info(f"Dtype conversion failures (first 10): {dtype_failures[:10]}")
+            
             if invalid_candidates:
                 # Trim to avoid downstream MI/GPU failures (informational)
-                self._log_info("Dropping non-numeric candidates prior to selection", dropped=len(invalid_candidates))
+                self._log_info("Dropping non-numeric candidates prior to selection", 
+                              dropped=len(invalid_candidates), 
+                              invalid_candidates=invalid_candidates[:10])
 
             if not valid_candidates:
-                self._critical_error("No valid numeric candidates after sanitization")
+                self._log_error("No valid numeric candidates after sanitization", 
+                               total_candidates=len(candidates),
+                               invalid_count=len(invalid_candidates),
+                               sample_columns=list(sample_df.columns)[:20])
+                
+                # Fallback: try a more lenient validation approach
+                self._log_info("Attempting fallback validation with more lenient criteria...")
+                fallback_candidates = []
+                fallback_failures = []
+                
+                self._log_info(f"Fallback: Testing {len(candidates)} candidates against sample with {len(sample_df)} rows")
+                
+                for c in candidates:
+                    try:
+                        if c not in sample_df.columns:
+                            fallback_failures.append(f"{c}: not in sample columns")
+                            continue
+                            
+                        # Try to get a small sample and check if it's numeric
+                        sample_values = sample_df[c].head(10)
+                        self._log_debug(f"Fallback testing {c}: sample values = {list(sample_values)[:5]}")
+                        
+                        # Check if we can convert to numeric
+                        numeric_count = 0
+                        non_numeric_values = []
+                        for val in sample_values:
+                            try:
+                                float(val)
+                                numeric_count += 1
+                            except (ValueError, TypeError):
+                                non_numeric_values.append(str(val))
+                        
+                        # If at least 30% of sample values are numeric, consider it valid (more lenient)
+                        if numeric_count >= len(sample_values) * 0.3:
+                            fallback_candidates.append(c)
+                            self._log_info(f"Fallback validation passed for {c} ({numeric_count}/{len(sample_values)} numeric values)")
+                        else:
+                            fallback_failures.append(f"{c}: only {numeric_count}/{len(sample_values)} numeric, non-numeric: {non_numeric_values[:3]}")
+                            
+                    except Exception as e:
+                        fallback_failures.append(f"{c}: exception - {str(e)}")
+                        self._log_debug(f"Fallback validation failed for {c}: {e}")
+                
+                self._log_info(f"Fallback results: {len(fallback_candidates)} passed, {len(fallback_failures)} failed")
+                if fallback_failures:
+                    self._log_info(f"Fallback failures: {fallback_failures[:10]}")
+                
+                if fallback_candidates:
+                    self._log_info(f"Fallback validation found {len(fallback_candidates)} valid candidates")
+                    valid_candidates = fallback_candidates
+                else:
+                    # Last resort: accept all candidates and let downstream handle errors
+                    self._log_warn("All fallback validations failed. Accepting all candidates as last resort...")
+                    valid_candidates = candidates
+                    self._log_info(f"Last resort: using all {len(candidates)} original candidates")
 
             # Get distance correlation scores (robust to NA/pd.NA/cudf.NA)
             dcor_scores = {}

@@ -329,14 +329,19 @@ class DistanceCorrelation:
         # Get GPU info
         try:
             import cupy as cp
+            import os as _os
             current_gpu = cp.cuda.runtime.getDevice()
-            gpu_info = f"GPU {current_gpu}"
+            visible = _os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            gpu_info = f"GPU {current_gpu} (VISIBLE={visible})"
         except Exception:
             gpu_info = "GPU unknown"
         
         try:
             y = pdf[target].astype('f8').to_cupy()  # Convert target to CuPy array
-            self._log_info(f"Starting dCor computation for {len(candidates)} features", gpu_info=gpu_info)
+            # Only log once per partition, not for every feature
+            if len(candidates) > 0:
+                self._log_info(f"dCor partition processing {len(candidates)} features on {gpu_info}", 
+                              target=target, sample_size=len(pdf))
         except Exception:
             return cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])  # Return NaN if conversion fails
         
@@ -348,6 +353,11 @@ class DistanceCorrelation:
                 
                 # Store result for logging
                 results_log.append(f"{c}: {dcor_value:.6f}")
+                
+                # Log progress every 20 features to reduce spam
+                if (i + 1) % 20 == 0 or (i + 1) == len(candidates):
+                    self._log_info(f"dCor progress: {i + 1}/{len(candidates)} features processed", 
+                                  current_feature=c, last_dcor=dcor_value)
                 
             except Exception:
                 out[f"dcor_{c}"] = float('nan')  # Return NaN if computation fails

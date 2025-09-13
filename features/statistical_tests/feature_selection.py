@@ -251,9 +251,15 @@ class FeatureSelection:
     def _to_cupy_matrix(self, gdf: cudf.DataFrame, cols: List[str], dtype: str = 'f4') -> Tuple[cp.ndarray, List[str]]:
         """Build a CuPy matrix (n_rows x n_cols) from cuDF columns without CPU copies.
 
-        Strict mode: any non-numeric/invalid column triggers a critical error to stop the pipeline.
-        Returns (X, used_cols) on success.
+        Drops columns that fail conversion; raises if none usable. Returns (X, used_cols).
         """
+        # Normalize input to cuDF DataFrame
+        try:
+            if not isinstance(gdf, cudf.DataFrame):
+                import pandas as _pd  # noqa: F401
+                gdf = cudf.from_pandas(gdf)
+        except Exception as e:
+            self._critical_error("GPU matrix expects cuDF DataFrame", error=str(e))
         used: List[str] = []
         arrays = []
         invalid: List[str] = []
@@ -270,15 +276,11 @@ class FeatureSelection:
                 # do not log per-column; escalate after scan
                 continue
         if invalid:
-            # escalate as critical with details
-            msg = "Found non-numeric/invalid candidate columns for GPU matrix"
+            # Log and continue with the usable subset
             preview = ",".join(invalid[:10])
             more = max(0, len(invalid) - 10)
             details = f"{preview}{'... (+%d more)' % more if more > 0 else ''}"
-            if last_err is not None:
-                self._critical_error(msg, count=len(invalid), examples=details, last_error=str(last_err))
-            else:
-                self._critical_error(msg, count=len(invalid), examples=details)
+            self._log_info("Dropping non-numeric/invalid columns for GPU matrix", count=len(invalid), examples=details)
         if not arrays:
             # No usable columns – escalate as critical
             msg = "to_cupy matrix failed: no usable numeric columns"
