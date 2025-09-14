@@ -191,18 +191,7 @@ rsync -avz --delete -e "ssh $SSH_OPTS" \
   "$LOCAL_PROJECT_DIR/" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
 echo "✅ Sincronização de código completa."
 
-# --- SINCRONIZAÇÃO DE ARQUIVOS DE PROGRAMA ---
-echo -e "\n🔄  Sincronizando arquivos de programa..."
-# Sincronizar arquivos específicos que podem ter sido modificados
-rsync -avz -e "ssh $SSH_OPTS" \
-  "$LOCAL_PROJECT_DIR/deploy_to_vast.sh" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
-rsync -avz -e "ssh $SSH_OPTS" \
-  "$LOCAL_PROJECT_DIR/run_pipeline_vast.sh" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
-rsync -avz -e "ssh $SSH_OPTS" \
-  "$LOCAL_PROJECT_DIR/environment.yml" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
-rsync -avz -e "ssh $SSH_OPTS" \
-  "$LOCAL_PROJECT_DIR/onstart.sh" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
-echo "✅ Sincronização de arquivos de programa completa."
+# Arquivos de programa já sincronizados pelo rsync principal acima
 
 # --- EXECUÇÃO DO PIPELINE COM TMUX DUAL TERMINAL ---
 echo -e "\n🚀  Executando pipeline remotamente com monitoramento dual..."

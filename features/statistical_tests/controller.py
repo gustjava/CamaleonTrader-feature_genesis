@@ -22,7 +22,7 @@ from .adf_tests import ADFTests
 from .distance_correlation import DistanceCorrelation
 from .feature_selection import FeatureSelection
 from .statistical_analysis import StatisticalAnalysis
-from .utils import _free_gpu_memory_worker, _tail_k, _tail_k_to_pandas, _jb_rolling_partition
+from .utils import _free_gpu_memory_worker, _tail_k, _tail_k_to_pandas
 from utils.logging_utils import get_logger, info_event, warn_event, error_event, Events
 from utils import log_context
 
@@ -83,19 +83,14 @@ class StatisticalTests(BaseFeatureEngine):
             self.dcor_permutations = int(getattr(uc.features, 'dcor_permutations', 0))
             # Feature toggles
             self.enable_adf_rolling = bool(getattr(uc.features, 'enable_adf_rolling', False))
-            # Rolling JB configuration
-            self.jb_base_column = getattr(uc.features, 'jb_base_column', None)
-            try:
-                self.jb_windows = list(getattr(uc.features, 'jb_windows', []) or [])
-            except Exception:
-                self.jb_windows = []
+            # JB removed: no configuration loaded
             
             # Feature selection parameters
             self.selection_max_rows = int(getattr(uc.features, 'selection_max_rows', 100000))
             self.vif_threshold = float(getattr(uc.features, 'vif_threshold', 5.0))
             self.mi_threshold = float(getattr(uc.features, 'mi_threshold', 0.3))
             self.stage3_top_n = int(getattr(uc.features, 'stage3_top_n', 50))
-            self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.0))
+            self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.5))
             self.dcor_min_percentile = float(getattr(uc.features, 'dcor_min_percentile', 0.0))
             self.stage1_top_n = int(getattr(uc.features, 'stage1_top_n', 0))
             
@@ -196,9 +191,7 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage1_agg = 'median'
             self.stage1_use_rolling_scores = True
             self.stage1_dashboard_per_feature = False
-            # JB defaults
-            self.jb_base_column = 'y_ret_1m'
-            self.jb_windows = []
+            # JB removed: no defaults
             # Feature toggles
             self.enable_adf_rolling = False
 
@@ -261,6 +254,48 @@ class StatisticalTests(BaseFeatureEngine):
         """Log critical error and raise exception."""
         self._log_error(message, **kwargs)
         raise RuntimeError(f"StatisticalTests Critical Error: {message}")
+
+    def _persist_and_wait(self, df: dask_cudf.DataFrame, stage: str, timeout_s: int = 600) -> dask_cudf.DataFrame:
+        """Persist the Dask DataFrame and wait with timeout, logging stage progress.
+
+        Intended to provide mid-stage visibility for long-running Statistical Tests.
+        Safe no-op if client is unavailable; always returns a (possibly) persisted df.
+        """
+        try:
+            self._log_info(f"Persist start: statistical_tests:{stage}")
+            try:
+                # Try to use dask.persist for better graph control when debug dashboard is enabled
+                import dask
+                debug_dash = bool(getattr(self, 'debug_write_artifacts', True))  # reuse flag as proxy
+                if debug_dash:
+                    df, = dask.persist(df, optimize_graph=False)
+                else:
+                    df = df.persist()
+            except Exception:
+                df = df.persist()
+
+            self._log_info(f"Persist returned: statistical_tests:{stage}")
+
+            # Wait with timeout (best-effort); continue even if timeout
+            try:
+                from dask.distributed import wait as _wait
+                self._log_info(f"Waiting for statistical_tests:{stage} to complete (timeout: {timeout_s}s)...")
+                _wait(df, timeout=timeout_s)
+                self._log_info(f"statistical_tests:{stage} computation completed successfully")
+            except Exception as wait_err:
+                self._log_warn(f"Wait timeout or error for statistical_tests:{stage}: {wait_err}")
+                self._log_info(f"Continuing without waiting - data is still persisted for statistical_tests:{stage}")
+
+            # Optional: free GPU pools on all workers to reduce memory pressure
+            try:
+                if getattr(self, 'client', None):
+                    self.client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
+            except Exception:
+                pass
+            return df
+        except Exception as e:
+            self._log_warn(f"persist_and_wait failed for stage {stage}: {e}")
+            return df
 
     def _sample_head_across_partitions(self, df: dask_cudf.DataFrame, n: int, max_parts: int = 16) -> cudf.DataFrame:
         """Collect up to n rows by sampling the head of several partitions safely.
@@ -389,48 +424,59 @@ class StatisticalTests(BaseFeatureEngine):
             except Exception:
                 self._sid = None
             self._set_stage('init')
-            self._log_info("Starting comprehensive statistical tests pipeline...")
+            
+            # Extract currency pair information
+            currency_pair = self._mt_currency_pair(df)
+            currency_info = f" for {currency_pair}" if currency_pair else ""
+            
+            self._log_info(f"Starting comprehensive statistical tests pipeline{currency_info}...")
+            self._log_info("Input DataFrame info", 
+                          currency_pair=currency_pair,
+                          rows=len(df), 
+                          cols=len(df.columns),
+                          memory_usage_mb=df.memory_usage(deep=True).sum() / 1024**2)
             
             # 1. ADF TESTS IN BATCH
             self._set_stage('adf')
+            self._log_info(f"🔍 Starting ADF (Augmented Dickey-Fuller) stationarity tests{currency_info}...")
+            cols_before = len(df.columns)
             df = self.adf_tests._apply_comprehensive_adf_tests(df)
+            cols_after = len(df.columns)
+            self._log_info("✅ ADF tests completed", 
+                          currency_pair=currency_pair,
+                          features_added=cols_after - cols_before,
+                          total_features=cols_after)
             
-            # 1b. JB rolling p-values (cuDF path)
-            try:
-                jb_windows = list(getattr(self, 'jb_windows', []) or [])
-            except Exception:
-                jb_windows = []
-            if jb_windows:
-                base = getattr(self, 'jb_base_column', None) or ('y_ret_1m' if 'y_ret_1m' in df.columns else None)
-                if base is None:
-                    # fallback: first column containing 'ret'
-                    for c in df.columns:
-                        if 'ret' in str(c).lower():
-                            base = c
-                            break
-                if base is not None and base in df.columns:
-                    self._log_info(f"JB (cuDF): Computing rolling JB for base={base} windows={jb_windows}")
-                    for w in jb_windows:
-                        try:
-                            win = int(w)
-                            minp = max(10, int(0.5 * win))
-                            safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(base))
-                            out = f"jb_p_{safe}_w{win}"
-                            if out in df.columns:
-                                continue
-                            df[out] = _jb_rolling_partition(df[base], win, minp)
-                        except Exception as e:
-                            self._log_warn("JB (cuDF) rolling failed", window=str(w), error=str(e))
+            # JB removed: no rolling JB features
             
             # 2. DISTANCE CORRELATION TESTS
             self._set_stage('dcor')
+            self._log_info(f"🔗 Starting Distance Correlation (dCor) analysis{currency_info}...")
+            self._log_info("📊 PROCESSING: Distance Correlation - This is the main computational step")
+            cols_before_dcor = len(df.columns)
             df = self.distance_correlation._apply_comprehensive_distance_correlation(df)
+            cols_after_dcor = len(df.columns)
+            self._log_info("✅ Distance Correlation analysis completed", 
+                          currency_pair=currency_pair,
+                          features_added=cols_after_dcor - cols_before_dcor,
+                          total_features=cols_after_dcor)
             
             # 3. ADDITIONAL STATISTICAL TESTS
             self._set_stage('final_stats')
+            self._log_info(f"📈 Starting additional statistical analysis{currency_info}...")
+            self._log_info("📊 PROCESSING: Statistical Analysis - Computing summaries and correlations")
+            cols_before_final = len(df.columns)
             df = self.statistical_analysis.apply_comprehensive_statistical_analysis(df)
+            cols_after_final = len(df.columns)
+            self._log_info("✅ Additional statistical analysis completed", 
+                          currency_pair=currency_pair,
+                          features_added=cols_after_final - cols_before_final,
+                          total_features=cols_after_final)
             
-            self._log_info("Comprehensive statistical tests pipeline completed successfully")
+            self._log_info("🎉 Comprehensive statistical tests pipeline completed successfully",
+                          currency_pair=currency_pair,
+                          total_features_created=cols_after_final - len(df.columns) + (cols_after_final - cols_before_final),
+                          final_feature_count=cols_after_final)
             return df
             
         except Exception as e:
@@ -453,6 +499,7 @@ class StatisticalTests(BaseFeatureEngine):
             self._sid = None
         self._set_stage('init')
         self._log_info("Starting StatisticalTests (Dask)...")
+        self._log_info("📊 PROCESSING: Dask Statistical Tests Pipeline - This is the main processing stage")
 
         # Validate primary target; support computing log-forward returns if configured
         try:
@@ -520,140 +567,47 @@ class StatisticalTests(BaseFeatureEngine):
             except Exception as e:
                 self._log_warn("[MT] Persist comparison failed", error=str(e))
 
-        # --- ADF rolling window on fractional difference columns ---
-        adf_cols = [c for c in df.columns if "frac_diff" in c]
-        
-        if adf_cols:
-            self._log_info(f"ADF: Found {len(adf_cols)} frac_diff features to process", 
-                          features=adf_cols[:10],  # Show first 10 features
-                          total_count=len(adf_cols))
-        else:
-            self._log_info("ADF: No frac_diff features found to process")
-
-        processed_count = 0
-        skipped_count = 0
-
+    # --- ADF Stage ---
+        from .stage_adf import run as run_adf
         self._set_stage('adf')
-        for col in adf_cols:
-            # Use a unique, safe output column name to avoid collisions across frac_diff variants
-            try:
-                safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(col))
-            except Exception:
-                safe = str(col)
-            out = f"adf_stat_{safe}"
-            # Skip if the column already exists to prevent redundant recomputation
-            try:
-                if out in df.columns:
-                    skipped_count += 1
-                    continue
-            except Exception as e:
-                self._log_error(f"Failed to check if column exists: {e}")
-                pass
-            
-            df[out] = df[col].map_partitions(
-                self.adf_tests._apply_adf_rolling,
-                252,  # Window size (1 year of trading days)
-                200,  # Minimum periods
-                meta=(out, "f8"),
-            )
-            processed_count += 1
-            
-            # Log progress every 10 features to reduce spam
-            if processed_count % 10 == 0:
-                self._log_info(f"ADF: Processed {processed_count}/{len(adf_cols)} features...")
+        self._log_info("Stage start: ADF rolling on frac_diff*")
+        df = run_adf(self, df, window=252, min_periods=200)
+        df = self._persist_and_wait(df, stage="adf", timeout_s=600)
+        self._log_info("Stage end: ADF")
 
-        if adf_cols:
-            self._log_info(f"ADF: Completed processing {processed_count} features, skipped {skipped_count} (already exist)")
-
-        # --- Rolling JB p-value on base return column(s) ---
-        self._set_stage('jb')
-        try:
-            jb_windows = list(getattr(self, 'jb_windows', []) or [])
-        except Exception:
-            jb_windows = []
-        if jb_windows:
-            # Determine base column
-            try:
-                cols = list(df.columns)
-            except Exception:
-                cols = []
-            base = None
-            cfg_base = getattr(self, 'jb_base_column', None)
-            if cfg_base and (cfg_base in cols):
-                base = cfg_base
-            elif 'y_ret_1m' in cols:
-                base = 'y_ret_1m'
-            else:
-                # fallback: first column containing 'ret'
-                for c in cols:
-                    if 'ret' in str(c).lower():
-                        base = c
-                        break
-            if base is None:
-                self._log_warn("JB: No suitable base return column found; skipping rolling JB features")
-            else:
-                self._log_info(f"JB: Computing rolling JB p-values for base={base} windows={jb_windows}")
-                for w in jb_windows:
-                    try:
-                        win = int(w)
-                        minp = max(10, int(0.5 * win))
-                        safe = re.sub(r"[^0-9a-zA-Z_]+", "_", str(base))
-                        out = f"jb_p_{safe}_w{win}"
-                        if out in df.columns:
-                            continue
-                        # Apply mask for DXY base if available (mask closed periods to null)
-                        base_series = df[base]
-                        try:
-                            if ('is_dxy_open' in df.columns) and ('dxy' in str(base).lower()):
-                                base_series = base_series.where(df['is_dxy_open'].astype('bool'), None)
-                        except Exception:
-                            pass
-                        df[out] = base_series.map_partitions(
-                            _jb_rolling_partition,
-                            win,
-                            minp,
-                            meta=(out, 'f8')
-                        )
-                    except Exception as e:
-                        self._log_warn("JB rolling failed for a window", window=str(w), error=str(e))
+    # JB removed: no rolling JB features
 
         # --- Pre-selection Statistical Analysis (broadcast constants; no corr matrix) ---
         # (Pre-selection statistical broadcasting removed per request)
 
-        # --- Distance Correlation Analysis ---
+        # --- dCor Stage ---
         self._set_stage('dcor')
         if primary_target and primary_target in df.columns:
-            self._log_info("Starting distance correlation analysis...")
-            
-            # Find candidate features
+            from .stage_dcor import run as run_dcor
+            self._log_info("Stage start: dCor analysis")
             candidate_features = self._find_candidate_features(df)
-            
             if candidate_features:
-                self._log_info(f"Found {len(candidate_features)} candidate features for distance correlation", 
-                              candidates=candidate_features[:15],  # Show first 15 candidates
-                              total_count=len(candidate_features))
-                
-                # Apply distance correlation analysis
-                df = self._apply_distance_correlation_analysis(df, primary_target, candidate_features)
+                df = run_dcor(self, df, primary_target, candidate_features)
             else:
-                self._log_warn("No candidate features found for distance correlation analysis")
+                self._log_warn("No candidate features found for dCor analysis")
+            self._log_info("Stage end: dCor")
 
-        # --- Feature Selection Pipeline ---
+        # --- Selection Stage ---
         self._set_stage('selection')
         if primary_target and primary_target in df.columns:
-            self._log_info("Starting feature selection pipeline...")
-            
-            # Apply feature selection
-            selection_results = self._apply_feature_selection_pipeline(df, primary_target)
-            
+            from .stage_selection import run as run_selection
+            self._log_info("Stage start: Selection (VIF/MI/LGBM)")
+            selection_results = run_selection(self, df, primary_target)
             if selection_results:
-                self._log_info("Feature selection pipeline completed", 
-                              final_count=len(selection_results.get('stage3_final_selected', [])))
+                self._log_info("Stage end: Selection", final_count=len(selection_results.get('stage3_final_selected', [])))
 
-        # --- Final Statistical Analysis (comprehensive) ---
+        # --- Final Stats Stage ---
         self._set_stage('final_stats')
-        self._log_info("Final statistical analysis (comprehensive)…")
-        df = df.map_partitions(self.statistical_analysis.apply_comprehensive_statistical_analysis)
+        from .stage_final_stats import run as run_final
+        self._log_info("Stage start: Final comprehensive statistical analysis")
+        df = run_final(self, df)
+        df = self._persist_and_wait(df, stage="final_stats", timeout_s=600)
+        self._log_info("Stage end: Final Stats")
 
         self._log_info("StatisticalTests (Dask) completed successfully")
         return df
@@ -772,12 +726,65 @@ class StatisticalTests(BaseFeatureEngine):
             # Convert target to CuPy
             try:
                 y = sample[target].astype('f8').to_cupy()
+                # Log GPU context for transparency
+                try:
+                    import os as _os
+                    dev = int(cp.cuda.runtime.getDevice())
+                    vis = _os.environ.get('CUDA_VISIBLE_DEVICES', '')
+                    self._log_info("dCor GPU context", gpu_device=dev, visible_devices=vis, sample_rows=len(sample))
+                except Exception:
+                    pass
             except Exception as e:
                 self._log_warn("dCor tail sample: failed to pull target to GPU", error=str(e))
                 return df
-            # Compute dCor for each candidate on the sample
+            # Optional: fast prefilter using Pearson corr on GPU to shrink candidate set
             dcor_map: Dict[str, float] = {}
-            for c in candidates:
+            try:
+                pre_k = int(min(max(10, getattr(self, 'dcor_top_k', 50) * 3), 200))
+            except Exception:
+                pre_k = 150
+
+            pref_candidates = candidates
+            try:
+                # Compute quick Pearson correlations (O(n) per feature) to select top-K for full dCor (O(n^2))
+                scores = []
+                yf = y.astype(cp.float32, copy=False)
+                y_mask = cp.isfinite(yf)
+                yv = yf[y_mask]
+                if int(yv.size) >= 50:
+                    for c in candidates:
+                        if c not in sample.columns:
+                            continue
+                        try:
+                            xv = sample[c].astype('f4').to_cupy()
+                            m = y_mask & cp.isfinite(xv)
+                            if int(m.sum().item()) < 50:
+                                continue
+                            xa = xv[m]
+                            ya = yf[m]
+                            # Pearson corr in a few ops
+                            xm = xa.mean()
+                            ym = ya.mean()
+                            xs = xa - xm
+                            ys = ya - ym
+                            denom = cp.sqrt((xs * xs).sum() * (ys * ys).sum())
+                            if float(denom) == 0.0:
+                                continue
+                            corr = float((xs * ys).sum() / denom)
+                            scores.append((c, abs(corr)))
+                        except Exception:
+                            continue
+                    if scores:
+                        scores.sort(key=lambda kv: kv[1], reverse=True)
+                        pref_candidates = [name for name, _ in scores[:pre_k]]
+                        self._log_info("Prefilter via Pearson corr applied", total=len(candidates), kept=len(pref_candidates), pre_k=pre_k)
+            except Exception as _pf_err:
+                self._log_warn("Prefilter via Pearson corr failed; proceeding with full candidate set", error=str(_pf_err))
+
+            # Compute dCor for prefiltered candidates on the sample
+            total = len(pref_candidates)
+            last_log = -1
+            for i, c in enumerate(pref_candidates, start=1):
                 if c not in sample.columns:
                     dcor_map[f"dcor_{c}"] = float('nan')
                     continue
@@ -789,6 +796,15 @@ class StatisticalTests(BaseFeatureEngine):
                     dcor_map[f"dcor_{c}"] = float(val)
                 except Exception:
                     dcor_map[f"dcor_{c}"] = float('nan')
+                # Progress log every ~25 features or at end
+                try:
+                    if total > 0:
+                        step = max(1, min(25, total // 10 or 1))
+                        if (i == total) or (i // step) > last_log:
+                            last_log = i // step
+                            self._log_info("dCor progress", processed=i, total=total)
+                except Exception:
+                    pass
             # Optional: log top-K dCor scores for visibility
             try:
                 topk = int(getattr(self, 'dcor_permutation_top_k', 0) or getattr(self, 'dcor_top_k', 20))
@@ -814,6 +830,84 @@ class StatisticalTests(BaseFeatureEngine):
         except Exception as e:
             self._log_warn(f"Error in distance correlation analysis (tail-based): {e}")
             return df
+
+    def _apply_dcor_filters(self, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
+        """
+        Apply dCor-based filtering (Stage 1 filters) to candidates.
+        
+        Args:
+            candidates: List of candidate feature names
+            dcor_scores: Dictionary of distance correlation scores
+            
+        Returns:
+            List of filtered candidate feature names
+        """
+        try:
+            self._log_info(f"DEBUG: _apply_dcor_filters called with {len(candidates)} candidates and {len(dcor_scores)} scores")
+            self._log_info(f"DEBUG: dcor_min_threshold = {self.dcor_min_threshold}, stage1_top_n = {self.stage1_top_n}")
+            
+            if not candidates or not dcor_scores:
+                self._log_info("dCor filtering: No candidates or scores available")
+                return candidates
+            
+            original_count = len(candidates)
+            filtered_candidates = []
+            
+            # Step 1: Apply dcor_min_threshold filter
+            threshold_filtered = []
+            for candidate in candidates:
+                score = dcor_scores.get(candidate, 0.0)
+                if score >= self.dcor_min_threshold:
+                    threshold_filtered.append(candidate)
+                else:
+                    self._log_debug(f"dCor filter: {candidate} removed (score={score:.4f} < threshold={self.dcor_min_threshold})")
+            
+            threshold_count = len(threshold_filtered)
+            self._log_info(f"dCor threshold filter: {original_count} → {threshold_count} candidates (threshold={self.dcor_min_threshold})")
+            
+            # Step 2: Apply stage1_top_n filter (if enabled)
+            if self.stage1_top_n > 0 and threshold_count > self.stage1_top_n:
+                # Sort by dCor score (descending) and take top N
+                scored_candidates = [(candidate, dcor_scores.get(candidate, 0.0)) for candidate in threshold_filtered]
+                scored_candidates.sort(key=lambda x: x[1], reverse=True)
+                
+                top_candidates = [candidate for candidate, score in scored_candidates[:self.stage1_top_n]]
+                filtered_candidates = top_candidates
+                
+                self._log_info(f"dCor top_n filter: {threshold_count} → {len(filtered_candidates)} candidates (top_n={self.stage1_top_n})")
+                
+                # Log the top candidates for visibility
+                top_scores = [(candidate, score) for candidate, score in scored_candidates[:min(10, len(scored_candidates))]]
+                self._log_info(f"dCor top candidates: {[(c, f'{s:.4f}') for c, s in top_scores]}")
+            else:
+                filtered_candidates = threshold_filtered
+                if self.stage1_top_n > 0:
+                    self._log_info(f"dCor top_n filter: Not applied (candidates={threshold_count} <= top_n={self.stage1_top_n})")
+                else:
+                    self._log_info(f"dCor top_n filter: Disabled (top_n={self.stage1_top_n})")
+            
+            # Step 3: Apply dcor_min_percentile filter (if enabled)
+            if self.dcor_min_percentile > 0.0 and len(filtered_candidates) > 1:
+                # Calculate percentile threshold
+                scores = [dcor_scores.get(candidate, 0.0) for candidate in filtered_candidates]
+                scores.sort()
+                percentile_index = int(len(scores) * self.dcor_min_percentile)
+                percentile_threshold = scores[percentile_index] if percentile_index < len(scores) else scores[-1]
+                
+                percentile_filtered = [candidate for candidate in filtered_candidates 
+                                     if dcor_scores.get(candidate, 0.0) >= percentile_threshold]
+                
+                self._log_info(f"dCor percentile filter: {len(filtered_candidates)} → {len(percentile_filtered)} candidates (percentile={self.dcor_min_percentile}, threshold={percentile_threshold:.4f})")
+                filtered_candidates = percentile_filtered
+            
+            final_count = len(filtered_candidates)
+            self._log_info(f"dCor filtering complete: {original_count} → {final_count} candidates")
+            
+            return filtered_candidates
+            
+        except Exception as e:
+            self._log_warn(f"Error in dCor filtering: {e}")
+            return candidates  # Return original candidates on error
 
     def _apply_feature_selection_pipeline(self, df: dask_cudf.DataFrame, target: str) -> Dict[str, Any]:
         """Apply the complete feature selection pipeline."""
@@ -962,10 +1056,15 @@ class StatisticalTests(BaseFeatureEngine):
             # First, try the in-memory scores computed during dCor phase
             try:
                 mem_scores = getattr(self, '_last_dcor_scores', {}) or {}
+                self._log_info(f"DEBUG: Retrieved {len(mem_scores)} dCor scores from memory")
                 if mem_scores:
                     for col in valid_candidates:
                         dcor_scores[col] = float(mem_scores.get(col, 0.0))
-            except Exception:
+                    self._log_info(f"DEBUG: Mapped {len(dcor_scores)} scores for valid candidates")
+                else:
+                    self._log_warn("DEBUG: No dCor scores found in memory")
+            except Exception as e:
+                self._log_warn(f"DEBUG: Error getting dCor scores from memory: {e}")
                 pass
             # If still empty, fallback to reading from sample columns (legacy path)
             if not dcor_scores and len(sample_df) > 0:
@@ -979,9 +1078,12 @@ class StatisticalTests(BaseFeatureEngine):
                             score = 0.0
                         dcor_scores[col] = score
             
+            # Apply dCor-based filtering (Stage 1 filters)
+            filtered_candidates = self._apply_dcor_filters(valid_candidates, dcor_scores)
+            
             # Apply feature selection pipeline
             selection_results = self.feature_selection.apply_feature_selection_pipeline(
-                sample_df, target, valid_candidates, dcor_scores
+                sample_df, target, filtered_candidates, dcor_scores
             )
             return selection_results
         except Exception as e:

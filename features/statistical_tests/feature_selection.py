@@ -11,8 +11,9 @@ import cupy as cp
 import cudf
 from typing import List, Dict, Any, Tuple
 from .utils import _hermitian_pinv_gpu
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.statistical_tests.feature_selection")
 
 
 class FeatureSelection:
@@ -472,7 +473,7 @@ class FeatureSelection:
             except Exception:
                 task = 'regression'  # Default to regression if auto-detection fails
 
-        backend_used = 'lgbm'  # Use LightGBM as the embedded model
+        backend_used = 'catboost'  # Use CatBoost as the embedded model
         importances: dict = {}  # Store feature importances
         model = None
         
@@ -512,7 +513,7 @@ class FeatureSelection:
             X = X[indices]
             y = y[indices]
         
-        esr = int(getattr(self, 'stage3_lgbm_early_stopping_rounds', 0))  # Early stopping rounds
+        esr = int(getattr(self, 'stage3_lgbm_early_stopping_rounds', 0))  # Early stopping rounds (reuse cfg)
         eval_set = None
         # Build TimeSeriesSplit for validation and early stopping if requested
         if esr and esr > 0 and X.shape[0] >= 10:
@@ -532,53 +533,122 @@ class FeatureSelection:
                 eval_set = None
                 self._log_warn("TimeSeriesSplit setup failed", error=str(e_ts))
 
-        # Try preferred backend: LightGBM
+        # Preferred backend: CatBoost (GPU)
         try:
-            import lightgbm as lgb
-            params = {
-                'num_leaves': int(getattr(self, 'stage3_lgbm_num_leaves', 31)),  # Number of leaves
-                'max_depth': int(getattr(self, 'stage3_lgbm_max_depth', -1)),  # Maximum depth
-                'n_estimators': int(getattr(self, 'stage3_lgbm_n_estimators', 200)),  # Number of trees
-                'learning_rate': float(getattr(self, 'stage3_lgbm_learning_rate', 0.05)),  # Learning rate
-                'subsample': float(getattr(self, 'stage3_lgbm_bagging_fraction', 0.8)),  # Subsample ratio
-                'colsample_bytree': float(getattr(self, 'stage3_lgbm_feature_fraction', 0.8)),  # Feature fraction
-                'random_state': int(getattr(self, 'stage3_random_state', 42)),  # Random seed
-                'n_jobs': -1,  # Use all available cores
-            }
-            
+            from catboost import CatBoostClassifier, CatBoostRegressor
+            iterations = int(getattr(self, 'stage3_lgbm_n_estimators', 200))
+            learning_rate = float(getattr(self, 'stage3_lgbm_learning_rate', 0.05))
+            depth = int(getattr(self, 'stage3_lgbm_max_depth', 6 if getattr(self, 'stage3_lgbm_max_depth', -1) == -1 else getattr(self, 'stage3_lgbm_max_depth', 6)))
+            random_state = int(getattr(self, 'stage3_random_state', 42))
+
             if task == 'classification':
-                params['objective'] = 'binary' if len(np.unique(y)) == 2 else 'multiclass'
-                params['metric'] = 'binary_logloss' if len(np.unique(y)) == 2 else 'multi_logloss'
+                loss_function = 'Logloss' if len(np.unique(y)) == 2 else 'MultiClass'
+                model = CatBoostClassifier(
+                    iterations=iterations,
+                    learning_rate=learning_rate,
+                    depth=depth if depth > 0 else 6,
+                    random_seed=random_state,
+                    task_type='GPU',
+                    devices='0',
+                    verbose=0,
+                    loss_function=loss_function,
+                    thread_count=1,
+                )
             else:
-                params['objective'] = 'regression'
-                params['metric'] = 'rmse'
-            
-            # Train model
-            if eval_set is not None:
+                model = CatBoostRegressor(
+                    iterations=iterations,
+                    learning_rate=learning_rate,
+                    depth=depth if depth > 0 else 6,
+                    random_seed=random_state,
+                    task_type='GPU',
+                    devices='0',
+                    verbose=0,
+                    loss_function='RMSE',
+                    thread_count=1,
+                )
+
+            # Early stopping configuration
+            fit_kwargs = {}
+            if eval_set is not None and esr and esr > 0:
                 X_tr, y_tr, X_va, y_va = eval_set
-                model = lgb.LGBMClassifier(**params) if task == 'classification' else lgb.LGBMRegressor(**params)
-                model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], callbacks=[lgb.early_stopping(esr)])
+                fit_kwargs = {
+                    'X': X_tr,
+                    'y': y_tr,
+                    'eval_set': [(X_va, y_va)],
+                    'use_best_model': True,
+                    'od_type': 'Iter',
+                    'od_wait': esr,
+                }
+                model.fit(**fit_kwargs)
             else:
-                model = lgb.LGBMClassifier(**params) if task == 'classification' else lgb.LGBMRegressor(**params)
                 model.fit(X, y)
-            
-            # Extract feature importances
-            importances = dict(zip(candidates, model.feature_importances_))
-            
-            # Apply importance threshold
+
+            # Extract feature importances (use a stable default type)
+            try:
+                fi = model.get_feature_importance(type='PredictionValuesChange')
+            except TypeError:
+                # Older/newer CatBoost versions may use positional or different kw name
+                fi = model.get_feature_importance()
+            importances = dict(zip(candidates, fi))
+
+            # Threshold and selection
             threshold = self._parse_importance_threshold('median', list(importances.values()))
             selected = [f for f, imp in importances.items() if imp >= threshold]
-            
-            self._log_info("LightGBM feature selection completed", 
-                          task=task, selected=len(selected), threshold=round(threshold, 6))
-            
+
+            self._log_info("CatBoost feature selection completed",
+                           task=task, selected=len(selected), threshold=round(threshold, 6))
+
         except Exception as e:
-            # Treat embedded model failure as critical to stop the pipeline
-            self._critical_error("LightGBM feature selection failed", error=str(e))
-            # Unreachable, but keep signature expectations
-            selected = candidates
-            importances = {f: 1.0 for f in candidates}
-            backend_used = 'error'
+            # Attempt CPU fallback if GPU training failed
+            try:
+                from catboost import CatBoostClassifier, CatBoostRegressor
+                iterations = int(getattr(self, 'stage3_lgbm_n_estimators', 200))
+                learning_rate = float(getattr(self, 'stage3_lgbm_learning_rate', 0.05))
+                depth = int(getattr(self, 'stage3_lgbm_max_depth', 6 if getattr(self, 'stage3_lgbm_max_depth', -1) == -1 else getattr(self, 'stage3_lgbm_max_depth', 6)))
+                random_state = int(getattr(self, 'stage3_random_state', 42))
+                
+                if task == 'classification':
+                    loss_function = 'Logloss' if len(np.unique(y)) == 2 else 'MultiClass'
+                    model = CatBoostClassifier(
+                        iterations=iterations,
+                        learning_rate=learning_rate,
+                        depth=depth if depth > 0 else 6,
+                        random_seed=random_state,
+                        task_type='CPU',
+                        verbose=0,
+                        loss_function=loss_function,
+                        thread_count=1,
+                    )
+                else:
+                    model = CatBoostRegressor(
+                        iterations=iterations,
+                        learning_rate=learning_rate,
+                        depth=depth if depth > 0 else 6,
+                        random_seed=random_state,
+                        task_type='CPU',
+                        verbose=0,
+                        loss_function='RMSE',
+                        thread_count=1,
+                    )
+                if eval_set is not None and esr and esr > 0:
+                    X_tr, y_tr, X_va, y_va = eval_set
+                    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], use_best_model=True, verbose=False)
+                else:
+                    model.fit(X, y)
+                try:
+                    fi = model.get_feature_importance(type='PredictionValuesChange')
+                except TypeError:
+                    fi = model.get_feature_importance()
+                importances = dict(zip(candidates, fi))
+                threshold = self._parse_importance_threshold('median', list(importances.values()))
+                selected = [f for f, imp in importances.items() if imp >= threshold]
+                backend_used = 'catboost_cpu'
+                self._log_warn("GPU CatBoost failed; used CPU fallback", error=str(e), selected=len(selected))
+            except Exception as e2:
+                self._critical_error("CatBoost feature selection failed (GPU and CPU)", error=str(e2))
+                selected = candidates
+                importances = {f: 1.0 for f in candidates}
+                backend_used = 'error'
         
         return selected, importances, backend_used
 

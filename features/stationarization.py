@@ -21,8 +21,9 @@ from itertools import product  # Para combinações de parâmetros
 from config.unified_config import UnifiedConfig  # Configuração unificada do sistema
 from dask.distributed import Client  # Cliente Dask para computação distribuída
 from .base_engine import BaseFeatureEngine  # Classe base para engines de features
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.stationarization")
 
 
 def _fracdiff_series_partition(series: cudf.Series, d: float, max_lag: int, tol: float) -> cudf.Series:
@@ -834,7 +835,8 @@ class StationarizationEngine(BaseFeatureEngine):
             # Calculate rolling correlation
             rolling_corr = pdf[[col1, col2]].rolling(
                 window=window,
-                min_periods=min_periods
+                min_periods=min_periods,
+                center=False
             ).corr()
             
             # Extract the correlation between col1 and col2
@@ -1805,8 +1807,8 @@ class StationarizationEngine(BaseFeatureEngine):
             
             # Use rolling mean and std as a proxy for correlation
             # This is much faster and still provides useful information
-            col1_rolling_mean = col1.rolling(window=window, min_periods=min_periods).mean()
-            col2_rolling_mean = col2.rolling(window=window, min_periods=min_periods).mean()
+            col1_rolling_mean = col1.rolling(window=window, min_periods=min_periods, center=False).mean()
+            col2_rolling_mean = col2.rolling(window=window, min_periods=min_periods, center=False).mean()
             
             # Create a simple rolling relationship metric
             # This is not a true correlation but provides similar information
@@ -1835,7 +1837,7 @@ class StationarizationEngine(BaseFeatureEngine):
             })
             
             # Use cuDF's native rolling correlation
-            rolling_corr = temp_df.rolling(window).corr()
+            rolling_corr = temp_df.rolling(window=window, center=False).corr()
             
             # Extract the correlation between series1 and series2
             # The correlation matrix will have 4 values per row: [1, corr, corr, 1]

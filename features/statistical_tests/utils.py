@@ -10,8 +10,9 @@ import numpy as np
 import cupy as cp
 import cudf
 from typing import Dict, Any
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.statistical_tests.utils")
 
 
 def _free_gpu_memory_worker():
@@ -170,44 +171,7 @@ def _adf_rolling_partition(series: cudf.Series, window: int, min_periods: int) -
         return cudf.Series(cp.full(len(series), cp.nan))  # Return NaN series if computation fails
 
 
-def _jb_pvalue_window_host(vals: np.ndarray) -> float:
-    """Jarque–Bera p-value for a window (CPU, causal).
-
-    JB = n/6 * (skew^2 + (kurt-3)^2 / 4)
-    For chi2 with df=2, p = exp(-JB/2)
-    """
-    try:
-        x = np.asarray(vals, dtype=np.float64)
-        x = x[np.isfinite(x)]
-        n = len(x)
-        if n < 8:
-            return float('nan')
-        m = np.mean(x)
-        s = np.std(x)
-        if s == 0.0:
-            return float('nan')
-        z = (x - m) / s
-        skew = np.mean(z**3)
-        kurt = np.mean(z**4)
-        jb = (n / 6.0) * (skew**2 + ((kurt - 3.0)**2) / 4.0)
-        # For df=2, chi2 survival function simplifies to exp(-x/2)
-        p = float(np.exp(-0.5 * jb))
-        return p
-    except Exception:
-        return float('nan')
-
-def _jb_rolling_partition(series: cudf.Series, window: int, min_periods: int) -> cudf.Series:
-    """Apply Jarque–Bera p-value to rolling windows of a time series (CPU func on cuDF).
-
-    Uses the existing host implementation `_jb_pvalue_window_host` applied via cuDF rolling.
-    """
-    try:
-        return series.rolling(window=window, min_periods=min_periods).apply(
-            lambda x: _jb_pvalue_window_host(np.asarray(x))
-        )
-    except Exception:
-        import cupy as _cp
-        return cudf.Series(_cp.full(len(series), _cp.nan))
+# JB removed from project: helpers deleted
 
 
 def _compute_forward_log_return_partition(pdf: cudf.DataFrame, price_col: str, horizon: int, out_col: str) -> cudf.DataFrame:

@@ -25,8 +25,9 @@ import dask_cudf
 from dask.distributed import Client
 
 from config.unified_config import UnifiedConfig
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.base_engine")
 
 
 @dataclass
@@ -80,7 +81,7 @@ class BaseFeatureEngine(ABC):
         except Exception:
             self.settings = config
         self.client = client
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = get_logger(self.__class__.__name__, f"features.{self.__class__.__name__}")
         
         # Performance tracking
         self.processing_times = {}

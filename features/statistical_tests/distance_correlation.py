@@ -12,8 +12,9 @@ import cupy as cp
 import cudf
 from typing import List, Dict, Any, Tuple
 from .utils import _adaptive_tile
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.statistical_tests.distance_correlation")
 
 
 class DistanceCorrelation:

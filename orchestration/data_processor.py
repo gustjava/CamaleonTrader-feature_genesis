@@ -19,9 +19,15 @@ from config.unified_config import get_unified_config as get_settings
 from dask.distributed import Client, wait
 from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
-from features import StationarizationEngine, StatisticalTests, GARCHModels, FeatureEngineeringEngine
+from features import (
+    StationarizationEngine,
+    StatisticalTests,
+    GARCHModels,
+    FeatureEngineeringEngine,
+)
+from features.signal_processing import apply_emd_to_series
 from features.base_engine import CriticalPipelineError
-from utils.logging_utils import get_logger
+from utils.logging_utils import get_logger, set_currency_pair_context
 from features.engine_metrics import EngineMetrics
 
 logger = get_logger(__name__, "orchestration.processor")
@@ -68,6 +74,8 @@ class DataProcessor:
             bool: True if processing was successful, False otherwise
         """
         try:
+            # Set currency pair context for all subsequent logs
+            set_currency_pair_context(currency_pair)
             logger.info(f"Starting processing for {currency_pair}")
             
             # Connect to database for task tracking (non-fatal)
@@ -92,6 +100,9 @@ class DataProcessor:
             if gdf is None:
                 self._register_task_failure(currency_pair, r2_path, "Feature engineering failed")
                 return False
+
+            # Nota: Seleção final de features (CatBoost) ocorre dentro do engine statistical_tests
+            # após dCor → VIF → MI (Stage 3 embutido). Nenhuma execução duplicada aqui.
             
             # Save processed data
             if not self._save_processed_data(gdf, currency_pair):  # Salva dados processados
@@ -304,6 +315,13 @@ class DataProcessor:
                 except Exception:
                     desc = 'No description'
                 logger.info(f"📝 Description: {desc}")
+
+                # For statistical_tests, emit a concrete step-by-step plan derived from config and schema
+                try:
+                    if str(engine_name) == 'statistical_tests':
+                        self._log_statistical_tests_plan_cudf(gdf)
+                except Exception as _e:
+                    logger.debug(f"Could not build statistical_tests plan (cuDF): {_e}")
                 
                 rows_before = len(gdf)
                 cols_before = len(gdf.columns)
@@ -394,8 +412,40 @@ class DataProcessor:
             elif engine_name == 'statistical_tests':
                 return self.stats.process_cudf(gdf)
             elif engine_name == 'signal_processing':
-                logger.info("Signal processing engine removed; pass-through (cuDF)")
-                return gdf
+                # Apply EMD on 'close' (if available) and concatenate IMFs
+                try:
+                    emd_cfg = getattr(self.settings.features, 'emd', {})
+                    max_imfs = int(emd_cfg.get('max_imfs', getattr(self.settings.features, 'emd_max_imfs', 10)))
+                    rolling_enable = bool(emd_cfg.get('rolling_enable', getattr(self.settings.features, 'emd_rolling_enable', False)))
+                    window_size = int(emd_cfg.get('rolling_window', getattr(self.settings.features, 'emd_rolling_window', 500)))
+                    step_size = int(emd_cfg.get('rolling_step', getattr(self.settings.features, 'emd_rolling_step', 50)))
+                    embargo = int(emd_cfg.get('rolling_embargo', getattr(self.settings.features, 'emd_rolling_embargo', 0)))
+                except Exception:
+                    max_imfs = getattr(self.settings.features, 'emd_max_imfs', 10)
+                    rolling_enable = getattr(self.settings.features, 'emd_rolling_enable', False)
+                    window_size = getattr(self.settings.features, 'emd_rolling_window', 500)
+                    step_size = getattr(self.settings.features, 'emd_rolling_step', 50)
+                    embargo = getattr(self.settings.features, 'emd_rolling_embargo', 0)
+
+                if 'close' not in gdf.columns:
+                    logger.warning("Coluna 'close' ausente; pulando EMD (signal_processing)")
+                    return gdf
+                try:
+                    if rolling_enable:
+                        from features.signal_processing import apply_rolling_emd
+                        imfs = apply_rolling_emd(gdf['close'], max_imfs=max_imfs,
+                                                 window_size=window_size, step_size=step_size,
+                                                 embargo=embargo)
+                    else:
+                        imfs = apply_emd_to_series(gdf['close'], max_imfs=max_imfs)
+                    # Prefix with 'emd_' to namespace features
+                    imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
+                    gdf = cudf.concat([gdf, imfs], axis=1)
+                    logger.info(f"EMD gerou {imfs.shape[1]} IMFs; novas colunas adicionadas")
+                    return gdf
+                except Exception as e:
+                    logger.warning(f"Falha ao aplicar EMD: {e}; mantendo DataFrame inalterado")
+                    return gdf
             elif engine_name == 'garch_models':
                 return self.garch.process_cudf(gdf)
             else:
@@ -414,10 +464,58 @@ class DataProcessor:
             elif engine_name == 'feature_engineering':
                 return self.feng.process(ddf)
             elif engine_name == 'statistical_tests':
-                return self.stats.process(ddf)
+                # Orchestrate StatisticalTests as explicit sub-stages for visibility
+                return self._run_statistical_tests_stages(ddf)
             elif engine_name == 'signal_processing':
-                logger.info("Signal processing engine removed; pass-through (Dask)")
-                return ddf
+                # Compute EMD on worker by materializing a small cuDF subset and merge back by 'timestamp'.
+                try:
+                    import dask_cudf as _dask_cudf
+                except Exception:
+                    logger.info("dask_cudf indisponível; mantendo pass-through")
+                    return ddf
+
+                if 'close' not in ddf.columns or 'timestamp' not in ddf.columns:
+                    logger.warning("Colunas necessárias ('timestamp','close') ausentes; pulando EMD (Dask)")
+                    return ddf
+
+                try:
+                    emd_cfg = getattr(self.settings.features, 'emd', {})
+                    max_imfs = int(emd_cfg.get('max_imfs', getattr(self.settings.features, 'emd_max_imfs', 10)))
+                    rolling_enable = bool(emd_cfg.get('rolling_enable', getattr(self.settings.features, 'emd_rolling_enable', False)))
+                    window_size = int(emd_cfg.get('rolling_window', getattr(self.settings.features, 'emd_rolling_window', 500)))
+                    step_size = int(emd_cfg.get('rolling_step', getattr(self.settings.features, 'emd_rolling_step', 50)))
+                    embargo = int(emd_cfg.get('rolling_embargo', getattr(self.settings.features, 'emd_rolling_embargo', 0)))
+                except Exception:
+                    max_imfs = getattr(self.settings.features, 'emd_max_imfs', 10)
+                    rolling_enable = getattr(self.settings.features, 'emd_rolling_enable', False)
+                    window_size = getattr(self.settings.features, 'emd_rolling_window', 500)
+                    step_size = getattr(self.settings.features, 'emd_rolling_step', 50)
+                    embargo = getattr(self.settings.features, 'emd_rolling_embargo', 0)
+
+                # Materialize minimal columns on this worker
+                try:
+                    subset = ddf[['timestamp', 'close']].compute()
+                    subset = subset.sort_values('timestamp')
+                    if rolling_enable:
+                        from features.signal_processing import apply_rolling_emd
+                        imfs = apply_rolling_emd(subset['close'], max_imfs=max_imfs,
+                                                 window_size=window_size, step_size=step_size,
+                                                 embargo=embargo)
+                    else:
+                        imfs = apply_emd_to_series(subset['close'], max_imfs=max_imfs)
+                    # Prefix and add key for merge
+                    imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
+                    imfs = imfs.reset_index(drop=True)
+                    subset = subset.reset_index(drop=True)
+                    imf_gdf = cudf.concat([subset[['timestamp']], imfs], axis=1)
+                    imf_ddf = _dask_cudf.from_cudf(imf_gdf, npartitions=max(1, ddf.npartitions))
+                    # Merge by timestamp to align back to the distributed frame
+                    ddf = ddf.merge(imf_ddf, on='timestamp', how='left')
+                    logger.info(f"EMD (Dask) gerou {imfs.shape[1]} IMFs; colunas adicionadas via merge")
+                    return ddf
+                except Exception as e:
+                    logger.warning(f"Falha ao aplicar EMD (Dask): {e}; mantendo pass-through")
+                    return ddf
             elif engine_name == 'garch_models':
                 return self.garch.process(ddf)
             else:
@@ -426,6 +524,249 @@ class DataProcessor:
         except Exception as e:
             logger.error(f"Error executing Dask engine {engine_name}: {e}", exc_info=True)
             return None
+
+    def _run_statistical_tests_stages(self, ddf):
+        """Run StatisticalTests as separate sub-stages with explicit checkpointing."""
+        try:
+            import dask
+            from dask.distributed import wait as _wait
+        except Exception:
+            dask = None
+            _wait = None
+
+        # Stage: ADF
+        try:
+            logger.info("[StatTests] Stage start: ADF rolling")
+            from features.statistical_tests.stage_adf import run as run_adf
+            with dask.annotate(task_key_name="stat_adf") if dask else _noop_ctx():
+                ddf = run_adf(self.stats, ddf, window=252, min_periods=200)
+            logger.info("Persist start: statistical_tests:adf")
+            ddf = ddf.persist()
+            logger.info("Persist returned: statistical_tests:adf")
+            try:
+                if _wait:
+                    logger.info("Waiting for statistical_tests:adf to complete (timeout: 600s)...")
+                    _wait(ddf, timeout=600)
+                    logger.info("statistical_tests:adf completed successfully")
+            except Exception as e:
+                logger.warning(f"Wait timeout or error for statistical_tests:adf: {e}")
+                logger.info("Continuing without waiting - data is still persisted for statistical_tests:adf")
+        except Exception as e:
+            logger.error(f"[StatTests] ADF stage failed: {e}")
+
+        # Stage: dCor
+        try:
+            logger.info("[StatTests] Stage start: dCor analysis")
+            from features.statistical_tests.stage_dcor import run as run_dcor
+            target = getattr(self.settings.features, 'selection_target_column', None)
+            if target and target in ddf.columns:
+                candidates = self.stats._find_candidate_features(ddf)
+                with dask.annotate(task_key_name="stat_dcor") if dask else _noop_ctx():
+                    ddf = run_dcor(self.stats, ddf, target, candidates)
+                # Orchestration-level summary for dCor
+                try:
+                    dsum = getattr(self.stats, '_last_dcor_summary', {}) or {}
+                    total = dsum.get('candidates_total')
+                    kept = dsum.get('prefilter_kept')
+                    scores = dsum.get('scores', {})
+                    # Show all scores instead of just top 10
+                    all_scores = [f"{name}:{val:.4f}" for name, val in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+                    logger.info(f"[StatTests] dCor completed: candidates={total}, prefilter_kept={kept}, all_scores={all_scores}")
+                    try:
+                        self._write_stat_tests_artifacts(getattr(self, 'current_currency_pair', 'unknown'), dcor_summary=dsum)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            else:
+                logger.warning("[StatTests] dCor skipped: target missing in columns")
+        except Exception as e:
+            logger.error(f"[StatTests] dCor stage failed: {e}")
+
+        # Stage: Selection (split into VIF → MI → Embedded(CatBoost))
+        try:
+            target = getattr(self.settings.features, 'selection_target_column', None)
+            if not (target and target in ddf.columns):
+                logger.warning("[StatTests] Selection skipped: target missing in columns")
+            else:
+                # VIF
+                logger.info("[StatTests] Stage start: Selection/VIF")
+                from features.statistical_tests.stage_selection_vif import run as run_vif
+                vif_res = run_vif(self.stats, ddf, target)
+                try:
+                    v_in = vif_res.get('stage2_vif_input', [])
+                    v_out = vif_res.get('stage2_vif_selected', [])
+                    logger.info(f"[StatTests] VIF: input={len(v_in)} → output={len(v_out)}; output_preview={(v_out or [])[:15]}")
+                except Exception:
+                    pass
+
+                # MI
+                logger.info("[StatTests] Stage start: Selection/MI")
+                from features.statistical_tests.stage_selection_mi import run as run_mi
+                mi_res = run_mi(self.stats, ddf, target, vif_selected=vif_res.get('stage2_vif_selected', []))
+                try:
+                    m_in = mi_res.get('stage2_vif_selected', [])
+                    m_out = mi_res.get('stage2_mi_selected', [])
+                    logger.info(f"[StatTests] MI: input={len(m_in)} → output={len(m_out)}; output_preview={(m_out or [])[:15]}")
+                except Exception:
+                    pass
+
+                # Embedded (CatBoost)
+                logger.info("[StatTests] Stage start: Selection/Embedded (CatBoost)")
+                from features.statistical_tests.stage_selection_embedded import run as run_emb
+                emb_res = run_emb(self.stats, ddf, target, mi_selected=mi_res.get('stage2_mi_selected', []))
+                try:
+                    e_in = emb_res.get('stage2_mi_selected', [])
+                    e_out = emb_res.get('stage3_final_selected', [])
+                    logger.info(f"[StatTests] Embedded (CatBoost): input={len(e_in)} → output={len(e_out)}; output_preview={(e_out or [])[:15]}")
+                except Exception:
+                    pass
+
+                # Combined selection summary + artifacts
+                try:
+                    combined = {
+                        'stage': 'selection_split',
+                        'stage2_vif_input': vif_res.get('stage2_vif_input', []),
+                        'stage2_vif_selected': vif_res.get('stage2_vif_selected', []),
+                        'vif_input_with_dcor': vif_res.get('vif_input_with_dcor', {}),
+                        'vif_selected_with_dcor': vif_res.get('vif_selected_with_dcor', {}),
+                        'stage2_mi_selected': mi_res.get('stage2_mi_selected', []),
+                        'stage3_final_selected': emb_res.get('stage3_final_selected', []),
+                        'importances': emb_res.get('importances', {}),
+                        'selection_stats': emb_res.get('selection_stats', {}),
+                    }
+                    logger.info(
+                        f"[StatTests] Selection split summary: VIF={len(combined['stage2_vif_selected'])} → MI={len(combined['stage2_mi_selected'])} → Final={len(combined['stage3_final_selected'])}; final_preview={(combined['stage3_final_selected'] or [])[:15]}"
+                    )
+                    try:
+                        self._write_stat_tests_artifacts(
+                            getattr(self, 'current_currency_pair', 'unknown'),
+                            dcor_summary=getattr(self.stats, '_last_dcor_summary', {}) or None,
+                            selection_results=combined,
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"[StatTests] Selection stages failed: {e}")
+
+        # Stage: Final Stats
+        try:
+            logger.info("[StatTests] Stage start: Final comprehensive statistical analysis")
+            from features.statistical_tests.stage_final_stats import run as run_final
+            with dask.annotate(task_key_name="stat_final") if dask else _noop_ctx():
+                ddf = run_final(self.stats, ddf)
+            logger.info("Persist start: statistical_tests:final_stats")
+            ddf = ddf.persist()
+            logger.info("Persist returned: statistical_tests:final_stats")
+            try:
+                if _wait:
+                    logger.info("Waiting for statistical_tests:final_stats to complete (timeout: 600s)...")
+                    _wait(ddf, timeout=600)
+                    logger.info("statistical_tests:final_stats completed successfully")
+            except Exception as e:
+                logger.warning(f"Wait timeout or error for statistical_tests:final_stats: {e}")
+                logger.info("Continuing without waiting - data is still persisted for statistical_tests:final_stats")
+        except Exception as e:
+            logger.error(f"[StatTests] Final Stats stage failed: {e}")
+
+        return ddf
+
+def _noop_ctx():
+    from contextlib import contextmanager
+    @contextmanager
+    def _noop():
+        yield
+    return _noop()
+
+    def _log_statistical_tests_plan_cudf(self, gdf: cudf.DataFrame) -> None:
+        """Emit a step-by-step plan for the statistical_tests engine when using cuDF.
+
+        The plan is inferred from settings.features and current DataFrame columns.
+        """
+        try:
+            feats = getattr(self.settings, 'features', None)
+            # Detect presence of typical inputs
+            cols = list(gdf.columns)
+            has_frac_diff = any('frac_diff' in str(c) for c in cols)
+            # JB removed from project
+            target = None
+            try:
+                target = getattr(feats, 'selection_target_column', None)
+            except Exception:
+                target = None
+            # dCor/selection params
+            dcor_top_k = int(getattr(feats, 'dcor_top_k', 50) or 50) if feats else 50
+            vif_thr = float(getattr(feats, 'vif_threshold', 5.0) or 5.0) if feats else 5.0
+            mi_thr = float(getattr(feats, 'mi_threshold', 0.3) or 0.3) if feats else 0.3
+            stage3_top_n = int(getattr(feats, 'stage3_top_n', 50) or 50) if feats else 50
+
+            steps = []
+            # Step 1: ADF
+            if has_frac_diff:
+                steps.append(f"1) ADF rolling over frac_diff* features (found={sum(1 for c in cols if 'frac_diff' in str(c))})")
+            else:
+                steps.append("1) ADF rolling: skipped (no frac_diff* columns found)")
+            # JB removed from project
+            # Step 2: dCor
+            if target and (target in cols or 'y_close' in cols):
+                steps.append(f"2) Distance Correlation (dCor) ranking vs target='{target}' (topK={dcor_top_k})")
+            else:
+                steps.append("2) Distance Correlation: target missing → will attempt fallback or skip")
+            # Step 3: Selection
+            steps.append(f"3) Feature Selection pipeline: VIF(thr={vif_thr}) → MI(thr={mi_thr}) → LGBM topN={stage3_top_n}")
+            # Step 4: Final stats
+            steps.append("4) Final comprehensive statistical summaries and flags")
+
+            logger.info("StatisticalTests plan (cuDF):")
+            for s in steps:
+                logger.info(f"   • {s}")
+        except Exception as e:
+            logger.debug(f"statistical_tests plan (cuDF) failed: {e}")
+
+    def _log_statistical_tests_plan_dask(self, ddf) -> None:
+        """Emit a step-by-step plan for the statistical_tests engine when using Dask-cuDF.
+
+        Avoids triggering computation; relies on available schema/meta only.
+        """
+        try:
+            feats = getattr(self.settings, 'features', None)
+            try:
+                cols = list(ddf.columns)
+            except Exception:
+                cols = []
+            has_frac_diff = any('frac_diff' in str(c) for c in cols)
+            # JB removed from project
+            target = None
+            try:
+                target = getattr(feats, 'selection_target_column', None)
+            except Exception:
+                target = None
+            dcor_top_k = int(getattr(feats, 'dcor_top_k', 50) or 50) if feats else 50
+            vif_thr = float(getattr(feats, 'vif_threshold', 5.0) or 5.0) if feats else 5.0
+            mi_thr = float(getattr(feats, 'mi_threshold', 0.3) or 0.3) if feats else 0.3
+            stage3_top_n = int(getattr(feats, 'stage3_top_n', 50) or 50) if feats else 50
+
+            steps = []
+            if has_frac_diff:
+                cnt = sum(1 for c in cols if 'frac_diff' in str(c))
+                steps.append(f"1) ADF rolling on frac_diff* (distributed) [~{cnt} features]")
+            else:
+                steps.append("1) ADF rolling: skipped (no frac_diff* columns in schema)")
+            # JB removed from project
+            if target and (target in cols or 'y_close' in cols):
+                steps.append(f"2) dCor ranking vs target='{target}' on sampled tail/head (topK={dcor_top_k})")
+            else:
+                steps.append("2) dCor: target missing → will try compute forward return if possible or skip")
+            steps.append(f"3) Selection: candidates filter → VIF({vif_thr}) → MI({mi_thr}) → LGBM topN={stage3_top_n}")
+            steps.append("4) Final comprehensive statistical analysis (map_partitions)")
+
+            logger.info("StatisticalTests plan (Dask):")
+            for s in steps:
+                logger.info(f"   • {s}")
+        except Exception as e:
+            logger.debug(f"statistical_tests plan (Dask) failed: {e}")
 
     def _save_intermediate_data(self, ddf_or_gdf, currency_pair: str, engine_name: str):
         """Optionally save an intermediate checkpoint after an engine.
@@ -484,6 +825,45 @@ class DataProcessor:
         except Exception as e:
             logger.warning(f"Could not save intermediate checkpoint for {engine_name}: {e}")
 
+    def _write_stat_tests_artifacts(self, currency_pair: str, dcor_summary=None, selection_results=None) -> None:
+        """Write compact JSON artifacts for Statistical Tests (dCor and Selection).
+
+        Best-effort only; failures are ignored. Files are written under artifacts/<pair>/
+        """
+        try:
+            import json as _json
+            base = None
+            try:
+                base = Path(getattr(self.stats, 'artifacts_dir', 'artifacts'))
+            except Exception:
+                base = Path('artifacts')
+            out_dir = base / str(currency_pair)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            if dcor_summary:
+                dsum = dict(dcor_summary)
+                scores = dsum.get('scores') or {}
+                if scores:
+                    try:
+                        items = sorted(scores.items(), key=lambda kv: (kv[1] if isinstance(kv[1], (int, float)) else -1), reverse=True)
+                        dsum['scores_top'] = items[:200]
+                    except Exception:
+                        pass
+                    dsum.pop('scores', None)
+                (out_dir / 'stat_tests_dcor.json').write_text(_json.dumps(dsum, ensure_ascii=False, indent=2))
+            if selection_results:
+                sres = dict(selection_results)
+                imps = sres.get('importances') or {}
+                if imps:
+                    try:
+                        items = sorted(imps.items(), key=lambda kv: (kv[1] if isinstance(kv[1], (int, float)) else -1), reverse=True)
+                        sres['importances_top'] = items[:200]
+                    except Exception:
+                        pass
+                    sres.pop('importances', None)
+                (out_dir / 'stat_tests_selection.json').write_text(_json.dumps(sres, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
     def _validate_initial_data_dask(self, ddf, currency_pair: str) -> bool:
         """Lightweight validation for dask_cudf DataFrame."""
         try:
@@ -513,10 +893,146 @@ class DataProcessor:
             return False
 
     def process_currency_pair_dask(self, currency_pair: str, r2_path: str, client: Client) -> bool:
-        """
-        Process a single currency pair using dask_cudf + multi-GPU engines on the driver.
-        """
-        try:
+        """Process a single currency pair using dask_cudf (delegates to module impl)."""
+        return _process_currency_pair_dask_impl(self, currency_pair, r2_path, client)
+
+
+def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, r2_path: str, client: Client) -> bool:
+    """Module-level implementation of the Dask processing path.
+
+    Kept outside the class so workers with an older DataProcessor class can bind
+    this function as a method at runtime and still execute the Dask path.
+    """
+    try:
+            # Ensure required helpers exist on this instance; bind from latest class or attach fallbacks
+            try:
+                import types as _types
+                try:
+                    # Try to use the most recently loaded class definition
+                    import importlib as _importlib
+                    import orchestration.data_processor as _dp_reload
+                    _dp_mod_latest = _importlib.reload(_dp_reload)
+                    _src_cls = getattr(_dp_mod_latest, 'DataProcessor', None) or type(self)
+                except Exception:
+                    _src_cls = type(self)
+
+                _need = [
+                    '_validate_initial_data_dask',
+                    '_validate_intermediate_data_dask',
+                    '_register_task_failure',
+                    '_register_task_success',
+                    '_save_intermediate_data',
+                    '_save_processed_data_dask',
+                    '_drop_denied_columns',
+                    '_execute_engine_dask',
+                    '_log_statistical_tests_plan_dask',
+                ]
+                for _name in _need:
+                    if not hasattr(self, _name) and hasattr(_src_cls, _name):
+                        try:
+                            setattr(self, _name, _types.MethodType(getattr(_src_cls, _name), self))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Attach minimal safe fallbacks if still missing
+            if not hasattr(self, '_validate_initial_data_dask'):
+                def _fb_validate_initial_data_dask(ddf, pair):
+                    try:
+                        sample = ddf.head(1)
+                        if getattr(sample, 'shape', (0,))[0] == 0:
+                            logger.error(f"Empty Dask DataFrame for {pair}")
+                            return False
+                        return True
+                    except Exception as _e:
+                        logger.error(f"Error validating initial Dask data for {pair}: {_e}")
+                        return False
+                self._validate_initial_data_dask = _fb_validate_initial_data_dask  # type: ignore
+
+            if not hasattr(self, '_validate_intermediate_data_dask'):
+                def _fb_validate_intermediate_data_dask(ddf, pair, engine):
+                    try:
+                        sample = ddf.head(1)
+                        if getattr(sample, 'shape', (0,))[0] == 0:
+                            logger.error(f"Empty Dask DataFrame after {engine} for {pair}")
+                            return False
+                        return True
+                    except Exception as _e:
+                        logger.error(f"Error validating Dask data for {pair} after {engine}: {_e}")
+                        return False
+                self._validate_intermediate_data_dask = _fb_validate_intermediate_data_dask  # type: ignore
+
+            if not hasattr(self, '_register_task_failure'):
+                def _fb_register_task_failure(pair, path, msg):
+                    try:
+                        if getattr(self, 'db_connected', False) and getattr(self, 'db_handler', None):
+                            try:
+                                task_id = self.db_handler.register_currency_pair(pair, path)
+                                if task_id:
+                                    self.db_handler.update_task_status(task_id, 'FAILED', msg)
+                            except Exception:
+                                pass
+                        logger.error(f"Task failure [{pair}]: {msg}")
+                    except Exception:
+                        pass
+                self._register_task_failure = _fb_register_task_failure  # type: ignore
+
+            if not hasattr(self, '_register_task_success'):
+                def _fb_register_task_success(pair, path):
+                    try:
+                        if getattr(self, 'db_connected', False) and getattr(self, 'db_handler', None):
+                            try:
+                                task_id = self.db_handler.register_currency_pair(pair, path)
+                                if task_id:
+                                    self.db_handler.update_task_status(task_id, 'COMPLETED')
+                            except Exception:
+                                pass
+                        logger.info(f"Task success [{pair}]")
+                    except Exception:
+                        pass
+                self._register_task_success = _fb_register_task_success  # type: ignore
+
+            if not hasattr(self, '_save_intermediate_data'):
+                def _fb_save_intermediate_data(_ddf, pair, eng):
+                    # no-op fallback; just log to keep flow
+                    logger.debug(f"[fallback] Skipping intermediate save for {pair}:{eng}")
+                self._save_intermediate_data = _fb_save_intermediate_data  # type: ignore
+
+            if not hasattr(self, '_save_processed_data_dask'):
+                def _fb_save_processed_data_dask(_ddf, pair):
+                    logger.warning(f"[fallback] Missing Dask save; skipping save for {pair}")
+                    return True
+                self._save_processed_data_dask = _fb_save_processed_data_dask  # type: ignore
+
+            if not hasattr(self, '_drop_denied_columns'):
+                def _fb_drop_denied_columns(df):
+                    try:
+                        cols = list(df.columns)
+                        if 'y_minutes_since_open' in cols:
+                            return df.drop(columns=['y_minutes_since_open'], errors='ignore')
+                        return df
+                    except Exception:
+                        return df
+                self._drop_denied_columns = _fb_drop_denied_columns  # type: ignore
+
+            if not hasattr(self, '_execute_engine_dask'):
+                def _fb_execute_engine_dask(_eng, df):
+                    logger.warning(f"[fallback] Missing _execute_engine_dask for {_eng}; pass-through")
+                    return df
+                self._execute_engine_dask = _fb_execute_engine_dask  # type: ignore
+
+            if not hasattr(self, '_log_statistical_tests_plan_dask'):
+                def _fb_log_stat_tests_plan(_df):
+                    logger.debug("[fallback] Stats tests plan log skipped (helper missing)")
+                self._log_statistical_tests_plan_dask = _fb_log_stat_tests_plan  # type: ignore
+
+            # Set currency pair context for all subsequent logs
+            set_currency_pair_context(currency_pair)
+            try:
+                self.current_currency_pair = currency_pair
+            except Exception:
+                pass
             logger.info(f"Starting Dask processing for {currency_pair}")
             # Cluster snapshot to aid debugging
             try:
@@ -626,6 +1142,12 @@ class DataProcessor:
                 # Log engine start
                 logger.info(f"Starting {engine_name} processing for {currency_pair} (Dask)")
                 logger.info(f"📝 Description: {eng_cfg.description}")
+                # Emit step-by-step plan for statistical_tests when running on Dask
+                try:
+                    if str(engine_name) == 'statistical_tests':
+                        self._log_statistical_tests_plan_dask(ddf)
+                except Exception as _e:
+                    logger.debug(f"Could not build statistical_tests plan (Dask): {_e}")
                 # Stage DB start (schema deltas based on columns only, rows unknown for Dask)
                 stage_id = None
                 try:
@@ -667,6 +1189,7 @@ class DataProcessor:
                         try:
                             logger.info(f"Engine start: {engine_name} | npartitions={ddf.npartitions}")
                         except Exception:
+                            logger.info(f"ERROR Engine start: {engine_name} | npartitions={ddf.npartitions}")
                             pass
                         ctx = _dask_config.set({"optimization.fuse.active": False}) if debug_dash else _dask_config.set({})
                         with ctx:
@@ -686,9 +1209,16 @@ class DataProcessor:
                     except Exception:
                         ddf = ddf.persist()
                     logger.info(f"Persist returned: {engine_name}")
-                    logger.info(f"Waiting for {engine_name} computation to complete (timeout: 60s)...")
+                    # Longer timeout for heavy engines (statistical_tests and garch_models)
+                    if engine_name == 'statistical_tests':
+                        timeout_s = 600
+                    elif engine_name == 'garch_models':
+                        timeout_s = 180
+                    else:
+                        timeout_s = 60
+                    logger.info(f"Waiting for {engine_name} computation to complete (timeout: {timeout_s}s)...")
                     try:
-                        wait(ddf, timeout=60)  # 1 minute timeout
+                        wait(ddf, timeout=timeout_s)
                         logger.info(f"{engine_name} computation completed successfully")
                     except Exception as wait_err:
                         logger.warning(f"Wait timeout or error for {engine_name}: {wait_err}")
@@ -754,6 +1284,9 @@ class DataProcessor:
                     return False
 
             # Save directly from Dask without materializing everything on one GPU
+            # Nota: Seleção final com CatBoost é parte do statistical_tests; não duplicar no caminho Dask.
+
+            # Save diretamente do Dask sem materializar tudo em uma única GPU
             with dask.annotate(task_key_name=f"save-{currency_pair}"):
                 try:
                     from dask import config as _dask_config
@@ -798,10 +1331,10 @@ class DataProcessor:
             self._register_task_success(currency_pair, r2_path)
             logger.info(f"Successfully completed Dask processing for {currency_pair}")
             return True
-        except Exception as e:
-            logger.error(f"Error in Dask processing for {currency_pair}: {e}", exc_info=True)
-            self._register_task_failure(currency_pair, r2_path, str(e))
-            return False
+    except Exception as e:
+        logger.error(f"Error in Dask processing for {currency_pair}: {e}", exc_info=True)
+        self._register_task_failure(currency_pair, r2_path, str(e))
+        return False
     
     def _validate_intermediate_data(self, gdf: cudf.DataFrame, currency_pair: str, engine_name: str) -> bool:
         """
@@ -929,6 +1462,8 @@ class DataProcessor:
             logger.error(f"Failed to save processed data for {currency_pair}: {save_error}", exc_info=True)
             return False
 
+    # Removido: persistência separada de selected_features.json (seleção centralizada no statistical_tests)
+
     def _save_processed_data_dask(self, ddf, currency_pair: str) -> bool:
         """Save the processed Dask-cuDF DataFrame as partitioned Feather files.
 
@@ -1033,6 +1568,8 @@ def process_currency_pair_worker(currency_pair: str, r2_path: str) -> bool:
     )
     
     try:
+        # Set currency pair context for all subsequent logs
+        set_currency_pair_context(currency_pair)
         processor = DataProcessor()
         return processor.process_currency_pair(currency_pair, r2_path)
     except Exception as e:
@@ -1050,15 +1587,82 @@ def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     try:
+        # Set currency pair context for all subsequent logs
+        set_currency_pair_context(currency_pair)
+        # Emit GPU/worker context to verify non-sharing and pinning
+        try:
+            import os as _os
+            import cupy as _cp
+            from dask.distributed import get_worker as _gw
+            _w = _gw()
+            _addr = getattr(_w, 'address', 'unknown')
+            _gpu = int(_cp.cuda.runtime.getDevice())
+            _vis = _os.environ.get('CUDA_VISIBLE_DEVICES', '')
+            logger.info(f"Worker context: pair={currency_pair}, worker={_addr}, gpu_device={_gpu}, VISIBLE={_vis}")
+        except Exception:
+            pass
         # Resolve current worker and use a worker_client to schedule sub-tasks
         from dask.distributed import get_worker, worker_client
         import dask
         w = get_worker()
         addr = getattr(w, 'address', None)
         with worker_client() as wc:
-            processor = DataProcessor(client=wc)
+            # Hot-reload this module on the worker to ensure latest class definitions
+            try:
+                import importlib, sys as _sys
+                _mod = importlib.reload(_sys.modules[__name__])
+            except Exception:
+                try:
+                    import importlib as _importlib
+                    import orchestration.data_processor as _dp_mod
+                    _mod = _importlib.reload(_dp_mod)
+                except Exception:
+                    _mod = None
+            processor = (_mod.DataProcessor if _mod and hasattr(_mod, 'DataProcessor') else DataProcessor)(client=wc)
+            # Ensure required helper methods exist on the instance (bind from latest class if missing)
+            import types as _types
+            try:
+                # Prefer the freshly reloaded class as source
+                _src_cls = _mod.DataProcessor if (_mod and hasattr(_mod, 'DataProcessor')) else DataProcessor
+            except Exception:
+                _src_cls = DataProcessor
+            _need = [
+                '_validate_initial_data_dask',
+                '_validate_intermediate_data_dask',
+                '_register_task_failure',
+                '_register_task_success',
+                '_save_intermediate_data',
+                '_save_processed_data_dask',
+                '_drop_denied_columns',
+                '_execute_engine_dask',
+                '_log_statistical_tests_plan_dask',
+            ]
+            _bound = []
+            _missing_after = []
+            for _name in _need:
+                if not hasattr(processor, _name) and hasattr(_src_cls, _name):
+                    try:
+                        setattr(processor, _name, _types.MethodType(getattr(_src_cls, _name), processor))
+                        _bound.append(_name)
+                    except Exception as _e:
+                        logger.warning(f"Failed to bind helper '{_name}' on worker: {_e}")
+            for _name in _need:
+                if not hasattr(processor, _name):
+                    _missing_after.append(_name)
+            if _bound:
+                logger.info(f"Worker bound helpers: {_bound}")
+            if _missing_after:
+                logger.warning(f"Helpers still missing on worker after bind: {_missing_after}")
             # Annotate all tasks to stay on this worker
             with dask.annotate(workers=[addr] if addr else None, allow_other_workers=False, task_key_name=f"pair-{currency_pair}"):
+                # Enforce Dask path only; if missing on class, bind module implementation dynamically
+                if not hasattr(processor, 'process_currency_pair_dask'):
+                    try:
+                        import types as _types
+                        from orchestration.data_processor import _process_currency_pair_dask_impl as _impl
+                        processor.process_currency_pair_dask = _types.MethodType(_impl, processor)
+                    except Exception as _bind_err:
+                        raise RuntimeError("Dask path required but missing on worker and dynamic bind failed: " + str(_bind_err))
                 return processor.process_currency_pair_dask(currency_pair, r2_path, wc)
     except Exception as e:
         logger.error(f"Error in Dask worker processing {currency_pair}: {e}", exc_info=True)

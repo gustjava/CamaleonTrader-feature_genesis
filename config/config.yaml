@@ -537,27 +537,31 @@ development:
 # Individual engine settings and execution order
 pipeline:
   engines:
-    stationarization:
+    signal_processing:
       enabled: true
       order: 1
+      description: "Signal processing (EMD decomposition)"
+    stationarization:
+      enabled: true
+      order: 2
       description: "Stationarization techniques including fractional differentiation"
       timeout: 300
       retry_count: 3
     feature_engineering:
       enabled: true
-      order: 2
+      order: 3
       description: "Early feature engineering (e.g., Baxter–King over multiple sources)"
       timeout: 300
       retry_count: 3
     garch_models:
       enabled: true
-      order: 3
+      order: 4
       description: "GARCH volatility modeling"
       timeout: 300
       retry_count: 3
     statistical_tests:
       enabled: true
-      order: 4
+      order: 5
       description: "Statistical tests and analysis"
       timeout: 300
       retry_count: 3

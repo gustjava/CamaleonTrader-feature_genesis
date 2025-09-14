@@ -248,11 +248,19 @@ else
     # Não ativar nenhum ambiente específico, usar o base
 fi
 
+# --- Garantir bibliotecas de seleção (CatBoost/LightGBM) instaladas ---
+echo '--- [REMOTO] Instalando dependências adicionais (CatBoost/LightGBM para seleção de features)...'
+conda install -y lightgbm || true
+conda install -c conda-forge -y catboost || true
+
 echo '--- [REMOTO] Instalando dependências adicionais para Stage 3/4...'
 # LightGBM (árvores), scikit-learn (LassoCV/TSS), XGBoost (GPU opcional), matplotlib (plots Stage 4)
 conda install -c conda-forge -y \
   sqlalchemy pymysql cryptography \
-  scikit-learn lightgbm xgboost matplotlib || true
+  scikit-learn lightgbm catboost xgboost matplotlib || true
+
+echo '--- [REMOTO] Garantindo instalação da biblioteca EMD (signal processing)...'
+pip install --no-cache-dir emd || true
 
 echo '--- [REMOTO] Verificando se rclone está instalado...'
 if ! command -v rclone &> /dev/null; then

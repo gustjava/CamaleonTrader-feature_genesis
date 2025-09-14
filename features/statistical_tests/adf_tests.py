@@ -11,8 +11,9 @@ import cupy as cp
 import cudf
 from typing import List, Dict, Any, Tuple
 from .utils import _adf_tstat_window_host, _adf_rolling_partition
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.statistical_tests.adf_tests")
 
 
 class ADFTests:

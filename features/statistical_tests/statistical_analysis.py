@@ -10,9 +10,10 @@ import numpy as np
 import cupy as cp
 import cudf
 from typing import List, Dict, Any
-from .utils import _jb_pvalue_window_host
+# JB helpers removed; no imports
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.statistical_tests.statistical_analysis")
 
 
 class StatisticalAnalysis:
@@ -92,48 +93,7 @@ class StatisticalAnalysis:
                 'kurtosis': float('nan')
             }
 
-    def _compute_normality_tests_vectorized(self, data: cp.ndarray) -> Dict[str, float]:
-        """
-        Vectorized normality tests including Jarque-Bera and Anderson-Darling.
-        """
-        try:
-            # Jarque-Bera test (vectorized)
-            moments = self._compute_moments_vectorized(data)
-            n = len(data)
-            
-            jb_stat = n * (moments['skewness']**2 / 6 + (moments['kurtosis'] - 3)**2 / 24)
-            jb_pvalue = 1.0  # Simplified - in practice, use chi-square distribution
-            
-            # Anderson-Darling test (simplified vectorized version)
-            sorted_data = cp.sort(data)
-            n = len(sorted_data)
-            
-            # Simplified AD statistic
-            ad_stat = 0.0
-            for i in range(n):
-                p = (i + 1) / n
-                ad_stat += (2*i + 1) * cp.log(p * (1 - p))
-            
-            ad_stat = -n - ad_stat / n
-            ad_pvalue = 1.0  # Simplified
-            
-            return {
-                'jarque_bera_stat': float(jb_stat),
-                'jarque_bera_pvalue': jb_pvalue,
-                'anderson_darling_stat': float(ad_stat),
-                'anderson_darling_pvalue': ad_pvalue,
-                'is_normal': jb_pvalue > 0.05 and ad_pvalue > 0.05
-            }
-            
-        except Exception as e:
-            self._log_error(f"Error in vectorized normality tests: {e}")
-            return {
-                'jarque_bera_stat': float('nan'),
-                'jarque_bera_pvalue': float('nan'),
-                'anderson_darling_stat': float('nan'),
-                'anderson_darling_pvalue': float('nan'),
-                'is_normal': False
-            }
+    # JB/AD normality tests removed from project
 
     def _apply_additional_statistical_tests(self, df: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -417,86 +377,7 @@ class StatisticalAnalysis:
             self._log_error(f"Error computing statistical summaries: {e}")
             return {}
 
-    def apply_normality_tests(self, df: cudf.DataFrame, columns: List[str] = None) -> cudf.DataFrame:
-        """
-        Apply normality tests to specified columns.
-        
-        Args:
-            df: Input DataFrame
-            columns: List of column names to test
-            
-        Returns:
-            DataFrame with normality test results added
-        """
-        try:
-            if columns is None:
-                # Find numeric columns
-                numeric_cols = []
-                for col in df.columns:
-                    try:
-                        data = df[col].to_cupy()
-                        if cp.isfinite(data).any():
-                            numeric_cols.append(col)
-                    except Exception:
-                        continue
-                columns = numeric_cols
-            else:
-                # Exclude ADF metrics from provided list
-                columns = [c for c in columns if not str(c).startswith(("adf_", "adf_stat_"))]
-            
-            if not columns:
-                return df
-            
-            self._log_info(f"Applying normality tests to {len(columns)} columns")
-            
-            for col in columns:
-                try:
-                    s = df[col]
-                    if 'is_dxy_open' in df.columns and 'dxy' in str(col).lower():
-                        s = s[df['is_dxy_open'] == 1]
-                    s = s.dropna()
-                    if len(s) == 0:
-                        # Nothing to test
-                        df[f'{col}_jb_stat'] = float('nan')
-                        df[f'{col}_jb_pvalue'] = float('nan')
-                        df[f'{col}_ad_stat'] = float('nan')
-                        df[f'{col}_ad_pvalue'] = float('nan')
-                        df[f'{col}_is_normal'] = False
-                        continue
-                    data = s.to_cupy()
-                    valid_data = data[~cp.isnan(data)]
-                    
-                    if len(valid_data) > 10:  # Minimum sample size for normality tests
-                        # Compute normality tests
-                        normality_results = self._compute_normality_tests_vectorized(valid_data)
-                        
-                        # Add results to DataFrame
-                        df[f'{col}_jb_stat'] = normality_results['jarque_bera_stat']
-                        df[f'{col}_jb_pvalue'] = normality_results['jarque_bera_pvalue']
-                        df[f'{col}_ad_stat'] = normality_results['anderson_darling_stat']
-                        df[f'{col}_ad_pvalue'] = normality_results['anderson_darling_pvalue']
-                        df[f'{col}_is_normal'] = normality_results['is_normal']
-                    else:
-                        # Not enough data for normality tests
-                        df[f'{col}_jb_stat'] = float('nan')
-                        df[f'{col}_jb_pvalue'] = float('nan')
-                        df[f'{col}_ad_stat'] = float('nan')
-                        df[f'{col}_ad_pvalue'] = float('nan')
-                        df[f'{col}_is_normal'] = False
-                        
-                except Exception as e:
-                    self._log_warn(f"Error applying normality tests to {col}: {e}")
-                    df[f'{col}_jb_stat'] = float('nan')
-                    df[f'{col}_jb_pvalue'] = float('nan')
-                    df[f'{col}_ad_stat'] = float('nan')
-                    df[f'{col}_ad_pvalue'] = float('nan')
-                    df[f'{col}_is_normal'] = False
-            
-            return df
-            
-        except Exception as e:
-            self._log_error(f"Error applying normality tests: {e}")
-            return df
+    # apply_normality_tests removed from project
 
     def apply_comprehensive_statistical_analysis(self, df: cudf.DataFrame) -> cudf.DataFrame:
         """
@@ -514,14 +395,12 @@ class StatisticalAnalysis:
             # 1. Apply additional statistical tests
             df = self._apply_additional_statistical_tests(df)
             
-            # 2. Apply normality tests to key columns (exclude ADF metrics)
+            # 2. Normality tests removed; keep only summaries and correlations
             key_columns = [
                 col for col in df.columns
                 if any(term in str(col).lower() for term in ['y_close', 'y_ret', 'frac_diff'])
                 and (not str(col).startswith(("adf_", "adf_stat_")))
             ]
-            if key_columns:
-                df = self.apply_normality_tests(df, key_columns)
             
             # 3. Compute correlation matrix for frac_diff columns (exclude ADF metrics)
             frac_diff_cols = [
@@ -559,14 +438,12 @@ class StatisticalAnalysis:
         try:
             self._log_info("Starting pre-selection statistical features (lightweight)...")
 
-            # Normality on key columns (exclude ADF metrics)
+            # Normality tests removed; compute summaries only
             key_columns = [
                 col for col in df.columns
                 if any(term in str(col).lower() for term in ['y_close', 'y_ret', 'frac_diff'])
                 and (not str(col).startswith(("adf_", "adf_stat_")))
             ]
-            if key_columns:
-                df = self.apply_normality_tests(df, key_columns)
 
             # Statistical summaries
             summaries = self.compute_statistical_summaries(df, key_columns)

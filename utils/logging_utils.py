@@ -15,7 +15,7 @@ import time
 from typing import Any, Dict, Optional, Union
 from datetime import datetime
 
-from .log_context import get_context
+from .log_context import get_context, set_task
 
 
 class ContextualLoggerAdapter(logging.LoggerAdapter):
@@ -80,6 +80,10 @@ class ContextualLoggerAdapter(logging.LoggerAdapter):
             if key not in extra:
                 extra[key] = value
         extra['component'] = self.component
+        
+        # Ensure currency_pair is always available (alias for pair)
+        if 'pair' in context and context['pair'] is not None:
+            extra['currency_pair'] = context['pair']
         
         # Add timestamp if not present
         if 'timestamp' not in extra:
@@ -182,6 +186,7 @@ class LogRecordFactory:
             'run_id': None,
             'task_id': None,
             'pair': None,
+            'currency_pair': None,  # Alternative field name for currency pair
             'engine': None,
             'hostname': None,
             'gpu_count': None,
@@ -196,15 +201,21 @@ class LogRecordFactory:
             'new_cols': None,
         }
         
-        # Apply defaults for missing fields
+        # Apply defaults for missing fields only
         for key, default_value in defaults.items():
             if not hasattr(record, key):
                 setattr(record, key, default_value)
         
-        # Apply extra fields if provided
+        # Apply extra fields if provided (only if they don't already exist)
         if extra:
             for key, value in extra.items():
-                setattr(record, key, value)
+                if not hasattr(record, key):
+                    setattr(record, key, value)
+                else:
+                    # If field already exists, only update if it's None
+                    current_value = getattr(record, key)
+                    if current_value is None and value is not None:
+                        setattr(record, key, value)
         
         # Set default event if not provided
         if not hasattr(record, 'event'):
@@ -232,6 +243,16 @@ def get_logger(name: str, component: Optional[str] = None) -> logging.Logger:
         Standard logging.Logger instance
     """
     return logging.getLogger(name)
+
+
+def set_currency_pair_context(currency_pair: str) -> None:
+    """
+    Set the currency pair in the logging context for all subsequent logs.
+    
+    Args:
+        currency_pair: The currency pair symbol (e.g., 'EURUSD')
+    """
+    set_task(pair=currency_pair)
 
 
 # Event-based logging helpers
@@ -454,7 +475,7 @@ class ConsoleFilter(logging.Filter):
             True if record should be logged
         """
         # Replace None values with empty strings for cleaner console output
-        for attr in ['run_id', 'task_id', 'pair', 'engine', 'hostname', 'gpu_count', 
+        for attr in ['run_id', 'task_id', 'pair', 'currency_pair', 'engine', 'hostname', 'gpu_count', 
                      'workers', 'dashboard_url', 'duration_ms', 'rows_before', 
                      'rows_after', 'cols_before', 'cols_after', 'new_cols']:
             if hasattr(record, attr) and getattr(record, attr) is None:
@@ -493,6 +514,7 @@ class JsonFilter(logging.Filter):
             'run_id': None,
             'task_id': None,
             'pair': None,
+            'currency_pair': None,  # Alternative field name for currency pair
             'engine': None,
             'hostname': None,
             'gpu_count': None,

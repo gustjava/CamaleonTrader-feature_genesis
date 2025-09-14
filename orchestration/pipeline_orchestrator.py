@@ -22,7 +22,7 @@ from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
 from features.base_engine import CriticalPipelineError
 from orchestration.data_processor import DataProcessor, process_currency_pair_dask_worker
-from utils.logging_utils import get_logger
+from utils.logging_utils import get_logger, set_currency_pair_context
 from utils.pipeline_visualizer import PipelineVisualizer
 from monitoring.pipeline_dashboard import PipelineDashboard
 from monitoring.smart_alerts import SmartAlertSystem
@@ -300,6 +300,8 @@ class PipelineOrchestrator:
                 pass
 
             try:
+                # Set currency pair context for all subsequent logs
+                set_currency_pair_context(task.currency_pair)
                 ok = processor.process_currency_pair_dask(task.currency_pair, task.r2_path, client)
                 if ok:
                     successful_tasks += 1
@@ -364,6 +366,8 @@ class PipelineOrchestrator:
                 return None
             task = task_queue.pop(0)
             logger.info(f"Submitting {task.currency_pair} to worker {worker_addr}")
+            # Set currency pair context for submission logs
+            set_currency_pair_context(task.currency_pair)
             fut = client.submit(
                 process_currency_pair_dask_worker,
                 task.currency_pair,

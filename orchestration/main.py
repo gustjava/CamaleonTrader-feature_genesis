@@ -68,6 +68,27 @@ def setup_logging(default_path='config/logging.yaml', default_level=logging.INFO
             try:
                 config = yaml.safe_load(f.read())
                 logging.config.dictConfig(config)
+                
+                # Apply custom currency formatter to console handlers
+                try:
+                    from utils.currency_formatter import CurrencyConsoleFormatter
+                    formatter = CurrencyConsoleFormatter()
+                    
+                    # Apply to root handlers
+                    for handler in logging.root.handlers:
+                        if isinstance(handler, logging.StreamHandler):
+                            handler.setFormatter(formatter)
+                    
+                    # Apply to specific logger handlers (orchestration, features, etc.)
+                    for logger_name in ['orchestration', 'features', 'data_io', 'utils']:
+                        logger = logging.getLogger(logger_name)
+                        for handler in logger.handlers:
+                            if isinstance(handler, logging.StreamHandler):
+                                handler.setFormatter(formatter)
+                                
+                except Exception as e:
+                    print(f"Warning: Could not apply currency formatter: {e}")
+                
             except Exception as e:
                 print(f"Error reading logging configuration: {e}")
                 logging.basicConfig(level=default_level)
@@ -297,6 +318,19 @@ class DaskClusterManager:
             bool: True if cluster started successfully, False otherwise
         """
         try:
+            # Enforce single-threaded CPU math libs before spawning workers
+            try:
+                import os as _os
+                _os.environ.setdefault('OMP_NUM_THREADS', '1')
+                _os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+                _os.environ.setdefault('MKL_NUM_THREADS', '1')
+                _os.environ.setdefault('NUMEXPR_NUM_THREADS', '1')
+                _os.environ.setdefault('VECLIB_MAXIMUM_THREADS', '1')
+                _os.environ.setdefault('BLIS_NUM_THREADS', '1')
+                _os.environ.setdefault('KMP_AFFINITY', 'granularity=fine,compact,1,0')
+                logger.info("CPU thread limits set for workers: OMP/BLAS/MKL=1")
+            except Exception:
+                pass
             logger.info("Starting Dask-CUDA cluster...")
             gpu_count = max(1, int(self._get_gpu_count()))
             logger.info(f"Detected GPU(s): {gpu_count}")

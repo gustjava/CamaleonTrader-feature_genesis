@@ -468,10 +468,11 @@ class PipelineConfig:
     """Pipeline engine configuration."""
     engines: Dict[str, PipelineEngineConfig] = field(default_factory=lambda: {
         'index_gap_imputation': PipelineEngineConfig(enabled=False, order=0, description="Kalman session-aware index gap imputation"),
-        'stationarization': PipelineEngineConfig(enabled=True, order=1, description="Stationarization techniques"),
-        'feature_engineering': PipelineEngineConfig(enabled=True, order=2, description="Early feature engineering (e.g., BK)"),
-        'garch_models': PipelineEngineConfig(enabled=True, order=3, description="GARCH volatility modeling"),
-        'statistical_tests': PipelineEngineConfig(enabled=True, order=4, description="Statistical tests and analysis"),
+    'signal_processing': PipelineEngineConfig(enabled=True, order=1, description="Signal processing (EMD decomposition)"),
+    'stationarization': PipelineEngineConfig(enabled=True, order=2, description="Stationarization techniques"),
+    'feature_engineering': PipelineEngineConfig(enabled=True, order=3, description="Early feature engineering (e.g., BK)"),
+    'garch_models': PipelineEngineConfig(enabled=True, order=4, description="GARCH volatility modeling"),
+    'statistical_tests': PipelineEngineConfig(enabled=True, order=5, description="Statistical tests and analysis"),
     })
 
 

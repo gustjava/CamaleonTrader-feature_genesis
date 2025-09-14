@@ -12,6 +12,7 @@ import dask_cudf  # For distributed GPU DataFrames
 import cudf  # For GPU DataFrames
 
 from .base_engine import BaseFeatureEngine  # Base class for feature engines
+from utils.logging_utils import get_logger
 
 # Local BK helpers (decoupled from legacy SignalProcessor)
 import numpy as _np  # For numerical computations on CPU
@@ -53,8 +54,7 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
     Handles nulls by filling with 0 for the convolution and restoring NaNs
     at original null positions in the output.
     """
-    import logging
-    logger = logging.getLogger(__name__)
+    logger = get_logger(__name__, "features.feature_engineering")
     
     # Fast-path: if dtype is obviously non-numeric, return all-NaN
     try:
@@ -134,7 +134,7 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
     
     return out
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.feature_engineering")
 
 
 class FeatureEngineeringEngine(BaseFeatureEngine):

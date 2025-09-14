@@ -39,6 +39,27 @@ class PipelineWorkerPlugin(WorkerPlugin):
             self._cp = cp
         except Exception:
             self._cp = None
+        # Enforce single-threaded CPU libs per worker to avoid oversubscription
+        try:
+            import os
+            defaults = {
+                'OMP_NUM_THREADS': '1',
+                'OPENBLAS_NUM_THREADS': '1',
+                'MKL_NUM_THREADS': '1',
+                'NUMEXPR_NUM_THREADS': '1',
+                'VECLIB_MAXIMUM_THREADS': '1',
+                'BLIS_NUM_THREADS': '1',
+                'KMP_AFFINITY': 'granularity=fine,compact,1,0',
+            }
+            for k, v in defaults.items():
+                os.environ.setdefault(k, v)
+            # Precompute diagnostics
+            _omp = int(os.environ.get('OMP_NUM_THREADS', '0'))
+            _obl = int(os.environ.get('OPENBLAS_NUM_THREADS', '0'))
+            _mkl = int(os.environ.get('MKL_NUM_THREADS', '0'))
+            _nex = int(os.environ.get('NUMEXPR_NUM_THREADS', '0'))
+        except Exception:
+            _omp = _obl = _mkl = _nex = 0
 
         # Initialize metrics
         worker.metrics.update({
@@ -46,6 +67,11 @@ class PipelineWorkerPlugin(WorkerPlugin):
             'gpu_mem_total_gb': 0.0,
             'active_task': None,
             'last_task_update_ts': time.time(),
+            # CPU thread diagnostics
+            'omp_threads': _omp,
+            'openblas_threads': _obl,
+            'mkl_threads': _mkl,
+            'numexpr_threads': _nex,
         })
 
         # Periodically update GPU memory metrics

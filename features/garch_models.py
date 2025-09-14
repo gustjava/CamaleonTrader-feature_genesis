@@ -16,8 +16,9 @@ from scipy.optimize import minimize  # Otimização para fitting de parâmetros 
 from .base_engine import BaseFeatureEngine  # Classe base para engines de features
 from config.unified_config import UnifiedConfig  # Configuração unificada do sistema
 from dask.distributed import Client  # Cliente Dask para computação distribuída
+from utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, "features.garch_models")
 
 
 def _garch_default_row() -> Dict[str, float]:
@@ -130,6 +131,139 @@ class GARCHModels(BaseFeatureEngine):
             self.log_price = bool(getattr(self.settings.features, 'garch_log_price', True))
         except Exception:
             self.min_price_rows, self.min_return_rows, self.log_price = 200, 100, True
+
+        # Rolling/embargo settings (optional)
+        try:
+            self.rolling_enable = bool(getattr(self.settings.features, 'garch_rolling_enable', False))
+            self.rolling_window = int(getattr(self.settings.features, 'garch_rolling_window', 1000))
+            self.rolling_step = int(getattr(self.settings.features, 'garch_rolling_step', 100))
+            self.rolling_embargo = int(getattr(self.settings.features, 'garch_rolling_embargo', 0))
+        except Exception:
+            self.rolling_enable, self.rolling_window, self.rolling_step, self.rolling_embargo = False, 1000, 100, 0
+
+    # ---------------------------
+    # Rolling GARCH (no leakage)
+    # ---------------------------
+    def fit_rolling_garch(self,
+                          series: cudf.Series,
+                          window_size: Optional[int] = None,
+                          step_size: Optional[int] = None,
+                          embargo: Optional[int] = None,
+                          max_iter: Optional[int] = None,
+                          tolerance: Optional[float] = None) -> cudf.DataFrame:
+        """
+        Fit GARCH(1,1) over rolling windows and emit out-of-sample parameters only.
+
+        Contract:
+        - Inputs: price series (cudf.Series) indexed as original data
+        - Outputs: DataFrame with columns garch_omega_rw, garch_alpha_rw, garch_beta_rw,
+                   garch_persistence_rw; aligned to input index
+        - For each window [t-window_size, t), parameters are fitted on past data only
+          and assigned to the future region (t+embargo ... t+step_size-1)
+        """
+        try:
+            import pandas as pd  # CPU optimization & robust ops
+
+            if window_size is None:
+                window_size = int(self.rolling_window)
+            if step_size is None:
+                step_size = int(self.rolling_step)
+            if embargo is None:
+                embargo = int(self.rolling_embargo)
+            if max_iter is None:
+                max_iter = int(self.max_iter)
+            if tolerance is None:
+                tolerance = float(self.tolerance)
+
+            # Bring to CPU numpy for robust SciPy optimize
+            px = series.to_pandas()
+            # Basic cleaning: forward-fill, then drop leading NaNs
+            px = px.ffill()
+            px = px.dropna()
+            n = len(px)
+            if n < max(window_size + step_size + embargo + 1, 150):
+                # Not enough data to do rolling safely
+                out_df = cudf.DataFrame(index=series.index)
+                out_df['garch_omega_rw'] = np.nan
+                out_df['garch_alpha_rw'] = np.nan
+                out_df['garch_beta_rw'] = np.nan
+                out_df['garch_persistence_rw'] = np.nan
+                return out_df
+
+            # Prepare outputs (pandas aligned to px index)
+            omega_out = pd.Series(np.nan, index=px.index, dtype='float64')
+            alpha_out = pd.Series(np.nan, index=px.index, dtype='float64')
+            beta_out = pd.Series(np.nan, index=px.index, dtype='float64')
+            persistence_out = pd.Series(np.nan, index=px.index, dtype='float64')
+
+            # Precompute log-returns
+            log_px = np.log(np.maximum(px.values.astype(float), 1e-12))
+            r = np.diff(log_px)
+
+            # Helper: NLL for scipy
+            def nll(params: np.ndarray, r_window: np.ndarray) -> float:
+                omega, alpha, beta = params
+                if omega <= 0 or alpha < 0 or beta < 0 or (alpha + beta) >= 1.0:
+                    return 1e12
+                n_loc = r_window.size
+                h = np.empty(n_loc, dtype=np.float64)
+                h0 = np.var(r_window) if (1 - alpha - beta) <= 1e-8 else omega / (1 - alpha - beta)
+                h[0] = max(h0, 1e-9)
+                for t in range(1, n_loc):
+                    h[t] = omega + alpha * r_window[t-1] * r_window[t-1] + beta * h[t-1]
+                    if h[t] <= 0:
+                        return 1e12
+                ll = -0.5 * np.sum(np.log(2 * np.pi) + np.log(h) + (r_window * r_window) / h)
+                return -float(ll)
+
+            # Iterate rolling endpoints
+            # Map prices index positions to returns index positions: r[i] relates to px[i+1]
+            import math
+            end = n - 1  # last price index
+            start_anchor = window_size  # first anchor where window fits: uses r[0:window_size-1]
+            for anchor in range(start_anchor, end, step_size):
+                # Training window on returns indices: returns for prices [anchor-window_size, anchor]
+                r_start = anchor - window_size
+                r_end = anchor  # exclusive in slicing of r (since r has length n-1)
+                r_window = r[r_start:r_end]
+                if r_window.size < 50 or not np.isfinite(r_window).all():
+                    continue
+                # Optimize
+                x0 = np.array([max(1e-8, np.var(r_window) * 0.01), 0.05, 0.85], dtype=np.float64)
+                bounds = [(1e-10, None), (0.0, 1.0), (0.0, 1.0)]
+                res = minimize(nll, x0=x0, args=(r_window,), method='L-BFGS-B', bounds=bounds,
+                               options={'maxiter': max_iter, 'ftol': tolerance})
+                if not res.success:
+                    continue
+                om, al, be = map(float, res.x)
+                pers = float(al + be)
+
+                # Assign to out-of-sample region: [anchor + embargo, anchor + step_size)
+                assign_start = min(len(px) - 1, anchor + embargo)
+                assign_stop = min(len(px) - 1, anchor + step_size)
+                if assign_start <= assign_stop:
+                    idx_slice = px.index[assign_start:assign_stop]
+                    omega_out.loc[idx_slice] = om
+                    alpha_out.loc[idx_slice] = al
+                    beta_out.loc[idx_slice] = be
+                    persistence_out.loc[idx_slice] = pers
+
+            # Align back to original series index (may include timestamps not in px due to NaN drop)
+            out = cudf.DataFrame(index=series.index)
+            out['garch_omega_rw'] = cudf.from_pandas(omega_out.reindex(series.index))
+            out['garch_alpha_rw'] = cudf.from_pandas(alpha_out.reindex(series.index))
+            out['garch_beta_rw'] = cudf.from_pandas(beta_out.reindex(series.index))
+            out['garch_persistence_rw'] = cudf.from_pandas(persistence_out.reindex(series.index))
+            return out
+        except Exception as e:
+            self._critical_error(f"Error in rolling GARCH: {e}")
+            # Return NaNs aligned to input on failure
+            fallback = cudf.DataFrame(index=series.index)
+            fallback['garch_omega_rw'] = np.nan
+            fallback['garch_alpha_rw'] = np.nan
+            fallback['garch_beta_rw'] = np.nan
+            fallback['garch_persistence_rw'] = np.nan
+            return fallback
 
     def _log_likelihood_gpu(self, params: np.ndarray, returns: np.ndarray) -> float:
         """
@@ -422,7 +556,20 @@ class GARCHModels(BaseFeatureEngine):
         """
         Executes the GARCH modeling pipeline (Dask version).
         """
-        self._log_info("Starting GARCH (Dask)...")  # Log de início do processamento
+        # Log worker/GPU context to verify isolation and aid debugging
+        try:
+            import os as _os
+            from dask.distributed import get_worker as _gw
+            _w = _gw()
+            _addr = getattr(_w, 'address', 'unknown')
+        except Exception:
+            _addr = 'unknown'
+        try:
+            _gpu = int(cp.cuda.runtime.getDevice())
+            _vis = _os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        except Exception:
+            _gpu, _vis = -1, ''
+        self._log_info("Starting GARCH (Dask)...", worker=_addr, gpu_device=_gpu, visible_devices=_vis)
 
         # (optional) ensure temporal order
         # df = self._ensure_sorted(df, by="ts")
@@ -443,7 +590,36 @@ class GARCHModels(BaseFeatureEngine):
             self._log_warn("GARCH (Dask): no close-like column found; skipping")  # Log de aviso
             return df  # Retorna DataFrame original
 
-        # Bring series to single partition in one GPU worker
+        # If rolling mode is enabled, compute rolling parameters on a compact local frame and merge
+        if getattr(self, 'rolling_enable', False):
+            try:
+                import dask_cudf as _dask_cudf
+                self._log_info("GARCH rolling mode enabled (Dask)")
+                # Materialize minimal columns for deterministic processing
+                cols_needed = ['timestamp', price_col] if 'timestamp' in cols else [price_col]
+                subset = df[cols_needed].compute()
+                if 'timestamp' in subset.columns:
+                    subset = subset.sort_values('timestamp')
+                # Compute rolling GARCH on cuDF Series
+                roll_df = self.fit_rolling_garch(subset[price_col])
+                # Prefix columns
+                roll_df = roll_df.rename(columns={c: c for c in roll_df.columns})
+                # Build a frame to merge back by timestamp if available
+                if 'timestamp' in subset.columns:
+                    out_local = cudf.concat([subset[['timestamp']], roll_df.reset_index(drop=True)], axis=1)
+                    out_ddf = _dask_cudf.from_cudf(out_local, npartitions=max(1, df.npartitions))
+                    df = df.merge(out_ddf, on='timestamp', how='left')
+                else:
+                    # No timestamp; broadcast by index order (best-effort)
+                    out_ddf = _dask_cudf.from_cudf(roll_df.reset_index(drop=True), npartitions=max(1, df.npartitions))
+                    df = df.reset_index(drop=True)
+                    df = df.assign(**{c: out_ddf[c] for c in roll_df.columns})
+                self._log_info("GARCH rolling features attached.")
+                return df
+            except Exception as e:
+                self._log_warn("GARCH rolling failed; falling back to scalar GARCH", error=str(e))
+
+    # Bring series to single partition in one GPU worker (scalar/global fit)
         one = self._single_partition(df, cols=[price_col])  # Consolida em uma partição
 
         # Diagnostics on a bounded head (same cap as fit)
@@ -501,7 +677,12 @@ class GARCHModels(BaseFeatureEngine):
             meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in meta.items()})  # Schema de metadados
         )
 
-        params_pdf = params_ddf.compute().to_pandas()  # 1 row, cheap  # Computa e converte para pandas
+        # Compute with defensive try/except; avoid hanging due to bad partitions
+        try:
+            params_pdf = params_ddf.compute().to_pandas()  # 1 row, cheap
+        except Exception as e:
+            self._log_warn("GARCH compute failed; returning defaults", error=str(e))
+            params_pdf = cudf.DataFrame([_garch_default_row()]).to_pandas()
         params = params_pdf.iloc[0].to_dict()  # Extrai parâmetros como dicionário
 
         self._log_info("GARCH fitted.", **{k: float(params[k]) if params[k] == params[k] else None for k in params})  # Log de parâmetros ajustados
@@ -520,7 +701,7 @@ class GARCHModels(BaseFeatureEngine):
             self._log_error(f"Failed to log GARCH metrics: {e}")
             pass
 
-        # Record metrics and optional artifact summary
+    # Record metrics and optional artifact summary
         try:
             self._record_metrics('garch', params)  # Registra métricas GARCH
             if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):  # Verifica se deve escrever artefatos
@@ -541,6 +722,11 @@ class GARCHModels(BaseFeatureEngine):
         # Broadcast scalars to original DataFrame (all rows)
         df = self._broadcast_scalars(df, params)  # Transmite escalares para todas as linhas
         self._log_info("GARCH features attached.")  # Log de features anexadas
+        # Free CuPy memory blocks proactively on worker after GARCH stage
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
         return df  # Retorna DataFrame com features GARCH
 
     def process_cudf(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
@@ -561,6 +747,30 @@ class GARCHModels(BaseFeatureEngine):
             DataFrame with comprehensive GARCH features
         """
         self._log_info("Starting comprehensive GARCH (cuDF)...")  # Log de início do processamento cuDF
+
+        # If rolling mode is enabled, compute rolling parameters per-row and attach
+        if getattr(self, 'rolling_enable', False):
+            try:
+                price_col = None
+                cols = list(gdf.columns)
+                for pref in ("y_close", "log_stabilized_y_close"):
+                    if pref in cols:
+                        price_col = pref
+                        break
+                if price_col is None:
+                    for c in cols:
+                        if 'close' in str(c).lower():
+                            price_col = str(c)
+                            break
+                if price_col is not None:
+                    self._log_info("GARCH rolling mode enabled (cuDF)")
+                    roll_df = self.fit_rolling_garch(gdf[price_col])
+                    for c in roll_df.columns:
+                        gdf[c] = roll_df[c]
+                    self._log_info("GARCH rolling features attached.")
+                    return gdf
+            except Exception as e:
+                self._log_warn("Rolling GARCH (cuDF) failed; continuing with comprehensive scalar GARCH", error=str(e))
 
         # Fit GARCH directly on cuDF DataFrame
         garch_result = self._fit_comprehensive_garch(gdf)  # Ajusta modelo GARCH abrangente
