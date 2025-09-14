@@ -30,6 +30,31 @@ class LocalDataLoader:
         self.settings = get_settings()
         self.local_data_root = "/data" # Matches the sync destination in onstart.sh
 
+    # --- Internal logging helpers (missing before) ---
+    def _log_info(self, msg: str):
+        try:
+            logger.info(msg)
+        except Exception:
+            pass
+
+    def _log_warn(self, msg: str):
+        try:
+            logger.warning(msg)
+        except Exception:
+            pass
+
+    def _log_error(self, msg: str):
+        try:
+            logger.error(msg)
+        except Exception:
+            pass
+
+    def _critical_error(self, msg: str):
+        try:
+            logger.critical(msg)
+        except Exception:
+            pass
+
     def _get_local_path(self, r2_path: str) -> Path:
         """
         Construct the full local path for a currency pair's data.
@@ -177,26 +202,16 @@ class LocalDataLoader:
         Implements chunked processing to avoid OOM errors as specified in the technical plan.
         """
         try:
-            self._log_info(f"Loading currency pair data from {r2_path}")
-            
+            local_path = self._get_local_path(r2_path)
+            self._log_info(f"Loading currency pair data from {local_path}")
+
             # Check if file exists
-            if not os.path.exists(r2_path):
-                self._log_error(f"File not found: {r2_path}")
+            if not os.path.exists(local_path):
+                self._log_error(f"File not found: {local_path}")
                 return None
-            
-            # Get file size to determine if chunked processing is needed
-            file_size = os.path.getsize(r2_path)
-            file_size_gb = file_size / (1024**3)
-            
-            self._log_info(f"File size: {file_size_gb:.2f} GB")
-            
-            # Determine if chunked processing is needed based on file size and available memory
-            if self._should_use_chunked_processing(file_size_gb):
-                self._log_info("Using chunked processing to avoid OOM")
-                return self._load_data_with_chunked_processing(r2_path)
-            else:
-                self._log_info("Loading entire dataset into GPU memory")
-                return self._load_data_direct(r2_path)
+
+            # For parquet-only pipeline, load directly as parquet
+            return self._load_data_direct(local_path)
                 
         except Exception as e:
             self._critical_error(f"Error loading currency pair data: {e}")
@@ -226,28 +241,28 @@ class LocalDataLoader:
             self._log_warn(f"Error checking memory, defaulting to chunked processing: {e}")
             return True
     
-    def _load_data_direct(self, r2_path: str) -> Optional[cudf.DataFrame]:
+    def _load_data_direct(self, local_path: str) -> Optional[cudf.DataFrame]:
         """
-        Load data directly into GPU memory (for smaller files).
+        Load Parquet data directly into GPU memory.
         """
         try:
-            # Try to load as cuDF first
+            # Try to load as cuDF parquet first
             try:
-                df = cudf.read_feather(r2_path)
-                self._log_info(f"Loaded {len(df)} rows, {len(df.columns)} columns directly")
+                df = cudf.read_parquet(local_path)
+                self._log_info(f"Loaded parquet: {len(df)} rows, {len(df.columns)} columns")
                 return df
-            except Exception as feather_error:
-                self._log_warn(f"Failed to load as feather: {feather_error}")
-                
-                # Fallback to pandas then convert to cuDF
+            except Exception as parquet_error:
+                self._log_warn(f"Failed to load parquet directly: {parquet_error}")
+
+                # Fallback to pandas->cuDF parquet
                 try:
                     import pandas as pd
-                    pdf = pd.read_feather(r2_path)
+                    pdf = pd.read_parquet(local_path)
                     df = cudf.from_pandas(pdf)
-                    self._log_info(f"Loaded via pandas: {len(df)} rows, {len(df.columns)} columns")
+                    self._log_info(f"Loaded via pandas parquet: {len(df)} rows, {len(df.columns)} columns")
                     return df
                 except Exception as pandas_error:
-                    self._log_error(f"Failed to load via pandas: {pandas_error}")
+                    self._log_error(f"Failed to load via pandas parquet: {pandas_error}")
                     return None
                     
         except Exception as e:
@@ -274,7 +289,7 @@ class LocalDataLoader:
             # First, read the data structure to determine total size
             try:
                 # Read just the first few rows to get column structure
-                sample_df = cudf.read_feather(r2_path, nrows=100)
+                sample_df = cudf.read_parquet(r2_path, nrows=100)
                 total_columns = len(sample_df.columns)
                 self._log_info(f"Detected {total_columns} columns")
                 
@@ -339,9 +354,13 @@ class LocalDataLoader:
         Read a specific chunk of data from the file.
         """
         try:
-            # For feather files, we can use skiprows and nrows
-            # Note: This is a simplified approach - in practice, you might need more sophisticated chunking
-            chunk_df = cudf.read_feather(r2_path, skiprows=start_row, nrows=end_row-start_row)
+            # For parquet, use row_group based reads when available; fall back to nrows+skiprows if supported
+            # Note: skiprows is not supported by cudf.read_parquet; this is a simplified placeholder that
+            # reads full file when chunking isn't straightforward. For our use-case, prefer direct load above.
+            # If chunking is required, users should provide partitioned parquet.
+            chunk_df = cudf.read_parquet(r2_path)
+            if start_row or end_row:
+                chunk_df = chunk_df.iloc[start_row:end_row]
             return chunk_df
             
         except Exception as e:

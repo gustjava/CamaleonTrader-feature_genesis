@@ -14,14 +14,14 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
-from dask.distributed import Client
+from dask.distributed import Client, as_completed
 from dask_cuda import LocalCUDACluster
 
 from config.unified_config import get_unified_config as get_settings
 from data_io.db_handler import DatabaseHandler
 from data_io.local_loader import LocalDataLoader
 from features.base_engine import CriticalPipelineError
-from orchestration.data_processor import DataProcessor
+from orchestration.data_processor import DataProcessor, process_currency_pair_dask_worker
 from utils.logging_utils import get_logger
 from utils.pipeline_visualizer import PipelineVisualizer
 from monitoring.pipeline_dashboard import PipelineDashboard
@@ -251,8 +251,8 @@ class PipelineOrchestrator:
         # Log cluster diagnostics
         self._log_cluster_diagnostics(client)
         
-        # Process tasks on the driver (use all GPUs per task)
-        return self._process_tasks_on_driver(client, pending_tasks)
+        # Process tasks in parallel, one currency pair per GPU worker
+        return self._process_tasks_distributed(client, pending_tasks)
     
     def _log_cluster_diagnostics(self, client: Client):
         """Log diagnostic information about the cluster."""
@@ -335,6 +335,123 @@ class PipelineOrchestrator:
             successful_tasks=successful_tasks,
             failed_tasks=failed_tasks,
             emergency_shutdown=self.emergency_shutdown.is_set()
+        )
+
+    def _process_tasks_distributed(self, client: Client, tasks: List[ProcessingTask]) -> PipelineResult:
+        """Process tasks in parallel, one currency pair per Dask-CUDA worker (GPU).
+
+        Submits one task per currency pair using the worker-side implementation that
+        runs on a single GPU. Dask-CUDA ensures each worker is pinned to a unique GPU.
+        """
+        if not tasks:
+            return PipelineResult(total_tasks=0, successful_tasks=0, failed_tasks=0, emergency_shutdown=False)
+
+        try:
+            workers = list(client.scheduler_info().get("workers", {}).keys())
+            logger.info(f"Distributed processing start: {len(tasks)} tasks across {len(workers)} workers")
+        except Exception:
+            workers = []
+            logger.info(f"Distributed processing start: {len(tasks)} tasks")
+
+        # Submit up to one task per worker; queue the rest. Target specific workers to avoid multi-task per GPU.
+        task_queue = list(tasks)
+        futures_by_worker = {}
+        future_to_task = {}
+
+        # Helper to submit next task to a specific worker
+        def _submit_next(worker_addr: str):
+            if not task_queue:
+                return None
+            task = task_queue.pop(0)
+            logger.info(f"Submitting {task.currency_pair} to worker {worker_addr}")
+            fut = client.submit(
+                process_currency_pair_dask_worker,
+                task.currency_pair,
+                task.r2_path,
+                key=f"pair-{task.currency_pair}",
+                pure=False,
+                workers=[worker_addr],
+                allow_other_workers=False,
+            )
+            futures_by_worker[worker_addr] = fut
+            future_to_task[fut] = task
+            return fut
+
+        # Prime the pipeline: one per worker
+        for w in workers:
+            if self.emergency_shutdown.is_set() or not task_queue:
+                break
+            try:
+                _submit_next(w)
+            except Exception as e:
+                logger.error(f"Failed initial submit to worker {w}: {e}")
+
+        successful_tasks = 0
+        failed_tasks = 0
+
+        # Process completions and keep workers busy until queue empties
+        ac = as_completed(list(futures_by_worker.values()), with_results=False, raise_errors=False)
+        for fut in ac:
+            task = future_to_task.get(fut)
+            worker_addr = None
+            # Find which worker this future was targeting
+            try:
+                for w, f in list(futures_by_worker.items()):
+                    if f == fut:
+                        worker_addr = w
+                        break
+            except Exception:
+                worker_addr = None
+
+            if self.emergency_shutdown.is_set():
+                logger.critical("Emergency shutdown detected - cancelling remaining tasks")
+                try:
+                    for f in list(futures_by_worker.values()):
+                        if not f.done():
+                            f.cancel()
+                except Exception:
+                    pass
+                break
+
+            try:
+                ok = fut.result()
+            except Exception as e:
+                ok = False
+                pname = task.currency_pair if task else "<unknown>"
+                logger.error(f"Task failed for {pname}: {e}")
+
+            pname = task.currency_pair if task else "<unknown>"
+            if ok:
+                successful_tasks += 1
+                logger.info(f"Task completed successfully: {pname}")
+                try:
+                    self.dashboard.increment_completed()
+                except Exception:
+                    pass
+            else:
+                failed_tasks += 1
+                logger.error(f"Task reported failure: {pname}")
+
+            # Free worker memory proactively between tasks
+            try:
+                client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()), workers=[worker_addr] if worker_addr else None)
+            except Exception:
+                pass
+
+            # Submit next task to this worker if available
+            if worker_addr and task_queue:
+                try:
+                    new_fut = _submit_next(worker_addr)
+                    if new_fut:
+                        ac.add(new_fut)
+                except Exception as e:
+                    logger.error(f"Failed to submit next task to {worker_addr}: {e}")
+
+        return PipelineResult(
+            total_tasks=len(tasks),
+            successful_tasks=successful_tasks,
+            failed_tasks=failed_tasks,
+            emergency_shutdown=self.emergency_shutdown.is_set(),
         )
     
     def log_pipeline_summary(self, result: PipelineResult, total_discovered: int):

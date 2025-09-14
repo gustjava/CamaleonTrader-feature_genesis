@@ -76,7 +76,7 @@ class DataProcessor:
                 if not self.db_connected:
                     logger.warning("Database unavailable; proceeding without task tracking")
             
-            # Load data
+            # Load data (prefer parquet sync, then feather sync fallback)
             gdf = self._load_currency_pair_data(r2_path)  # Carrega dados do par de moeda
             if gdf is None:
                 self._register_task_failure(currency_pair, r2_path, "Failed to load data")
@@ -126,21 +126,23 @@ class DataProcessor:
             cuDF DataFrame if successful, None otherwise
         """
         try:
-            # Try loading as cuDF first
-            gdf = self.loader.load_currency_pair_data_feather_sync(r2_path)
-            if gdf is not None:
-                # Drop denied columns early (never enter any stage)
-                gdf = self._drop_denied_columns(gdf)
-                logger.info(f"Loaded data as cuDF: {len(gdf)} rows, {len(gdf.columns)} columns")
-                return gdf
-            
-            # Fallback to regular loading
+            # Prefer Parquet (sync)
             gdf = self.loader.load_currency_pair_data_sync(r2_path)
             if gdf is not None:
                 # Drop denied columns early
                 gdf = self._drop_denied_columns(gdf)
-                logger.info(f"Loaded data with fallback: {len(gdf)} rows, {len(gdf.columns)} columns")
+                logger.info(f"Loaded parquet data: {len(gdf)} rows, {len(gdf.columns)} columns")
                 return gdf
+            
+            # Optional fallback: Feather (sync) if exists
+            try:
+                gdf = self.loader.load_currency_pair_data_feather_sync(r2_path)
+                if gdf is not None:
+                    gdf = self._drop_denied_columns(gdf)
+                    logger.info(f"Loaded feather data: {len(gdf)} rows, {len(gdf.columns)} columns")
+                    return gdf
+            except Exception:
+                pass
             
             logger.error(f"Failed to load data from {r2_path}")
             return None
@@ -1035,4 +1037,29 @@ def process_currency_pair_worker(currency_pair: str, r2_path: str) -> bool:
         return processor.process_currency_pair(currency_pair, r2_path)
     except Exception as e:
         logger.error(f"Error in worker processing {currency_pair}: {e}", exc_info=True)
+        return False
+
+
+def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
+    """
+    Worker function that processes a single currency pair using the Dask path (dask_cudf),
+    constraining all inner tasks to the current worker (one GPU per pair).
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    try:
+        # Resolve current worker and use a worker_client to schedule sub-tasks
+        from dask.distributed import get_worker, worker_client
+        import dask
+        w = get_worker()
+        addr = getattr(w, 'address', None)
+        with worker_client() as wc:
+            processor = DataProcessor(client=wc)
+            # Annotate all tasks to stay on this worker
+            with dask.annotate(workers=[addr] if addr else None, allow_other_workers=False, task_key_name=f"pair-{currency_pair}"):
+                return processor.process_currency_pair_dask(currency_pair, r2_path, wc)
+    except Exception as e:
+        logger.error(f"Error in Dask worker processing {currency_pair}: {e}", exc_info=True)
         return False
