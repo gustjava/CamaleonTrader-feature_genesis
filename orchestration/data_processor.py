@@ -618,8 +618,63 @@ class DataProcessor:
                 try:
                     e_in = emb_res.get('stage2_mi_selected', [])
                     e_out = emb_res.get('stage3_final_selected', [])
-                    logger.info(f"[StatTests] Embedded (CatBoost): input={len(e_in)} → output={len(e_out)}; output_preview={(e_out or [])[:15]}")
-                except Exception:
+                    e_importances = emb_res.get('importances', {})
+                    e_backend = emb_res.get('selection_stats', {}).get('backend_used', 'unknown')
+                    e_model_score = emb_res.get('selection_stats', {}).get('model_score', 0.0)
+                    e_detailed_metrics = emb_res.get('detailed_metrics', {})
+                    
+                    # Log complete output with CatBoost scores
+                    logger.info(f"[StatTests] Embedded (CatBoost): input={len(e_in)} → output={len(e_out)}; backend={e_backend}; model_score={e_model_score:.6f}")
+                    
+                    # Log detailed CatBoost metrics
+                    if e_detailed_metrics:
+                        logger.info(f"[StatTests] 📊 CatBoost Detailed Analysis:")
+                        
+                        # Model configuration
+                        if 'model_info' in e_detailed_metrics:
+                            model_info = e_detailed_metrics['model_info']
+                            logger.info(f"[StatTests]   🔧 Model Config: iterations={model_info.get('iterations_used', 'unknown')}, "
+                                       f"learning_rate={model_info.get('learning_rate', 'unknown')}, "
+                                       f"depth={model_info.get('depth', 'unknown')}, "
+                                       f"task_type={model_info.get('task_type', 'unknown')}, "
+                                       f"loss_function={model_info.get('loss_function', 'unknown')}")
+                        
+                        # Performance metrics
+                        if 'validation_r2' in e_detailed_metrics:
+                            logger.info(f"[StatTests]   📈 Regression Performance: "
+                                       f"R²={e_detailed_metrics.get('validation_r2', 0):.4f}, "
+                                       f"RMSE={e_detailed_metrics.get('validation_rmse', 0):.4f}, "
+                                       f"MAE={e_detailed_metrics.get('validation_mae', 0):.4f}")
+                            logger.info(f"[StatTests]   📈 Training Performance: "
+                                       f"R²={e_detailed_metrics.get('training_r2', 0):.4f}, "
+                                       f"RMSE={e_detailed_metrics.get('training_rmse', 0):.4f}, "
+                                       f"MAE={e_detailed_metrics.get('training_mae', 0):.4f}")
+                        elif 'validation_accuracy' in e_detailed_metrics:
+                            logger.info(f"[StatTests]   📈 Classification Performance: "
+                                       f"Accuracy={e_detailed_metrics.get('validation_accuracy', 0):.4f}, "
+                                       f"Precision={e_detailed_metrics.get('validation_precision', 0):.4f}, "
+                                       f"Recall={e_detailed_metrics.get('validation_recall', 0):.4f}, "
+                                       f"F1={e_detailed_metrics.get('validation_f1', 0):.4f}")
+                        
+                        # Feature importance types
+                        if 'feature_importance_types' in e_detailed_metrics:
+                            fi_types = e_detailed_metrics['feature_importance_types']
+                            logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {list(fi_types.keys())}")
+                    
+                    # Log all winning features with their CatBoost importance scores
+                    if e_out and e_importances:
+                        winning_features = [(f, e_importances.get(f, 0.0)) for f in e_out]
+                        winning_features.sort(key=lambda x: x[1], reverse=True)  # Sort by importance
+                        logger.info(f"[StatTests] CatBoost - All winning features with importance scores: {[(f'{name}:{score:.6f}') for name, score in winning_features]}")
+                    
+                    # Log all considered features for comparison
+                    if e_importances:
+                        all_features = [(f, e_importances.get(f, 0.0)) for f in e_in if f in e_importances]
+                        all_features.sort(key=lambda x: x[1], reverse=True)
+                        logger.info(f"[StatTests] CatBoost - All considered features with importance scores: {[(f'{name}:{score:.6f}') for name, score in all_features]}")
+                        
+                except Exception as e:
+                    logger.warning(f"[StatTests] Error logging CatBoost results: {e}")
                     pass
 
                 # Combined selection summary + artifacts
@@ -638,6 +693,16 @@ class DataProcessor:
                     logger.info(
                         f"[StatTests] Selection split summary: VIF={len(combined['stage2_vif_selected'])} → MI={len(combined['stage2_mi_selected'])} → Final={len(combined['stage3_final_selected'])}; final_preview={(combined['stage3_final_selected'] or [])[:15]}"
                     )
+                    
+                    # Log final selection clearly
+                    final_features = combined['stage3_final_selected']
+                    if final_features:
+                        logger.info(f"[StatTests] 🎯 FINAL SELECTION: {len(final_features)} features selected by CatBoost:")
+                        for i, feature in enumerate(final_features, 1):
+                            importance = combined.get('importances', {}).get(feature, 0.0)
+                            logger.info(f"[StatTests]   {i:2d}. {feature} (importance: {importance:.6f})")
+                    else:
+                        logger.warning("[StatTests] ⚠️  FINAL SELECTION: No features selected!")
                     try:
                         self._write_stat_tests_artifacts(
                             getattr(self, 'current_currency_pair', 'unknown'),
@@ -652,24 +717,19 @@ class DataProcessor:
             logger.error(f"[StatTests] Selection stages failed: {e}")
 
         # Stage: Final Stats
+        # DISABLED: Final stats stage removed - unnecessary after feature selection
+        logger.info("[StatTests] Final Stats stage skipped - feature selection already completed")
+        
+        # Final summary
         try:
-            logger.info("[StatTests] Stage start: Final comprehensive statistical analysis")
-            from features.statistical_tests.stage_final_stats import run as run_final
-            with dask.annotate(task_key_name="stat_final") if dask else _noop_ctx():
-                ddf = run_final(self.stats, ddf)
-            logger.info("Persist start: statistical_tests:final_stats")
-            ddf = ddf.persist()
-            logger.info("Persist returned: statistical_tests:final_stats")
-            try:
-                if _wait:
-                    logger.info("Waiting for statistical_tests:final_stats to complete (timeout: 600s)...")
-                    _wait(ddf, timeout=600)
-                    logger.info("statistical_tests:final_stats completed successfully")
-            except Exception as e:
-                logger.warning(f"Wait timeout or error for statistical_tests:final_stats: {e}")
-                logger.info("Continuing without waiting - data is still persisted for statistical_tests:final_stats")
-        except Exception as e:
-            logger.error(f"[StatTests] Final Stats stage failed: {e}")
+            final_features = getattr(self.stats, '_last_embedded_selected', [])
+            if final_features:
+                logger.info(f"[StatTests] ✅ FEATURE SELECTION COMPLETED: {len(final_features)} final features selected")
+                logger.info(f"[StatTests] 📋 FINAL FEATURES LIST: {final_features}")
+            else:
+                logger.warning("[StatTests] ⚠️  FEATURE SELECTION COMPLETED: No features selected")
+        except Exception:
+            logger.info("[StatTests] ✅ FEATURE SELECTION COMPLETED")
 
         return ddf
 

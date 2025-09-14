@@ -457,10 +457,10 @@ class FeatureSelection:
         except Exception:
             return 0.0
 
-    def _stage3_selectfrommodel(self, X_df, y_series, candidates: List[str]) -> Tuple[List[str], dict, str]:
+    def _stage3_selectfrommodel(self, X_df, y_series, candidates: List[str]) -> Tuple[List[str], dict, str, float, dict]:
         """Select features using an embedded model with importance threshold.
 
-        Returns: (selected_features, importances_map, backend_used)
+        Returns: (selected_features, importances_map, backend_used, model_score, detailed_metrics)
         """
         # Determine task type (classification vs regression)
         task = str(getattr(self, 'stage3_task', 'auto')).lower()
@@ -502,109 +502,251 @@ class FeatureSelection:
             X = X_df[candidates].to_pandas().to_numpy(dtype=np.float32, copy=False)
             y = y_series.to_pandas().to_numpy(dtype=np.float32, copy=False)
         
-        # Apply sampling for large datasets to control computational cost
-        max_rows = int(getattr(self, 'selection_max_rows', 100000))
-        if X.shape[0] > max_rows:
-            self._log_info("Applying systematic sampling for feature selection", 
-                          original_rows=X.shape[0], sampled_rows=max_rows, 
-                          sampling_ratio=round(max_rows/X.shape[0], 3))
-            # Use systematic sampling to preserve time-series structure
-            indices = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
-            X = X[indices]
-            y = y[indices]
-        
-        esr = int(getattr(self, 'stage3_lgbm_early_stopping_rounds', 0))  # Early stopping rounds (reuse cfg)
-        eval_set = None
-        # Build TimeSeriesSplit for validation and early stopping if requested
-        if esr and esr > 0 and X.shape[0] >= 10:
+        # Optionally disable sampling to use the full dataset
+        use_full = bool(getattr(self, 'stage3_catboost_use_full_dataset', False))
+        if not use_full:
+            max_rows = int(getattr(self, 'selection_max_rows', 100000))
+            if X.shape[0] > max_rows:
+                self._log_info("Applying systematic sampling for feature selection", 
+                              original_rows=X.shape[0], sampled_rows=max_rows, 
+                              sampling_ratio=round(max_rows/X.shape[0], 3))
+                indices = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
+                X = X[indices]
+                y = y[indices]
+        else:
+            self._log_info("Using full dataset for embedded CatBoost selection", rows=X.shape[0])
+
+        # Temporal CV / early stopping configuration
+        esr = int(getattr(self, 'stage3_catboost_early_stopping_rounds', getattr(self, 'stage3_lgbm_early_stopping_rounds', 0)))
+        n_splits_cfg = int(getattr(self, 'stage3_cv_splits', 0))
+        min_train = int(getattr(self, 'stage3_cv_min_train', 200))
+        eval_split = None
+        tss_for_eval = None
+        if X.shape[0] >= max(10, 2 * min_train) and (esr > 0 or n_splits_cfg >= 2):
             try:
                 from sklearn.model_selection import TimeSeriesSplit
-                # Use more splits for better validation, minimum data size per split
-                min_samples_per_split = max(50, X.shape[0] // 10)  # At least 50 samples per split
-                n_splits = max(3, min(5, X.shape[0] // min_samples_per_split - 1))  # 3-5 splits
-                tss = TimeSeriesSplit(n_splits=n_splits)
-                tr_idx, va_idx = list(tss.split(X))[-1]  # Use last split for validation
-                X_tr, y_tr = X[tr_idx], y[tr_idx]  # Training data
-                X_va, y_va = X[va_idx], y[va_idx]  # Validation data
-                eval_set = (X_tr, y_tr, X_va, y_va)  # Evaluation set for early stopping
-                self._log_info("TimeSeriesSplit configured for feature selection",
-                              splits=n_splits, train_size=len(X_tr), val_size=len(X_va))
+                # Build primary TSS for CV aggregation if requested
+                if n_splits_cfg >= 2:
+                    n_splits = max(2, n_splits_cfg)
+                    tss_for_eval = TimeSeriesSplit(n_splits=n_splits)
+                else:
+                    # Create a last split only for early stopping
+                    tss_for_eval = TimeSeriesSplit(n_splits=3)
+                # Last split for early stopping eval_set
+                tr_idx, va_idx = list(tss_for_eval.split(X))[-1]
+                if len(tr_idx) >= max(10, min_train) and len(va_idx) >= max(5, min_train // 5):
+                    eval_split = (tr_idx, va_idx)
+                    self._log_info("TimeSeriesSplit ready for early stopping", train=len(tr_idx), val=len(va_idx))
             except Exception as e_ts:
-                eval_set = None
                 self._log_warn("TimeSeriesSplit setup failed", error=str(e_ts))
 
         # Preferred backend: CatBoost (GPU)
         try:
             from catboost import CatBoostClassifier, CatBoostRegressor
-            iterations = int(getattr(self, 'stage3_lgbm_n_estimators', 200))
-            learning_rate = float(getattr(self, 'stage3_lgbm_learning_rate', 0.05))
-            depth = int(getattr(self, 'stage3_lgbm_max_depth', 6 if getattr(self, 'stage3_lgbm_max_depth', -1) == -1 else getattr(self, 'stage3_lgbm_max_depth', 6)))
+            iterations = int(getattr(self, 'stage3_catboost_iterations', getattr(self, 'stage3_lgbm_n_estimators', 200)))
+            learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', getattr(self, 'stage3_lgbm_learning_rate', 0.05)))
+            depth = int(getattr(self, 'stage3_catboost_depth', 6))
             random_state = int(getattr(self, 'stage3_random_state', 42))
+            task_type = str(getattr(self, 'stage3_catboost_task_type', 'GPU'))
+            devices = str(getattr(self, 'stage3_catboost_devices', '0'))
+            thread_count = int(getattr(self, 'stage3_catboost_thread_count', 1))
 
-            if task == 'classification':
-                loss_function = 'Logloss' if len(np.unique(y)) == 2 else 'MultiClass'
-                model = CatBoostClassifier(
-                    iterations=iterations,
-                    learning_rate=learning_rate,
-                    depth=depth if depth > 0 else 6,
-                    random_seed=random_state,
-                    task_type='GPU',
-                    devices='0',
-                    verbose=0,
-                    loss_function=loss_function,
-                    thread_count=1,
-                )
-            else:
-                model = CatBoostRegressor(
-                    iterations=iterations,
-                    learning_rate=learning_rate,
-                    depth=depth if depth > 0 else 6,
-                    random_seed=random_state,
-                    task_type='GPU',
-                    devices='0',
-                    verbose=0,
-                    loss_function='RMSE',
-                    thread_count=1,
-                )
+            def _build_model():
+                if task == 'classification':
+                    loss_function = 'Logloss' if len(np.unique(y)) == 2 else 'MultiClass'
+                    return CatBoostClassifier(
+                        iterations=iterations,
+                        learning_rate=learning_rate,
+                        depth=depth if depth > 0 else 6,
+                        random_seed=random_state,
+                        task_type=task_type,
+                        devices=devices,
+                        verbose=0,
+                        loss_function=loss_function,
+                        thread_count=thread_count,
+                    )
+                else:
+                    loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
+                    return CatBoostRegressor(
+                        iterations=iterations,
+                        learning_rate=learning_rate,
+                        depth=depth if depth > 0 else 6,
+                        random_seed=random_state,
+                        task_type=task_type,
+                        devices=devices,
+                        verbose=0,
+                        loss_function=loss_fn,
+                        thread_count=thread_count,
+                    )
 
-            # Early stopping configuration
-            fit_kwargs = {}
-            if eval_set is not None and esr and esr > 0:
-                X_tr, y_tr, X_va, y_va = eval_set
-                fit_kwargs = {
-                    'X': X_tr,
-                    'y': y_tr,
-                    'eval_set': [(X_va, y_va)],
-                    'use_best_model': True,
-                    'od_type': 'Iter',
-                    'od_wait': esr,
+            def _fit_and_importances(X_fit, y_fit, eval_pair=None):
+                model = _build_model()
+                training_metrics = {}
+                
+                if eval_pair is not None and esr and esr > 0:
+                    tr_idx, va_idx = eval_pair
+                    model.fit(
+                        X_fit[tr_idx], y_fit[tr_idx],
+                        eval_set=[(X_fit[va_idx], y_fit[va_idx])],
+                        use_best_model=True, od_type='Iter', od_wait=esr
+                    )
+                    # Get validation score
+                    val_pred = model.predict(X_fit[va_idx])
+                    if task == 'classification':
+                        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                        score = accuracy_score(y_fit[va_idx], val_pred)
+                        training_metrics['validation_accuracy'] = score
+                        training_metrics['validation_precision'] = precision_score(y_fit[va_idx], val_pred, average='weighted')
+                        training_metrics['validation_recall'] = recall_score(y_fit[va_idx], val_pred, average='weighted')
+                        training_metrics['validation_f1'] = f1_score(y_fit[va_idx], val_pred, average='weighted')
+                    else:
+                        from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+                        score = r2_score(y_fit[va_idx], val_pred)
+                        training_metrics['validation_r2'] = score
+                        training_metrics['validation_mse'] = mean_squared_error(y_fit[va_idx], val_pred)
+                        training_metrics['validation_mae'] = mean_absolute_error(y_fit[va_idx], val_pred)
+                        training_metrics['validation_rmse'] = np.sqrt(training_metrics['validation_mse'])
+                    
+                    # Get training score for comparison
+                    train_pred = model.predict(X_fit[tr_idx])
+                    if task == 'classification':
+                        training_metrics['training_accuracy'] = accuracy_score(y_fit[tr_idx], train_pred)
+                    else:
+                        training_metrics['training_r2'] = r2_score(y_fit[tr_idx], train_pred)
+                        training_metrics['training_mse'] = mean_squared_error(y_fit[tr_idx], train_pred)
+                        training_metrics['training_mae'] = mean_absolute_error(y_fit[tr_idx], train_pred)
+                        training_metrics['training_rmse'] = np.sqrt(training_metrics['training_mse'])
+                else:
+                    model.fit(X_fit, y_fit)
+                    # Get training score
+                    train_pred = model.predict(X_fit)
+                    if task == 'classification':
+                        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                        score = accuracy_score(y_fit, train_pred)
+                        training_metrics['training_accuracy'] = score
+                        training_metrics['training_precision'] = precision_score(y_fit, train_pred, average='weighted')
+                        training_metrics['training_recall'] = recall_score(y_fit, train_pred, average='weighted')
+                        training_metrics['training_f1'] = f1_score(y_fit, train_pred, average='weighted')
+                    else:
+                        from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+                        score = r2_score(y_fit, train_pred)
+                        training_metrics['training_r2'] = score
+                        training_metrics['training_mse'] = mean_squared_error(y_fit, train_pred)
+                        training_metrics['training_mae'] = mean_absolute_error(y_fit, train_pred)
+                        training_metrics['training_rmse'] = np.sqrt(training_metrics['training_mse'])
+                
+                # Get feature importance with different types
+                try:
+                    fi_prediction = model.get_feature_importance(type='PredictionValuesChange')
+                    fi_loss = model.get_feature_importance(type='LossFunctionChange')
+                    fi_feature = model.get_feature_importance(type='Feature')
+                    training_metrics['feature_importance_types'] = {
+                        'prediction_values_change': fi_prediction.tolist(),
+                        'loss_function_change': fi_loss.tolist(),
+                        'feature': fi_feature.tolist()
+                    }
+                    fi = fi_prediction  # Use prediction values change as primary
+                except (TypeError, AttributeError):
+                    try:
+                        fi = model.get_feature_importance()
+                        training_metrics['feature_importance_types'] = {'default': fi.tolist()}
+                    except:
+                        fi = np.zeros(len(candidates))
+                        training_metrics['feature_importance_types'] = {'error': 'Could not get feature importance'}
+                
+                # Get model info
+                training_metrics['model_info'] = {
+                    'iterations_used': model.get_best_iteration() if hasattr(model, 'get_best_iteration') else model.get_param('iterations'),
+                    'learning_rate': model.get_param('learning_rate'),
+                    'depth': model.get_param('depth'),
+                    'task_type': model.get_param('task_type'),
+                    'loss_function': model.get_param('loss_function')
                 }
-                model.fit(**fit_kwargs)
-            else:
-                model.fit(X, y)
+                
+                return np.asarray(fi, dtype=float), score, training_metrics
 
-            # Extract feature importances (use a stable default type)
-            try:
-                fi = model.get_feature_importance(type='PredictionValuesChange')
-            except TypeError:
-                # Older/newer CatBoost versions may use positional or different kw name
-                fi = model.get_feature_importance()
-            importances = dict(zip(candidates, fi))
+            # If CV enabled (>=2 splits), aggregate importances across folds
+            agg_fi = None
+            agg_scores = []
+            agg_metrics = []
+            used_splits = 0
+            if n_splits_cfg >= 2 and tss_for_eval is not None:
+                from sklearn.model_selection import TimeSeriesSplit
+                for tr_idx, va_idx in tss_for_eval.split(X):
+                    if len(tr_idx) < max(10, min_train) or len(va_idx) < max(5, min_train // 5):
+                        continue
+                    fi, score, metrics = _fit_and_importances(X, y, (tr_idx, va_idx) if esr > 0 else None)
+                    agg_fi = fi if agg_fi is None else (agg_fi + fi)
+                    agg_scores.append(score)
+                    agg_metrics.append(metrics)
+                    used_splits += 1
+                if used_splits > 0:
+                    agg_fi = agg_fi / float(used_splits)
+                    model_score = np.mean(agg_scores)
+                    # Aggregate metrics (take mean for numeric values)
+                    final_metrics = {}
+                    for key in agg_metrics[0].keys():
+                        if key == 'feature_importance_types':
+                            final_metrics[key] = agg_metrics[0][key]  # Keep first one
+                        elif key == 'model_info':
+                            final_metrics[key] = agg_metrics[0][key]  # Keep first one
+                        else:
+                            final_metrics[key] = np.mean([m[key] for m in agg_metrics if key in m])
+            # If no CV aggregation, train once (optionally with early stopping on last split)
+            if agg_fi is None:
+                fi, model_score, final_metrics = _fit_and_importances(X, y, eval_split if esr > 0 and eval_split is not None else None)
+                agg_fi = fi
+
+            importances = dict(zip(candidates, agg_fi.tolist()))
 
             # Threshold and selection
-            threshold = self._parse_importance_threshold('median', list(importances.values()))
+            thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
+            threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
             selected = [f for f, imp in importances.items() if imp >= threshold]
 
             self._log_info("CatBoost feature selection completed",
-                           task=task, selected=len(selected), threshold=round(threshold, 6))
+                           task=task, selected=len(selected), threshold=round(threshold, 6), 
+                           model_score=round(model_score, 6), cv_splits_used=used_splits)
+            
+            # Log detailed training metrics
+            if 'final_metrics' in locals() and final_metrics:
+                self._log_info("CatBoost detailed metrics:", **final_metrics)
+                
+                # Log model configuration
+                if 'model_info' in final_metrics:
+                    model_info = final_metrics['model_info']
+                    self._log_info("CatBoost model configuration:",
+                                   iterations_used=model_info.get('iterations_used', 'unknown'),
+                                   learning_rate=model_info.get('learning_rate', 'unknown'),
+                                   depth=model_info.get('depth', 'unknown'),
+                                   task_type=model_info.get('task_type', 'unknown'),
+                                   loss_function=model_info.get('loss_function', 'unknown'))
+                
+                # Log performance metrics
+                if task == 'classification':
+                    if 'validation_accuracy' in final_metrics:
+                        self._log_info("CatBoost classification performance:",
+                                       validation_accuracy=round(final_metrics.get('validation_accuracy', 0), 4),
+                                       validation_precision=round(final_metrics.get('validation_precision', 0), 4),
+                                       validation_recall=round(final_metrics.get('validation_recall', 0), 4),
+                                       validation_f1=round(final_metrics.get('validation_f1', 0), 4),
+                                       training_accuracy=round(final_metrics.get('training_accuracy', 0), 4))
+                else:
+                    if 'validation_r2' in final_metrics:
+                        self._log_info("CatBoost regression performance:",
+                                       validation_r2=round(final_metrics.get('validation_r2', 0), 4),
+                                       validation_rmse=round(final_metrics.get('validation_rmse', 0), 4),
+                                       validation_mae=round(final_metrics.get('validation_mae', 0), 4),
+                                       training_r2=round(final_metrics.get('training_r2', 0), 4),
+                                       training_rmse=round(final_metrics.get('training_rmse', 0), 4))
 
         except Exception as e:
             # Attempt CPU fallback if GPU training failed
             try:
                 from catboost import CatBoostClassifier, CatBoostRegressor
-                iterations = int(getattr(self, 'stage3_lgbm_n_estimators', 200))
-                learning_rate = float(getattr(self, 'stage3_lgbm_learning_rate', 0.05))
-                depth = int(getattr(self, 'stage3_lgbm_max_depth', 6 if getattr(self, 'stage3_lgbm_max_depth', -1) == -1 else getattr(self, 'stage3_lgbm_max_depth', 6)))
+                iterations = int(getattr(self, 'stage3_catboost_iterations', getattr(self, 'stage3_lgbm_n_estimators', 200)))
+                learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', getattr(self, 'stage3_lgbm_learning_rate', 0.05)))
+                depth = int(getattr(self, 'stage3_catboost_depth', 6))
                 random_state = int(getattr(self, 'stage3_random_state', 42))
                 
                 if task == 'classification':
@@ -617,9 +759,10 @@ class FeatureSelection:
                         task_type='CPU',
                         verbose=0,
                         loss_function=loss_function,
-                        thread_count=1,
+                        thread_count=int(getattr(self, 'stage3_catboost_thread_count', 1)),
                     )
                 else:
+                    loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
                     model = CatBoostRegressor(
                         iterations=iterations,
                         learning_rate=learning_rate,
@@ -627,12 +770,12 @@ class FeatureSelection:
                         random_seed=random_state,
                         task_type='CPU',
                         verbose=0,
-                        loss_function='RMSE',
-                        thread_count=1,
+                        loss_function=loss_fn,
+                        thread_count=int(getattr(self, 'stage3_catboost_thread_count', 1)),
                     )
-                if eval_set is not None and esr and esr > 0:
-                    X_tr, y_tr, X_va, y_va = eval_set
-                    model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], use_best_model=True, verbose=False)
+                if eval_split is not None and esr and esr > 0:
+                    tr_idx, va_idx = eval_split
+                    model.fit(X[tr_idx], y[tr_idx], eval_set=[(X[va_idx], y[va_idx])], use_best_model=True, verbose=False)
                 else:
                     model.fit(X, y)
                 try:
@@ -640,20 +783,24 @@ class FeatureSelection:
                 except TypeError:
                     fi = model.get_feature_importance()
                 importances = dict(zip(candidates, fi))
-                threshold = self._parse_importance_threshold('median', list(importances.values()))
+                thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
+                threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
                 selected = [f for f, imp in importances.items() if imp >= threshold]
                 backend_used = 'catboost_cpu'
+                model_score = 0.0  # CPU fallback doesn't calculate score
                 self._log_warn("GPU CatBoost failed; used CPU fallback", error=str(e), selected=len(selected))
             except Exception as e2:
                 self._critical_error("CatBoost feature selection failed (GPU and CPU)", error=str(e2))
                 selected = candidates
                 importances = {f: 1.0 for f in candidates}
                 backend_used = 'error'
+                model_score = 0.0
         
-        return selected, importances, backend_used
+        return selected, importances, backend_used, model_score, final_metrics if 'final_metrics' in locals() else {}
 
     def apply_feature_selection_pipeline(self, df: cudf.DataFrame, target_col: str, 
-                                       candidates: List[str], dcor_scores: Dict[str, float] = None) -> Dict[str, Any]:
+                                       candidates: List[str], dcor_scores: Dict[str, float] = None,
+                                       full_ddf=None) -> Dict[str, Any]:
         """
         Apply the complete feature selection pipeline.
         
@@ -739,8 +886,25 @@ class FeatureSelection:
             # Stage 3: Embedded feature selection
             if len(results['stage2_mi_selected']) > 1:
                 try:
+                    # If configured, compute full dataset for Stage 3 from the original Dask frame
+                    X_stage3_df = df
+                    try:
+                        use_full = bool(getattr(self, 'stage3_catboost_use_full_dataset', False))
+                    except Exception:
+                        use_full = False
+                    if use_full and full_ddf is not None:
+                        try:
+                            # Build minimal subset of columns to compute
+                            cols = [c for c in results['stage2_mi_selected'] if c in getattr(full_ddf, 'columns', [])]
+                            if target_col not in cols:
+                                cols = cols + [target_col]
+                            X_stage3_df = full_ddf[cols].compute()
+                            self._log_info("Stage 3 using full dataset for CatBoost", rows=len(X_stage3_df), cols=len(X_stage3_df.columns))
+                        except Exception as e:
+                            self._log_warn("Stage 3 full dataset compute failed; falling back to sample", error=str(e))
+                            X_stage3_df = df
                     final_selected, importances, backend = self._stage3_selectfrommodel(
-                        df, df[target_col], results['stage2_mi_selected']
+                        X_stage3_df, X_stage3_df[target_col], results['stage2_mi_selected']
                     )
                     results['stage3_final_selected'] = final_selected
                     results['importances'] = importances

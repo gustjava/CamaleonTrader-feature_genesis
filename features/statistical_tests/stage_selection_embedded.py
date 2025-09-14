@@ -26,23 +26,73 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
             'selection_stats': {'backend_used': 'none'},
         }
 
-    # Build sample
-    sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
+    # Build sample or full dataset based on configuration
+    try:
+        use_full = bool(getattr(stats_engine, 'stage3_catboost_use_full_dataset', False))
+    except Exception:
+        use_full = False
+    if use_full:
+        # Compute only the required columns to reduce memory pressure
+        cols = [c for c in mi_selected if c in ddf.columns]
+        if target not in cols:
+            cols = cols + [target]
+        try:
+            sample_df = ddf[cols].compute()
+            stats_engine._log_info("[Embedded] Using full dataset for CatBoost selection", rows=len(sample_df), cols=len(sample_df.columns))
+        except Exception as e:
+            stats_engine._log_warn("[Embedded] Full dataset compute failed; falling back to sampling", error=str(e))
+            sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
+    else:
+        sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
 
     # Run embedded selection via FeatureSelection
     try:
-        final_selected, importances, backend = stats_engine.feature_selection._stage3_selectfrommodel(
+        stats_engine._log_info("[Embedded] Starting CatBoost feature selection", 
+                              input_features=len(mi_selected), 
+                              dataset_rows=len(sample_df),
+                              target=target)
+        
+        result = stats_engine.feature_selection._stage3_selectfrommodel(
             sample_df, sample_df[target], mi_selected
         )
+        if len(result) == 4:
+            final_selected, importances, backend, model_score = result
+            detailed_metrics = {}
+        else:
+            final_selected, importances, backend, model_score, detailed_metrics = result
+        
+        # Log detailed results
+        stats_engine._log_info("[Embedded] CatBoost selection completed",
+                              backend=backend,
+                              model_score=model_score,
+                              input_count=len(mi_selected), 
+                              output_count=len(final_selected),
+                              threshold_used=stats_engine.feature_selection._parse_importance_threshold('median', list(importances.values())))
+        
+        # Log all winning features with their importance scores
+        if final_selected and importances:
+            winning_features = [(f, importances.get(f, 0.0)) for f in final_selected]
+            winning_features.sort(key=lambda x: x[1], reverse=True)  # Sort by importance
+            stats_engine._log_info("[Embedded] All winning features with CatBoost importance scores:",
+                                  winning_features=[f"{name}:{score:.6f}" for name, score in winning_features])
+        
+        # Log all features that were considered (for comparison)
+        if importances:
+            all_features = [(f, importances.get(f, 0.0)) for f in mi_selected if f in importances]
+            all_features.sort(key=lambda x: x[1], reverse=True)
+            stats_engine._log_info("[Embedded] All considered features with CatBoost importance scores:",
+                                  all_features=[f"{name}:{score:.6f}" for name, score in all_features])
+        
     except Exception as e:
         stats_engine._log_error("[Embedded] Selection failed; passing through MI set", error=str(e))
         final_selected = list(mi_selected)
         importances = {f: 1.0 for f in mi_selected}
         backend = 'error'
+        model_score = 0.0
 
     stats_engine._log_info(
         "[Embedded] Stage end",
-        input_count=len(mi_selected), output_count=len(final_selected), backend=backend, output_preview=final_selected[:15]
+        input_count=len(mi_selected), output_count=len(final_selected), backend=backend, model_score=model_score
     )
 
     # Persist results
@@ -57,5 +107,6 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
         'stage2_mi_selected': mi_selected,
         'stage3_final_selected': final_selected,
         'importances': importances,
-        'selection_stats': {'backend_used': backend},
+        'selection_stats': {'backend_used': backend, 'model_score': model_score},
+        'detailed_metrics': detailed_metrics,
     }

@@ -14,8 +14,8 @@ import dask_cudf
 
 
 def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, candidates: List[str]) -> dask_cudf.DataFrame:
-    # Sample tail, fallback to head
-    sample_n = int(max(1000, min(stats_engine.dcor_max_samples * 2, 200000)))
+    # Sample tail, fallback to head - Fixed 100k sample
+    sample_n = 100000
     sample = stats_engine._sample_tail_across_partitions(ddf, sample_n, max_parts=16)
     if sample is None or len(sample) == 0 or target not in sample.columns:
         stats_engine._log_warn("dCor tail sample empty or missing target; trying head sample")

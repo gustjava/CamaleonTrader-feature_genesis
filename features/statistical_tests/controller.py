@@ -90,7 +90,7 @@ class StatisticalTests(BaseFeatureEngine):
             self.vif_threshold = float(getattr(uc.features, 'vif_threshold', 5.0))
             self.mi_threshold = float(getattr(uc.features, 'mi_threshold', 0.3))
             self.stage3_top_n = int(getattr(uc.features, 'stage3_top_n', 50))
-            self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.5))
+            self.dcor_min_threshold = float(getattr(uc.features, 'dcor_min_threshold', 0.05))
             self.dcor_min_percentile = float(getattr(uc.features, 'dcor_min_percentile', 0.0))
             self.stage1_top_n = int(getattr(uc.features, 'stage1_top_n', 0))
             
@@ -149,6 +149,22 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage3_lgbm_bagging_fraction = float(getattr(uc.features, 'stage3_lgbm_bagging_fraction', 0.8))
             self.stage3_lgbm_bagging_freq = int(getattr(uc.features, 'stage3_lgbm_bagging_freq', 0))
             self.stage3_lgbm_early_stopping_rounds = int(getattr(uc.features, 'stage3_lgbm_early_stopping_rounds', 0))
+            # Stage 3 CatBoost (explicit) with fallback to LGBM fields
+            self.stage3_catboost_iterations = int(getattr(uc.features, 'stage3_catboost_iterations', self.stage3_lgbm_n_estimators))
+            self.stage3_catboost_learning_rate = float(getattr(uc.features, 'stage3_catboost_learning_rate', self.stage3_lgbm_learning_rate))
+            # If lgbm_max_depth == -1 (auto), use 6 as CatBoost default depth
+            _cb_depth_default = 6 if int(self.stage3_lgbm_max_depth) == -1 else int(self.stage3_lgbm_max_depth)
+            self.stage3_catboost_depth = int(getattr(uc.features, 'stage3_catboost_depth', _cb_depth_default))
+            self.stage3_catboost_devices = str(getattr(uc.features, 'stage3_catboost_devices', '0'))
+            self.stage3_catboost_task_type = str(getattr(uc.features, 'stage3_catboost_task_type', 'GPU'))
+            self.stage3_catboost_thread_count = int(getattr(uc.features, 'stage3_catboost_thread_count', 1))
+            self.stage3_catboost_loss_regression = str(getattr(uc.features, 'stage3_catboost_loss_regression', 'RMSE'))
+            self.stage3_catboost_loss_classification = str(getattr(uc.features, 'stage3_catboost_loss_classification', 'Logloss'))
+            # Temporal CV / early stopping
+            self.stage3_cv_splits = int(getattr(uc.features, 'stage3_cv_splits', 3))
+            self.stage3_cv_min_train = int(getattr(uc.features, 'stage3_cv_min_train', 200))
+            self.stage3_catboost_early_stopping_rounds = int(getattr(uc.features, 'stage3_catboost_early_stopping_rounds', self.stage3_lgbm_early_stopping_rounds))
+            self.stage3_catboost_use_full_dataset = bool(getattr(uc.features, 'stage3_catboost_use_full_dataset', False))
             
             # MI clustering params (Stage 2 scalable)
             self.mi_cluster_enabled = bool(getattr(uc.features, 'mi_cluster_enabled', True))
@@ -596,18 +612,14 @@ class StatisticalTests(BaseFeatureEngine):
         self._set_stage('selection')
         if primary_target and primary_target in df.columns:
             from .stage_selection import run as run_selection
-            self._log_info("Stage start: Selection (VIF/MI/LGBM)")
+            self._log_info("Stage start: Selection (VIF/MI/CatBoost)")
             selection_results = run_selection(self, df, primary_target)
             if selection_results:
                 self._log_info("Stage end: Selection", final_count=len(selection_results.get('stage3_final_selected', [])))
 
         # --- Final Stats Stage ---
-        self._set_stage('final_stats')
-        from .stage_final_stats import run as run_final
-        self._log_info("Stage start: Final comprehensive statistical analysis")
-        df = run_final(self, df)
-        df = self._persist_and_wait(df, stage="final_stats", timeout_s=600)
-        self._log_info("Stage end: Final Stats")
+        # DISABLED: Final stats stage removed - unnecessary after feature selection
+        self._log_info("Final Stats stage skipped - feature selection already completed")
 
         self._log_info("StatisticalTests (Dask) completed successfully")
         return df
@@ -714,8 +726,8 @@ class StatisticalTests(BaseFeatureEngine):
         Stores results in `self._last_dcor_scores` for downstream selection.
         """
         try:
-            # Build a tail sample across last partitions to represent recent behavior
-            sample_n = int(max(1000, min(self.dcor_max_samples * 2, 200000)))
+            # Build a tail sample across last partitions to represent recent behavior - Fixed 100k sample
+            sample_n = 100000
             sample = self._sample_tail_across_partitions(df, sample_n, max_parts=16)
             if sample is None or len(sample) == 0 or target not in sample.columns:
                 self._log_warn("dCor tail sample empty or missing target; trying head sample")
@@ -1083,7 +1095,7 @@ class StatisticalTests(BaseFeatureEngine):
             
             # Apply feature selection pipeline
             selection_results = self.feature_selection.apply_feature_selection_pipeline(
-                sample_df, target, filtered_candidates, dcor_scores
+                sample_df, target, filtered_candidates, dcor_scores, full_ddf=df
             )
             return selection_results
         except Exception as e:

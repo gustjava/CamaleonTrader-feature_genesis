@@ -177,14 +177,26 @@ class FeatureConfig:
     stage3_lgbm_early_stopping_rounds: int = 0
     stage3_use_gpu: bool = True
     stage3_wrapper_backend: str = "xgb_gpu"  # lgbm|xgb_gpu
+    # Stage 3 CatBoost (new explicit keys; fall back to LGBM keys if not provided)
+    stage3_catboost_iterations: int = 200
+    stage3_catboost_learning_rate: float = 0.05
+    stage3_catboost_depth: int = 6
+    stage3_catboost_devices: str = "0"
+    stage3_catboost_task_type: str = "GPU"  # GPU|CPU
+    stage3_catboost_thread_count: int = 1
+    stage3_catboost_loss_regression: str = "RMSE"
+    stage3_catboost_loss_classification: str = "Logloss"  # or MultiClass automatically if needed
+    # Walkforward / temporal CV controls for CatBoost embedded selection
+    stage3_cv_splits: int = 3               # TimeSeriesSplit folds for aggregated importances (>=2 -> enabled)
+    stage3_cv_min_train: int = 200          # Minimum train rows per split
+    stage3_catboost_early_stopping_rounds: int = 0  # Overrides lgbm early stopping if > 0
+    # Data usage control for embedded stage
+    stage3_catboost_use_full_dataset: bool = False   # If true, do not sample selection_max_rows for Stage 3
     # Stage 3 embedded selector (SelectFromModel)
     stage3_selector_method: str = "wrappers"  # wrappers|selectfrommodel
     stage3_importance_type: str = "gain"      # gain|split|weight (backend-dependent)
     stage3_importance_threshold: str = "median"  # 'median' or float as string
     stage3_save_importances_format: str = "json"  # json|parquet
-    # Stage 3 CV (leakage-safe) selection
-    stage3_cv_splits: int = 3               # TimeSeriesSplit folds for aggregated importances (>=2 -> enabled)
-    stage3_cv_min_train: int = 200          # Minimum train rows per split
     # Stage 1 retention controls
     dcor_min_threshold: float = 0.0
     dcor_min_percentile: float = 0.0  # 0.0..1.0

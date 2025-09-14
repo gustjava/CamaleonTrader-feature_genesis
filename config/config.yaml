@@ -166,6 +166,21 @@ features:
   stage3_lgbm_early_stopping_rounds: 0
   stage3_use_gpu: true
   stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
+  # Stage 3 CatBoost (explicit keys; fallback to LGBM values if omitted)
+  stage3_catboost_iterations: 300           # same as n_estimators
+  stage3_catboost_learning_rate: 0.05
+  stage3_catboost_depth: 6
+  stage3_catboost_task_type: GPU            # GPU|CPU
+  stage3_catboost_devices: "0"               # GPU device id(s)
+  stage3_catboost_thread_count: 1
+  stage3_catboost_loss_regression: RMSE
+  stage3_catboost_loss_classification: Logloss
+  # Walkforward / temporal validation for embedded CatBoost selection
+  stage3_cv_splits: 5                       # Use TimeSeriesSplit with K folds (>=2 enables aggregation)
+  stage3_cv_min_train: 200                  # Minimum rows in each training fold
+  stage3_catboost_early_stopping_rounds: 50 # Enable early stopping on validation fold
+  # Data usage control for embedded stage
+  stage3_catboost_use_full_dataset: true    # Use full dataset (disable selection_max_rows sampling)
   # Force GPU usage for all stages
   force_gpu_usage: true
   gpu_fallback_enabled: false  # Disable CPU fallbacks to force GPU usage
