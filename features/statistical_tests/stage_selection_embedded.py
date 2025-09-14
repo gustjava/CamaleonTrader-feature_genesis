@@ -29,23 +29,40 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
     # Build sample or full dataset based on configuration
     try:
         use_full = bool(getattr(stats_engine, 'stage3_catboost_use_full_dataset', False))
+        stats_engine._log_info(f"[Embedded] Dataset configuration: stage3_catboost_use_full_dataset={use_full}")
     except Exception:
         use_full = False
+        stats_engine._log_warn("[Embedded] Could not read stage3_catboost_use_full_dataset config; defaulting to False")
+    
     if use_full:
         # Compute only the required columns to reduce memory pressure
         cols = [c for c in mi_selected if c in ddf.columns]
         if target not in cols:
             cols = cols + [target]
+        
+        # Log dataset size before compute
+        try:
+            total_rows = len(ddf)
+            stats_engine._log_info(f"[Embedded] 🎯 FULL DATASET MODE: Computing {total_rows:,} rows for CatBoost")
+        except Exception:
+            stats_engine._log_info("[Embedded] 🎯 FULL DATASET MODE: Computing complete dataset for CatBoost")
+        
         try:
             sample_df = ddf[cols].compute()
-            stats_engine._log_info("[Embedded] Using full dataset for CatBoost selection", rows=len(sample_df), cols=len(sample_df.columns))
+            stats_engine._log_info(f"[Embedded] ✅ FULL DATASET LOADED: {len(sample_df):,} rows × {len(sample_df.columns)} columns")
+            stats_engine._log_info(f"[Embedded] 📊 Dataset size: {len(sample_df):,} rows (FULL DATASET - NO SAMPLING)")
         except Exception as e:
-            stats_engine._log_warn("[Embedded] Full dataset compute failed; falling back to sampling", error=str(e))
+            stats_engine._log_warn(f"[Embedded] ❌ Full dataset compute failed; falling back to sampling", error=str(e))
             sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
+            stats_engine._log_warn(f"[Embedded] ⚠️  FALLBACK TO SAMPLING: {len(sample_df):,} rows (SAMPLED - NOT FULL DATASET)")
     else:
         sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
+        stats_engine._log_info(f"[Embedded] 📊 SAMPLING MODE: {len(sample_df):,} rows (SAMPLED - NOT FULL DATASET)")
+        stats_engine._log_info(f"[Embedded] ⚠️  WARNING: Using sampled data instead of full dataset")
 
     # Run embedded selection via FeatureSelection
+    detailed_metrics = {}
+    model_score = 0.0
     try:
         stats_engine._log_info("[Embedded] Starting CatBoost feature selection", 
                               input_features=len(mi_selected), 
@@ -55,19 +72,33 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
         result = stats_engine.feature_selection._stage3_selectfrommodel(
             sample_df, sample_df[target], mi_selected
         )
-        if len(result) == 4:
-            final_selected, importances, backend, model_score = result
-            detailed_metrics = {}
+        # Unpack results with backward compatibility (3, 4, or 5 items)
+        if isinstance(result, (list, tuple)):
+            if len(result) >= 5:
+                final_selected, importances, backend, model_score, detailed_metrics = result
+            elif len(result) == 4:
+                final_selected, importances, backend, model_score = result
+                detailed_metrics = {}
+            elif len(result) == 3:
+                final_selected, importances, backend = result
+                model_score = 0.0
+                detailed_metrics = {}
+            else:
+                # Unexpected shape
+                final_selected, importances, backend = list(mi_selected), {f: 1.0 for f in mi_selected}, 'unknown'
+                model_score, detailed_metrics = 0.0, {}
         else:
-            final_selected, importances, backend, model_score, detailed_metrics = result
+            # Unexpected type
+            final_selected, importances, backend = list(mi_selected), {f: 1.0 for f in mi_selected}, 'unknown'
+            model_score, detailed_metrics = 0.0, {}
         
         # Log detailed results
         stats_engine._log_info("[Embedded] CatBoost selection completed",
-                              backend=backend,
-                              model_score=model_score,
-                              input_count=len(mi_selected), 
-                              output_count=len(final_selected),
-                              threshold_used=stats_engine.feature_selection._parse_importance_threshold('median', list(importances.values())))
+                  backend=backend,
+                  model_score=model_score,
+                  input_count=len(mi_selected), 
+                  output_count=len(final_selected),
+                  threshold_used=stats_engine.feature_selection._parse_importance_threshold('median', list(importances.values())))
         
         # Log all winning features with their importance scores
         if final_selected and importances:
@@ -89,6 +120,7 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
         importances = {f: 1.0 for f in mi_selected}
         backend = 'error'
         model_score = 0.0
+        detailed_metrics = {'error': str(e)}
 
     stats_engine._log_info(
         "[Embedded] Stage end",

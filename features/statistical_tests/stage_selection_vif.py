@@ -3,9 +3,15 @@ Statistical Tests - Selection Stage 2A: VIF (Dask)
 
 Performs VIF-based multicollinearity filtering on validated candidates.
 Logs explicit inputs/outputs and returns a dict with stage results for orchestration.
+
+Added auditing:
+- vif_input_without_dcor: features entering VIF that don't have a finite dCor score.
+- vif_selected_without_dcor: VIF-selected features without a finite dCor score.
+This helps diagnose candidates that bypassed Stage 1 scoring.
 """
 
 from typing import Dict, Any, List, Optional
+import math
 import dask_cudf
 
 
@@ -129,10 +135,21 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, candidates: Optiona
         pairs = [f"{f}:{float(dcor_scores.get(f, 0.0)):.6f}" for f in valid_candidates]
         # Inline the full list in the message so it always appears in logs
         stats_engine._log_info(f"[VIF] Input features with dCor (full) [{len(pairs)}]: " + ", ".join(pairs))
+        # Audit: which inputs lack a finite dCor score
+        try:
+            no_dcor_inputs = [
+                f for f in valid_candidates
+                if not (f in dcor_scores and isinstance(dcor_scores.get(f), (int, float)) and math.isfinite(float(dcor_scores.get(f))))
+            ]
+        except Exception:
+            no_dcor_inputs = []
         try:
             stats_engine._last_vif_input_dcor = {f: float(dcor_scores.get(f, 0.0)) for f in valid_candidates}
+            stats_engine._last_vif_input_without_dcor = list(no_dcor_inputs)
         except Exception:
             pass
+        if no_dcor_inputs:
+            stats_engine._log_warn(f"[VIF] {len(no_dcor_inputs)} input features without dCor score", examples=no_dcor_inputs[:15])
     except Exception:
         pass
 
@@ -145,10 +162,21 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, candidates: Optiona
     try:
         sel_pairs = [f"{f}:{float(dcor_scores.get(f, 0.0)):.6f}" for f in vif_selected]
         stats_engine._log_info(f"[VIF] Selected features with dCor (full) [{len(sel_pairs)}]: " + ", ".join(sel_pairs))
+        # Audit: which selected outputs lack a finite dCor score
+        try:
+            no_dcor_selected = [
+                f for f in vif_selected
+                if not (f in dcor_scores and isinstance(dcor_scores.get(f), (int, float)) and math.isfinite(float(dcor_scores.get(f))))
+            ]
+        except Exception:
+            no_dcor_selected = []
         try:
             stats_engine._last_vif_selected_dcor = {f: float(dcor_scores.get(f, 0.0)) for f in vif_selected}
+            stats_engine._last_vif_selected_without_dcor = list(no_dcor_selected)
         except Exception:
             pass
+        if no_dcor_selected:
+            stats_engine._log_warn(f"[VIF] {len(no_dcor_selected)} VIF-selected features without dCor score", examples=no_dcor_selected[:15])
     except Exception:
         pass
 
@@ -169,7 +197,10 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, candidates: Optiona
         'stage': 'vif',
         'stage2_vif_selected': vif_selected,
         'stage2_vif_input': valid_candidates,
-    'stage2_vif_usable': used_cols,
-    'vif_input_with_dcor': getattr(stats_engine, '_last_vif_input_dcor', {f: float(dcor_scores.get(f, 0.0)) for f in valid_candidates}),
-    'vif_selected_with_dcor': getattr(stats_engine, '_last_vif_selected_dcor', {f: float(dcor_scores.get(f, 0.0)) for f in vif_selected}),
+        'stage2_vif_usable': used_cols,
+        'vif_input_with_dcor': getattr(stats_engine, '_last_vif_input_dcor', {f: float(dcor_scores.get(f, 0.0)) for f in valid_candidates}),
+        'vif_selected_with_dcor': getattr(stats_engine, '_last_vif_selected_dcor', {f: float(dcor_scores.get(f, 0.0)) for f in vif_selected}),
+        # New audit fields
+        'vif_input_without_dcor': getattr(stats_engine, '_last_vif_input_without_dcor', []),
+        'vif_selected_without_dcor': getattr(stats_engine, '_last_vif_selected_without_dcor', []),
     }

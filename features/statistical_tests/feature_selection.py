@@ -457,497 +457,430 @@ class FeatureSelection:
         except Exception:
             return 0.0
 
-    def _stage3_selectfrommodel(self, X_df, y_series, candidates: List[str]) -> Tuple[List[str], dict, str, float, dict]:
-        """Select features using an embedded model with importance threshold.
+    def _stage3_selectfrommodel(self, X_df, y_series, candidates: List[str]) -> Tuple[List[str], dict, str, float, Dict[str, Any]]:
+        """Embedded CatBoost selector with CPCV/TSS and GPU-only training.
 
         Returns: (selected_features, importances_map, backend_used, model_score, detailed_metrics)
         """
-        # Determine task type (classification vs regression)
+        backend_used = 'catboost'
+
+        # Resolve task type
         task = str(getattr(self, 'stage3_task', 'auto')).lower()
         if task == 'auto':
             try:
-                y_vals = y_series.values
+                y_vals = y_series.values if hasattr(y_series, 'values') else np.asarray(y_series)
                 uniq = np.unique(y_vals)
-                # Classify as classification if <= 10 unique integer values, otherwise regression
-                task = 'classification' if (len(uniq) <= 10 and np.allclose(uniq, uniq.astype(int))) else 'regression'
+                max_classes = int(getattr(self, 'stage3_classification_max_classes', 10))
+                task = 'classification' if (len(uniq) <= max(2, max_classes) and np.allclose(uniq, np.round(uniq))) else 'regression'
             except Exception:
-                task = 'regression'  # Default to regression if auto-detection fails
+                task = 'regression'
 
-        backend_used = 'catboost'  # Use CatBoost as the embedded model
-        importances: dict = {}  # Store feature importances
-        model = None
-        
-        # Build CPU numpy arrays for sklearn/LightGBM (avoid CuPy arrays)
+        # Pre-filter: ensure candidates exist and are numeric; drop zero-variance columns
+        present = [c for c in candidates if c in X_df.columns]
+        if not present:
+            self._critical_error('No valid candidate features present in DataFrame')
+            # unreachable
+
+        # Build a clean pandas DataFrame and numpy arrays; drop NaN/Inf jointly
         try:
             import cudf as _cudf
-            # Convert to pandas if coming from cuDF
-            if isinstance(X_df, _cudf.DataFrame):
-                Xp = X_df[candidates].to_pandas()
-            else:
-                Xp = X_df[candidates]
-            if hasattr(y_series, 'to_pandas'):
-                yp = y_series.to_pandas()
-            else:
-                yp = y_series
-            # Align and drop NaNs/Infs jointly
-            import numpy as _np
+            Xp_all = X_df[present].to_pandas() if isinstance(X_df, _cudf.DataFrame) else X_df[present].copy()
+            yp = y_series.to_pandas() if hasattr(y_series, 'to_pandas') else y_series
+            # Keep only numeric columns
+            import pandas as _pd
+            num_cols = [c for c in Xp_all.columns if _pd.api.types.is_numeric_dtype(Xp_all[c])]
+            dropped_non_numeric = [c for c in Xp_all.columns if c not in num_cols]
+            if dropped_non_numeric:
+                self._log_warn('Dropping non-numeric features for CatBoost', dropped=len(dropped_non_numeric), examples=dropped_non_numeric[:10])
+            Xp = Xp_all[num_cols]
+            # Append target and clean
             data = Xp.copy()
-            data['__target__'] = yp
-            data.replace([_np.inf, -_np.inf], _np.nan, inplace=True)
+            data['__y__'] = yp
+            data.replace([np.inf, -np.inf], np.nan, inplace=True)
             data = data.dropna()
-            y = data.pop('__target__').to_numpy(dtype=_np.float32, copy=False)
-            X = data.to_numpy(dtype=_np.float32, copy=False)
+            # Drop constant columns (zero variance)
+            try:
+                nunq = data.drop(columns=['__y__']).nunique()
+                const_cols = nunq[nunq <= 1].index.tolist()
+                if const_cols:
+                    data = data.drop(columns=const_cols, errors='ignore')
+                    self._log_warn('Dropping constant-variance features for CatBoost', dropped=len(const_cols), examples=const_cols[:10])
+            except Exception:
+                pass
+            # Final safety: ensure we still have features
+            if data.shape[1] <= 1:  # only __y__ remains
+                self._critical_error('No usable numeric features after cleaning for CatBoost')
+                # unreachable
+            y = data.pop('__y__').to_numpy(dtype=np.float32, copy=False)
+            X = data.to_numpy(dtype=np.float32, copy=False)
+            # Update candidates list to the used order
+            candidates = list(data.columns)
         except Exception as e:
-            # Fallback: best-effort to numpy
-            X = X_df[candidates].to_pandas().to_numpy(dtype=np.float32, copy=False)
-            y = y_series.to_pandas().to_numpy(dtype=np.float32, copy=False)
-        
-        # Optionally disable sampling to use the full dataset
-        use_full = bool(getattr(self, 'stage3_catboost_use_full_dataset', False))
-        if not use_full:
-            max_rows = int(getattr(self, 'selection_max_rows', 100000))
-            if X.shape[0] > max_rows:
-                self._log_info("Applying systematic sampling for feature selection", 
-                              original_rows=X.shape[0], sampled_rows=max_rows, 
-                              sampling_ratio=round(max_rows/X.shape[0], 3))
-                indices = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
-                X = X[indices]
-                y = y[indices]
-        else:
-            self._log_info("Using full dataset for embedded CatBoost selection", rows=X.shape[0])
+            self._critical_error('Failed to materialize training arrays for CatBoost', error=str(e))
+            return candidates, {f: 1.0 for f in candidates}, backend_used, 0.0, {'error': str(e)}
 
-        # Temporal CV / early stopping configuration
-        esr = int(getattr(self, 'stage3_catboost_early_stopping_rounds', getattr(self, 'stage3_lgbm_early_stopping_rounds', 0)))
+        # Optional downsampling
+        use_full = bool(getattr(self, 'stage3_catboost_use_full_dataset', False))
+        if not use_full and X.shape[0] > int(getattr(self, 'selection_max_rows', 100000)):
+            max_rows = int(getattr(self, 'selection_max_rows', 100000))
+            if task == 'classification' and bool(getattr(self, 'stage3_stratified_sampling', True)):
+                try:
+                    classes, counts = np.unique(y, return_counts=True)
+                    quotas = {c: max(1, int(round(max_rows * cnt / float(len(y))))) for c, cnt in zip(classes, counts)}
+                    idx_parts = []
+                    for c in classes:
+                        cls_idx = np.nonzero(y == c)[0]
+                        k = min(len(cls_idx), quotas[c])
+                        if k > 0:
+                            sel = np.linspace(0, len(cls_idx) - 1, k, dtype=int)
+                            idx_parts.append(cls_idx[sel])
+                    if idx_parts:
+                        idx = np.sort(np.concatenate(idx_parts))
+                        if idx.shape[0] > max_rows:
+                            idx = idx[:max_rows]
+                        self._log_info('Stratified sampling applied', original_rows=X.shape[0], sampled_rows=int(idx.shape[0]))
+                        X, y = X[idx], y[idx]
+                    else:
+                        ids = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
+                        X, y = X[ids], y[ids]
+                except Exception as se:
+                    self._log_warn('Stratified sampling failed; using systematic', error=str(se))
+                    ids = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
+                    X, y = X[ids], y[ids]
+            else:
+                ids = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
+                X, y = X[ids], y[ids]
+
+        # Model params
+        iterations = int(getattr(self, 'stage3_catboost_iterations', 200))
+        learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', 0.05))
+        depth = int(getattr(self, 'stage3_catboost_depth', 6))
+        task_type = str(getattr(self, 'stage3_catboost_task_type', 'GPU'))
+        devices_cfg = str(getattr(self, 'stage3_catboost_devices', '0'))
+        thread_count = int(getattr(self, 'stage3_catboost_thread_count', 1))
+        random_state = int(getattr(self, 'stage3_random_state', 42))
+
+        # GPU validation and device mapping
+        if task_type.upper() == 'GPU':
+            try:
+                import cupy as _cp
+                if int(_cp.cuda.runtime.getDeviceCount()) <= 0:
+                    raise RuntimeError('No CUDA devices available for CatBoost GPU task')
+            except Exception as de:
+                self._critical_error('GPU validation failed', error=str(de))
+            import os as _os
+            devices = '0' if _os.environ.get('CUDA_VISIBLE_DEVICES') else devices_cfg
+        else:
+            self._log_error('CPU CatBoost not allowed; GPU-only policy enforced')
+            raise RuntimeError('CPU CatBoost not allowed')
+
+        # Build model
+        from catboost import CatBoostClassifier, CatBoostRegressor, Pool as _Pool
+        if task == 'classification':
+            unique_y = np.unique(y)
+            is_binary = len(unique_y) == 2
+            loss_function = 'Logloss' if is_binary else 'MultiClass'
+            eval_metric = 'AUC' if is_binary else 'Accuracy'
+            model = CatBoostClassifier(
+                iterations=iterations,
+                learning_rate=learning_rate,
+                depth=depth if depth > 0 else 6,
+                random_seed=random_state,
+                task_type=task_type,
+                devices=devices,
+                loss_function=loss_function,
+                eval_metric=eval_metric,
+                verbose=0,
+                thread_count=thread_count,
+            )
+        else:
+            loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
+            model = CatBoostRegressor(
+                iterations=iterations,
+                learning_rate=learning_rate,
+                depth=depth if depth > 0 else 6,
+                random_seed=random_state,
+                task_type=task_type,
+                devices=devices,
+                loss_function=loss_fn,
+                eval_metric=loss_fn,
+                verbose=0,
+                thread_count=thread_count,
+            )
+
+        # Early stopping + CV setup
+        esr = int(getattr(self, 'stage3_catboost_early_stopping_rounds', 0))
         n_splits_cfg = int(getattr(self, 'stage3_cv_splits', 0))
         min_train = int(getattr(self, 'stage3_cv_min_train', 200))
-        eval_split = None
-        tss_for_eval = None
-        if X.shape[0] >= max(10, 2 * min_train) and (esr > 0 or n_splits_cfg >= 2):
+
+        def _fit_eval(X_fit, y_fit, tr_idx=None, va_idx=None):
+            feat_names = list(candidates)
+            if tr_idx is not None and va_idx is not None and esr > 0:
+                train_pool = _Pool(X_fit[tr_idx], y_fit[tr_idx], feature_names=feat_names)
+                valid_pool = _Pool(X_fit[va_idx], y_fit[va_idx], feature_names=feat_names)
+                model.fit(train_pool, eval_set=[valid_pool], use_best_model=True, od_type='Iter', od_wait=esr)
+                pred_tr = model.predict(train_pool)
+                pred_va = model.predict(valid_pool)
+                ytr, yva = y_fit[tr_idx], y_fit[va_idx]
+            else:
+                train_pool = _Pool(X_fit, y_fit, feature_names=feat_names)
+                model.fit(train_pool)
+                pred_tr = model.predict(train_pool)
+                ytr = y_fit
+                pred_va, yva = None, None
+
+            metrics = {}
+            if task == 'classification':
+                from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+                metrics['training_accuracy'] = float(accuracy_score(ytr, pred_tr))
+                metrics['training_precision'] = float(precision_score(ytr, pred_tr, average='weighted', zero_division=0))
+                metrics['training_recall'] = float(recall_score(ytr, pred_tr, average='weighted', zero_division=0))
+                metrics['training_f1'] = float(f1_score(ytr, pred_tr, average='weighted', zero_division=0))
+                if pred_va is not None:
+                    metrics['validation_accuracy'] = float(accuracy_score(yva, pred_va))
+                    metrics['validation_precision'] = float(precision_score(yva, pred_va, average='weighted', zero_division=0))
+                    metrics['validation_recall'] = float(recall_score(yva, pred_va, average='weighted', zero_division=0))
+                    metrics['validation_f1'] = float(f1_score(yva, pred_va, average='weighted', zero_division=0))
+                    score = metrics['validation_f1']
+                else:
+                    score = metrics['training_f1']
+            else:
+                from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+                metrics['training_r2'] = float(r2_score(ytr, pred_tr))
+                metrics['training_mse'] = float(mean_squared_error(ytr, pred_tr))
+                metrics['training_mae'] = float(mean_absolute_error(ytr, pred_tr))
+                metrics['training_rmse'] = float(np.sqrt(metrics['training_mse']))
+                if pred_va is not None:
+                    metrics['validation_r2'] = float(r2_score(yva, pred_va))
+                    metrics['validation_mse'] = float(mean_squared_error(yva, pred_va))
+                    metrics['validation_mae'] = float(mean_absolute_error(yva, pred_va))
+                    metrics['validation_rmse'] = float(np.sqrt(metrics['validation_mse']))
+                    score = metrics['validation_r2']
+                else:
+                    score = metrics['training_r2']
+
+            # Feature importance
             try:
-                from sklearn.model_selection import TimeSeriesSplit
-                # Build primary TSS for CV aggregation if requested
-                if n_splits_cfg >= 2:
-                    n_splits = max(2, n_splits_cfg)
-                    tss_for_eval = TimeSeriesSplit(n_splits=n_splits)
-                else:
-                    # Create a last split only for early stopping
-                    tss_for_eval = TimeSeriesSplit(n_splits=3)
-                # Last split for early stopping eval_set
-                tr_idx, va_idx = list(tss_for_eval.split(X))[-1]
-                if len(tr_idx) >= max(10, min_train) and len(va_idx) >= max(5, min_train // 5):
-                    eval_split = (tr_idx, va_idx)
-                    self._log_info("TimeSeriesSplit ready for early stopping", train=len(tr_idx), val=len(va_idx))
-            except Exception as e_ts:
-                self._log_warn("TimeSeriesSplit setup failed", error=str(e_ts))
-
-        # Preferred backend: CatBoost (GPU)
-        try:
-            from catboost import CatBoostClassifier, CatBoostRegressor
-            iterations = int(getattr(self, 'stage3_catboost_iterations', getattr(self, 'stage3_lgbm_n_estimators', 200)))
-            learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', getattr(self, 'stage3_lgbm_learning_rate', 0.05)))
-            depth = int(getattr(self, 'stage3_catboost_depth', 6))
-            random_state = int(getattr(self, 'stage3_random_state', 42))
-            task_type = str(getattr(self, 'stage3_catboost_task_type', 'GPU'))
-            devices = str(getattr(self, 'stage3_catboost_devices', '0'))
-            thread_count = int(getattr(self, 'stage3_catboost_thread_count', 1))
-
-            def _build_model():
-                if task == 'classification':
-                    loss_function = 'Logloss' if len(np.unique(y)) == 2 else 'MultiClass'
-                    return CatBoostClassifier(
-                        iterations=iterations,
-                        learning_rate=learning_rate,
-                        depth=depth if depth > 0 else 6,
-                        random_seed=random_state,
-                        task_type=task_type,
-                        devices=devices,
-                        verbose=0,
-                        loss_function=loss_function,
-                        thread_count=thread_count,
-                    )
-                else:
-                    loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
-                    return CatBoostRegressor(
-                        iterations=iterations,
-                        learning_rate=learning_rate,
-                        depth=depth if depth > 0 else 6,
-                        random_seed=random_state,
-                        task_type=task_type,
-                        devices=devices,
-                        verbose=0,
-                        loss_function=loss_fn,
-                        thread_count=thread_count,
-                    )
-
-            def _fit_and_importances(X_fit, y_fit, eval_pair=None):
-                model = _build_model()
-                training_metrics = {}
-                
-                if eval_pair is not None and esr and esr > 0:
-                    tr_idx, va_idx = eval_pair
-                    model.fit(
-                        X_fit[tr_idx], y_fit[tr_idx],
-                        eval_set=[(X_fit[va_idx], y_fit[va_idx])],
-                        use_best_model=True, od_type='Iter', od_wait=esr
-                    )
-                    # Get validation score
-                    val_pred = model.predict(X_fit[va_idx])
-                    if task == 'classification':
-                        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-                        score = accuracy_score(y_fit[va_idx], val_pred)
-                        training_metrics['validation_accuracy'] = score
-                        training_metrics['validation_precision'] = precision_score(y_fit[va_idx], val_pred, average='weighted')
-                        training_metrics['validation_recall'] = recall_score(y_fit[va_idx], val_pred, average='weighted')
-                        training_metrics['validation_f1'] = f1_score(y_fit[va_idx], val_pred, average='weighted')
-                    else:
-                        from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-                        score = r2_score(y_fit[va_idx], val_pred)
-                        training_metrics['validation_r2'] = score
-                        training_metrics['validation_mse'] = mean_squared_error(y_fit[va_idx], val_pred)
-                        training_metrics['validation_mae'] = mean_absolute_error(y_fit[va_idx], val_pred)
-                        training_metrics['validation_rmse'] = np.sqrt(training_metrics['validation_mse'])
-                    
-                    # Get training score for comparison
-                    train_pred = model.predict(X_fit[tr_idx])
-                    if task == 'classification':
-                        training_metrics['training_accuracy'] = accuracy_score(y_fit[tr_idx], train_pred)
-                    else:
-                        training_metrics['training_r2'] = r2_score(y_fit[tr_idx], train_pred)
-                        training_metrics['training_mse'] = mean_squared_error(y_fit[tr_idx], train_pred)
-                        training_metrics['training_mae'] = mean_absolute_error(y_fit[tr_idx], train_pred)
-                        training_metrics['training_rmse'] = np.sqrt(training_metrics['training_mse'])
-                else:
-                    model.fit(X_fit, y_fit)
-                    # Get training score
-                    train_pred = model.predict(X_fit)
-                    if task == 'classification':
-                        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-                        score = accuracy_score(y_fit, train_pred)
-                        training_metrics['training_accuracy'] = score
-                        training_metrics['training_precision'] = precision_score(y_fit, train_pred, average='weighted')
-                        training_metrics['training_recall'] = recall_score(y_fit, train_pred, average='weighted')
-                        training_metrics['training_f1'] = f1_score(y_fit, train_pred, average='weighted')
-                    else:
-                        from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-                        score = r2_score(y_fit, train_pred)
-                        training_metrics['training_r2'] = score
-                        training_metrics['training_mse'] = mean_squared_error(y_fit, train_pred)
-                        training_metrics['training_mae'] = mean_absolute_error(y_fit, train_pred)
-                        training_metrics['training_rmse'] = np.sqrt(training_metrics['training_mse'])
-                
-                # Get feature importance with different types
+                fi = model.get_feature_importance(type='PredictionValuesChange')
+            except Exception:
                 try:
-                    fi_prediction = model.get_feature_importance(type='PredictionValuesChange')
-                    fi_loss = model.get_feature_importance(type='LossFunctionChange')
-                    fi_feature = model.get_feature_importance(type='Feature')
-                    training_metrics['feature_importance_types'] = {
-                        'prediction_values_change': fi_prediction.tolist(),
-                        'loss_function_change': fi_loss.tolist(),
-                        'feature': fi_feature.tolist()
-                    }
-                    fi = fi_prediction  # Use prediction values change as primary
-                except (TypeError, AttributeError):
-                    try:
-                        fi = model.get_feature_importance()
-                        training_metrics['feature_importance_types'] = {'default': fi.tolist()}
-                    except:
-                        fi = np.zeros(len(candidates))
-                        training_metrics['feature_importance_types'] = {'error': 'Could not get feature importance'}
-                
-                # Get model info
-                training_metrics['model_info'] = {
-                    'iterations_used': model.get_best_iteration() if hasattr(model, 'get_best_iteration') else model.get_param('iterations'),
-                    'learning_rate': model.get_param('learning_rate'),
-                    'depth': model.get_param('depth'),
-                    'task_type': model.get_param('task_type'),
-                    'loss_function': model.get_param('loss_function')
-                }
-                
-                return np.asarray(fi, dtype=float), score, training_metrics
+                    fi = model.get_feature_importance()
+                except Exception:
+                    fi = np.zeros(len(candidates), dtype=float)
 
-            # If CV enabled (>=2 splits), aggregate importances across folds
-            agg_fi = None
-            agg_scores = []
-            agg_metrics = []
-            used_splits = 0
-            if n_splits_cfg >= 2 and tss_for_eval is not None:
-                from sklearn.model_selection import TimeSeriesSplit
-                for tr_idx, va_idx in tss_for_eval.split(X):
-                    if len(tr_idx) < max(10, min_train) or len(va_idx) < max(5, min_train // 5):
+            # Model info (log only)
+            try:
+                it_used = int(model.get_best_iteration())
+            except Exception:
+                it_used = iterations
+            metrics['model_info'] = {
+                'iterations_used': it_used,
+                'learning_rate': learning_rate,
+                'task_type': task_type,
+                'depth': int(depth if depth > 0 else 6),
+            }
+            return fi, float(score), metrics
+
+        # Build CV plan: CPCV preferred
+        final_metrics = {}
+        used_splits = 0
+        model_score = 0.0
+        agg_metrics = []
+        agg_fi = None
+
+        use_cpcv = bool(getattr(self, 'cpcv_enabled', False))
+        cpcv_n = int(getattr(self, 'cpcv_n_groups', 6))
+        cpcv_k = int(getattr(self, 'cpcv_k_leave_out', 2))
+        cpcv_purge = int(getattr(self, 'cpcv_purge', 0))
+        cpcv_embargo = int(getattr(self, 'cpcv_embargo', 0))
+
+        try:
+            if use_cpcv and cpcv_n >= 3 and X.shape[0] >= cpcv_n:
+                from utils.cpcv import combinatorial_purged_cv
+                n_samples = X.shape[0]
+                sizes = (n_samples // cpcv_n) * np.ones(cpcv_n, dtype=int)
+                sizes[: n_samples % cpcv_n] += 1
+                idx = np.arange(n_samples)
+                groups = []
+                pos = 0
+                for s in sizes:
+                    groups.append(idx[pos:pos + int(s)])
+                    pos += int(s)
+                # Log CPCV plan details for transparency
+                self._log_info('CPCV plan', enabled=bool(use_cpcv), n_groups=int(cpcv_n), k_leave_out=int(cpcv_k), purge=int(cpcv_purge), embargo=int(cpcv_embargo), total_samples=int(n_samples))
+                for tr_idx, te_idx in combinatorial_purged_cv(groups, k_leave_out=cpcv_k, purge=cpcv_purge, embargo=cpcv_embargo):
+                    if len(tr_idx) < max(10, min_train) or len(te_idx) < max(5, max(1, min_train // 5)):
                         continue
-                    fi, score, metrics = _fit_and_importances(X, y, (tr_idx, va_idx) if esr > 0 else None)
+                    fi, score, m = _fit_eval(X, y, tr_idx, te_idx)
                     agg_fi = fi if agg_fi is None else (agg_fi + fi)
-                    agg_scores.append(score)
-                    agg_metrics.append(metrics)
+                    agg_metrics.append(m)
                     used_splits += 1
+                    model_score += score
                 if used_splits > 0:
                     agg_fi = agg_fi / float(used_splits)
-                    model_score = np.mean(agg_scores)
-                    # Aggregate metrics (take mean for numeric values)
-                    final_metrics = {}
-                    for key in agg_metrics[0].keys():
-                        if key == 'feature_importance_types':
-                            final_metrics[key] = agg_metrics[0][key]  # Keep first one
-                        elif key == 'model_info':
-                            final_metrics[key] = agg_metrics[0][key]  # Keep first one
-                        else:
-                            final_metrics[key] = np.mean([m[key] for m in agg_metrics if key in m])
-            # If no CV aggregation, train once (optionally with early stopping on last split)
-            if agg_fi is None:
-                fi, model_score, final_metrics = _fit_and_importances(X, y, eval_split if esr > 0 and eval_split is not None else None)
-                agg_fi = fi
-
-            importances = dict(zip(candidates, agg_fi.tolist()))
-
-            # Threshold and selection
-            thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
-            threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
-            selected = [f for f, imp in importances.items() if imp >= threshold]
-
-            self._log_info("CatBoost feature selection completed",
-                           task=task, selected=len(selected), threshold=round(threshold, 6), 
-                           model_score=round(model_score, 6), cv_splits_used=used_splits)
-            
-            # Log detailed training metrics
-            if 'final_metrics' in locals() and final_metrics:
-                self._log_info("CatBoost detailed metrics:", **final_metrics)
-                
-                # Log model configuration
-                if 'model_info' in final_metrics:
-                    model_info = final_metrics['model_info']
-                    self._log_info("CatBoost model configuration:",
-                                   iterations_used=model_info.get('iterations_used', 'unknown'),
-                                   learning_rate=model_info.get('learning_rate', 'unknown'),
-                                   depth=model_info.get('depth', 'unknown'),
-                                   task_type=model_info.get('task_type', 'unknown'),
-                                   loss_function=model_info.get('loss_function', 'unknown'))
-                
-                # Log performance metrics
-                if task == 'classification':
-                    if 'validation_accuracy' in final_metrics:
-                        self._log_info("CatBoost classification performance:",
-                                       validation_accuracy=round(final_metrics.get('validation_accuracy', 0), 4),
-                                       validation_precision=round(final_metrics.get('validation_precision', 0), 4),
-                                       validation_recall=round(final_metrics.get('validation_recall', 0), 4),
-                                       validation_f1=round(final_metrics.get('validation_f1', 0), 4),
-                                       training_accuracy=round(final_metrics.get('training_accuracy', 0), 4))
-                else:
-                    if 'validation_r2' in final_metrics:
-                        self._log_info("CatBoost regression performance:",
-                                       validation_r2=round(final_metrics.get('validation_r2', 0), 4),
-                                       validation_rmse=round(final_metrics.get('validation_rmse', 0), 4),
-                                       validation_mae=round(final_metrics.get('validation_mae', 0), 4),
-                                       training_r2=round(final_metrics.get('training_r2', 0), 4),
-                                       training_rmse=round(final_metrics.get('training_rmse', 0), 4))
-
+                    model_score = model_score / float(used_splits)
+                    final_metrics['cv_scheme'] = 'cpcv'
+                    final_metrics['cv_folds_used'] = used_splits
         except Exception as e:
-            # Attempt CPU fallback if GPU training failed
-            try:
-                from catboost import CatBoostClassifier, CatBoostRegressor
-                iterations = int(getattr(self, 'stage3_catboost_iterations', getattr(self, 'stage3_lgbm_n_estimators', 200)))
-                learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', getattr(self, 'stage3_lgbm_learning_rate', 0.05)))
-                depth = int(getattr(self, 'stage3_catboost_depth', 6))
-                random_state = int(getattr(self, 'stage3_random_state', 42))
-                
-                if task == 'classification':
-                    loss_function = 'Logloss' if len(np.unique(y)) == 2 else 'MultiClass'
-                    model = CatBoostClassifier(
-                        iterations=iterations,
-                        learning_rate=learning_rate,
-                        depth=depth if depth > 0 else 6,
-                        random_seed=random_state,
-                        task_type='CPU',
-                        verbose=0,
-                        loss_function=loss_function,
-                        thread_count=int(getattr(self, 'stage3_catboost_thread_count', 1)),
-                    )
-                else:
-                    loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
-                    model = CatBoostRegressor(
-                        iterations=iterations,
-                        learning_rate=learning_rate,
-                        depth=depth if depth > 0 else 6,
-                        random_seed=random_state,
-                        task_type='CPU',
-                        verbose=0,
-                        loss_function=loss_fn,
-                        thread_count=int(getattr(self, 'stage3_catboost_thread_count', 1)),
-                    )
-                if eval_split is not None and esr and esr > 0:
-                    tr_idx, va_idx = eval_split
-                    model.fit(X[tr_idx], y[tr_idx], eval_set=[(X[va_idx], y[va_idx])], use_best_model=True, verbose=False)
-                else:
-                    model.fit(X, y)
-                try:
-                    fi = model.get_feature_importance(type='PredictionValuesChange')
-                except TypeError:
-                    fi = model.get_feature_importance()
-                importances = dict(zip(candidates, fi))
-                thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
-                threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
-                selected = [f for f, imp in importances.items() if imp >= threshold]
-                backend_used = 'catboost_cpu'
-                model_score = 0.0  # CPU fallback doesn't calculate score
-                self._log_warn("GPU CatBoost failed; used CPU fallback", error=str(e), selected=len(selected))
-            except Exception as e2:
-                self._critical_error("CatBoost feature selection failed (GPU and CPU)", error=str(e2))
-                selected = candidates
-                importances = {f: 1.0 for f in candidates}
-                backend_used = 'error'
-                model_score = 0.0
-        
-        return selected, importances, backend_used, model_score, final_metrics if 'final_metrics' in locals() else {}
+            self._log_warn('CPCV failed; will try TimeSeriesSplit', error=str(e))
 
-    def apply_feature_selection_pipeline(self, df: cudf.DataFrame, target_col: str, 
-                                       candidates: List[str], dcor_scores: Dict[str, float] = None,
-                                       full_ddf=None) -> Dict[str, Any]:
-        """
-        Apply the complete feature selection pipeline.
-        
-        Args:
-            df: Input DataFrame
-            target_col: Target column name
-            candidates: List of candidate feature names
-            dcor_scores: Dictionary of distance correlation scores
-            
-        Returns:
-            Dictionary with selection results and statistics
+        # Fallback to TimeSeriesSplit if no CPCV splits used
+        if used_splits == 0 and n_splits_cfg >= 2 and X.shape[0] >= max(10, 2 * min_train):
+            from sklearn.model_selection import TimeSeriesSplit
+            tss_n = max(2, n_splits_cfg)
+            self._log_info('TSS plan', n_splits=int(tss_n), min_train=int(min_train), total_samples=int(X.shape[0]))
+            tss = TimeSeriesSplit(n_splits=tss_n)
+            for tr_idx, va_idx in tss.split(X):
+                if len(tr_idx) < max(10, min_train) or len(va_idx) < max(5, max(1, min_train // 5)):
+                    continue
+                fi, score, m = _fit_eval(X, y, tr_idx, va_idx)
+                agg_fi = fi if agg_fi is None else (agg_fi + fi)
+                agg_metrics.append(m)
+                used_splits += 1
+                model_score += score
+            if used_splits > 0:
+                agg_fi = agg_fi / float(used_splits)
+                model_score = model_score / float(used_splits)
+                final_metrics['cv_scheme'] = 'tss'
+                final_metrics['cv_folds_used'] = used_splits
+
+        # No CV? Fit once (optionally with early stopping)
+        if used_splits == 0:
+            fi, model_score, m = _fit_eval(X, y, None, None)
+            agg_fi = fi
+            final_metrics.update(m)
+            final_metrics['cv_scheme'] = 'none'
+            final_metrics['cv_folds_used'] = 0
+
+        # Aggregate per-fold metrics (mean) if available
+        if agg_metrics:
+            sums: Dict[str, float] = {}
+            counts: Dict[str, int] = {}
+            model_infos = []
+            for m in agg_metrics:
+                if not isinstance(m, dict):
+                    continue
+                if 'model_info' in m:
+                    model_infos.append(m['model_info'])
+                for k, v in m.items():
+                    if k == 'model_info':
+                        continue
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    sums[k] = sums.get(k, 0.0) + fv
+                    counts[k] = counts.get(k, 0) + 1
+            for k in sums:
+                if counts.get(k, 0) > 0:
+                    final_metrics[k] = float(sums[k] / counts[k])
+            # Summarize model_info if present
+            if model_infos:
+                try:
+                    iters = [int(info.get('iterations_used', 0)) for info in model_infos if isinstance(info, dict)]
+                    it_mean = int(round(sum(iters) / max(1, len(iters)))) if iters else iterations
+                except Exception:
+                    it_mean = iterations
+                final_metrics['model_info'] = {
+                    'iterations_used': it_mean,
+                    'learning_rate': learning_rate,
+                    'task_type': task_type,
+                    'depth': int(depth if depth > 0 else 6),
+                }
+        # Record FI type used for transparency
+        final_metrics.setdefault('feature_importance_types', ['PredictionValuesChange'])
+
+        # Map importances and select
+        importances = dict(zip(candidates, np.asarray(agg_fi, dtype=float).tolist()))
+        thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
+        threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
+        selected = [f for f, v in importances.items() if float(v) >= float(threshold)]
+
+        # Log summary
+        self._log_info('CatBoost feature selection completed',
+                       task=task, selected=len(selected), threshold=float(round(threshold, 6)),
+                       model_score=float(round(model_score, 6)), cv_splits_used=int(used_splits),
+                       cv_scheme=final_metrics.get('cv_scheme', 'unknown'))
+        if final_metrics:
+            self._log_info('CatBoost detailed metrics', **final_metrics)
+
+        return selected, importances, backend_used, float(model_score), final_metrics
+
+    def apply_feature_selection_pipeline(self, df: cudf.DataFrame, target_col: str, candidates: List[str], dcor_scores: Dict[str, float], full_ddf=None) -> Dict[str, Any]:
+        """Run VIF -> MI -> Embedded (CatBoost) pipeline on provided candidates.
+
+        Returns a dict with keys: stage2_vif_selected, stage2_mi_selected, stage3_final_selected, importances, selection_stats
         """
         try:
-            self._log_info("Starting feature selection pipeline", 
-                          n_candidates=len(candidates), target=target_col)
-            
-            results = {
-                'stage1_candidates': candidates,
+            # Ensure target exists
+            if target_col not in df.columns:
+                self._critical_error('Target column missing for selection pipeline', target=target_col)
+
+            # Keep only candidates present in df
+            valid = [c for c in candidates if c in df.columns]
+            if not valid:
+                self._log_warn('No valid candidates after presence check; skipping pipeline')
+                return {
+                    'stage2_vif_selected': [],
+                    'stage2_mi_selected': [],
+                    'stage3_final_selected': [],
+                    'importances': {},
+                    'selection_stats': {'backend_used': 'none'}
+                }
+
+            # Stage 2: VIF on GPU
+            try:
+                X_gpu, used_cols = self._to_cupy_matrix(df, valid, dtype='f4')
+                vif_selected = self._compute_vif_iterative_gpu(X_gpu, used_cols, threshold=float(getattr(self, 'vif_threshold', 5.0)))
+            except Exception as e:
+                self._log_warn('VIF stage failed; passing all valid candidates', error=str(e))
+                vif_selected = list(valid)
+
+            # Stage 2b: MI redundancy or clustering
+            try:
+                if bool(getattr(self, 'mi_cluster_enabled', True)):
+                    mi_selected = self._compute_mi_cluster_representatives(df, vif_selected, dcor_scores or {})
+                else:
+                    # Try GPU MI redundancy first
+                    try:
+                        X_gpu2, used_cols2 = self._to_cupy_matrix(df, vif_selected, dtype='f4')
+                        mi_selected = self._compute_mi_redundancy_gpu(X_gpu2, used_cols2, dcor_scores or {}, threshold=float(getattr(self, 'mi_threshold', 0.3)))
+                    except Exception as eg:
+                        self._log_warn('GPU MI redundancy failed; using CPU fallback', error=str(eg))
+                        mi_selected = self._compute_mi_redundancy(df, vif_selected, dcor_scores or {}, mi_threshold=float(getattr(self, 'mi_threshold', 0.3)))
+            except Exception as e:
+                self._log_warn('MI stage failed; using VIF-selected set', error=str(e))
+                mi_selected = list(vif_selected)
+
+            # Stage 3: Embedded CatBoost
+            final_selected, importances, backend = self._stage3_selectfrommodel(df, df[target_col], mi_selected)
+
+            # Apply optional top-N cap
+            try:
+                top_n = int(getattr(self, 'stage3_top_n', 0))
+            except Exception:
+                top_n = 0
+            if top_n and top_n > 0 and final_selected:
+                # Sort by importance desc and keep top_n
+                ranked = sorted(final_selected, key=lambda f: float(importances.get(f, 0.0)), reverse=True)
+                final_selected = ranked[:top_n]
+
+            self._log_info('Selection pipeline completed',
+                           candidates=len(candidates), vif_selected=len(vif_selected), mi_selected=len(mi_selected), final_selected=len(final_selected))
+
+            return {
+                'stage2_vif_selected': vif_selected,
+                'stage2_mi_selected': mi_selected,
+                'stage3_final_selected': final_selected,
+                'importances': importances,
+                'selection_stats': {'backend_used': backend}
+            }
+        except Exception as e:
+            self._critical_error('Selection pipeline failed', error=str(e))
+            return {
                 'stage2_vif_selected': [],
                 'stage2_mi_selected': [],
                 'stage3_final_selected': [],
                 'importances': {},
-                'selection_stats': {}
+                'selection_stats': {'backend_used': 'error', 'error': str(e)}
             }
-            
-            if not candidates:
-                self._log_warn("No candidates provided for feature selection")
-                return results
-            
-            # Stage 2: VIF-based multicollinearity removal
-            self._log_info(f"VIF: Starting with {len(candidates)} candidates from feature selection")
-            X_matrix, used_cols = self._to_cupy_matrix(df, candidates)
-            if X_matrix.shape[1] == 0 or len(used_cols) == 0:
-                self._critical_error("to_cupy matrix failed; no usable numeric features for VIF", candidates=len(candidates))
-            
-            self._log_info(f"VIF: After GPU matrix conversion: {len(used_cols)} usable features out of {len(candidates)} candidates")
-            self._log_info(f"VIF: Complete list of features entering VIF processing: {used_cols}")
-            
-            # CRITICAL: Verify no data leakage - check for forbidden features
-            forbidden_features = []
-            for col in used_cols:
-                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
-                    forbidden_features.append(col)
-            
-            if forbidden_features:
-                self._critical_error(f"DATA LEAKAGE DETECTED: {len(forbidden_features)} forbidden features in VIF: {forbidden_features}")
-            else:
-                self._log_info(f"✓ LEAKAGE CHECK PASSED: No forbidden features found in {len(used_cols)} VIF candidates")
-            
-            vif_selected = self._compute_vif_iterative_gpu(X_matrix, used_cols, self.vif_threshold)
-            results['stage2_vif_selected'] = vif_selected
-            self._log_info("VIF selection completed", 
-                          original_candidates=len(candidates),
-                          usable_for_vif=len(used_cols),
-                          vif_selected=len(vif_selected))
-            
-            # Stage 2: MI-based redundancy removal
-            if len(results['stage2_vif_selected']) > 1:
-                try:
-                    # CRITICAL: Verify no data leakage in MI input
-                    mi_input_features = results['stage2_vif_selected']
-                    forbidden_in_mi = []
-                    for col in mi_input_features:
-                        if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
-                            forbidden_in_mi.append(col)
-                    
-                    if forbidden_in_mi:
-                        self._critical_error(f"DATA LEAKAGE DETECTED: {len(forbidden_in_mi)} forbidden features in MI: {forbidden_in_mi}")
-                    else:
-                        self._log_info(f"✓ MI LEAKAGE CHECK PASSED: No forbidden features in {len(mi_input_features)} MI candidates")
-                        self._log_info(f"MI: Complete list of features entering MI processing: {mi_input_features}")
-                    
-                    mi_selected = self._compute_mi_cluster_representatives(
-                        df, results['stage2_vif_selected'], dcor_scores or {}
-                    )
-                    results['stage2_mi_selected'] = mi_selected
-                    self._log_info("MI redundancy removal completed", original=len(results['stage2_vif_selected']), selected=len(mi_selected))
-                except Exception as e:
-                    self._critical_error("MI redundancy removal failed", error=str(e))
-            else:
-                results['stage2_mi_selected'] = results['stage2_vif_selected']
-            
-            # Stage 3: Embedded feature selection
-            if len(results['stage2_mi_selected']) > 1:
-                try:
-                    # If configured, compute full dataset for Stage 3 from the original Dask frame
-                    X_stage3_df = df
-                    try:
-                        use_full = bool(getattr(self, 'stage3_catboost_use_full_dataset', False))
-                    except Exception:
-                        use_full = False
-                    if use_full and full_ddf is not None:
-                        try:
-                            # Build minimal subset of columns to compute
-                            cols = [c for c in results['stage2_mi_selected'] if c in getattr(full_ddf, 'columns', [])]
-                            if target_col not in cols:
-                                cols = cols + [target_col]
-                            X_stage3_df = full_ddf[cols].compute()
-                            self._log_info("Stage 3 using full dataset for CatBoost", rows=len(X_stage3_df), cols=len(X_stage3_df.columns))
-                        except Exception as e:
-                            self._log_warn("Stage 3 full dataset compute failed; falling back to sample", error=str(e))
-                            X_stage3_df = df
-                    final_selected, importances, backend = self._stage3_selectfrommodel(
-                        X_stage3_df, X_stage3_df[target_col], results['stage2_mi_selected']
-                    )
-                    results['stage3_final_selected'] = final_selected
-                    results['importances'] = importances
-                    results['selection_stats']['backend_used'] = backend
-                    self._log_info("Embedded feature selection completed", original=len(results['stage2_mi_selected']), selected=len(final_selected), backend=backend)
-                except Exception as e:
-                    self._critical_error("Embedded feature selection failed", error=str(e))
-            else:
-                results['stage3_final_selected'] = results['stage2_mi_selected']
-                results['importances'] = {f: 1.0 for f in results['stage2_mi_selected']}
-                results['selection_stats']['backend_used'] = 'single_feature'
-            
-            # Compute selection statistics
-            results['selection_stats'].update({
-                'stage1_count': len(candidates),
-                'stage2_vif_count': len(results['stage2_vif_selected']),
-                'stage2_mi_count': len(results['stage2_mi_selected']),
-                'stage3_final_count': len(results['stage3_final_selected']),
-                'vif_removed': len(candidates) - len(results['stage2_vif_selected']),
-                'mi_removed': len(results['stage2_vif_selected']) - len(results['stage2_mi_selected']),
-                'embedded_removed': len(results['stage2_mi_selected']) - len(results['stage3_final_selected']),
-                'total_removed': len(candidates) - len(results['stage3_final_selected']),
-                'reduction_ratio': round(1.0 - len(results['stage3_final_selected']) / len(candidates), 3)
-            })
-            
-            # FINAL LEAKAGE CHECK: Verify final output has no forbidden features
-            final_features = results['stage3_final_selected']
-            forbidden_in_final = []
-            for col in final_features:
-                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
-                    forbidden_in_final.append(col)
-            
-            if forbidden_in_final:
-                self._critical_error(f"DATA LEAKAGE DETECTED IN FINAL OUTPUT: {len(forbidden_in_final)} forbidden features: {forbidden_in_final}")
-            else:
-                self._log_info(f"✓ FINAL LEAKAGE CHECK PASSED: No forbidden features in final {len(final_features)} selected features")
-                self._log_info(f"FINAL: Complete list of selected features: {final_features}")
-            
-            self._log_info("Feature selection pipeline completed", 
-                          final_count=len(results['stage3_final_selected']),
-                          reduction_ratio=results['selection_stats']['reduction_ratio'])
-            
-            return results
-            
-        except Exception as e:
-            self._critical_error(f"Error in feature selection pipeline: {e}")

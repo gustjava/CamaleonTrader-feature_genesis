@@ -189,9 +189,12 @@ features:
   stage3_importance_type: gain              # gain|split|weight (backend-dependent)
   stage3_importance_threshold: median       # 'median' or numeric value
   stage3_save_importances_format: json      # json|parquet
-  dcor_min_threshold: 0.05
+  # Stage 3 sampling/labels controls
+  stage3_stratified_sampling: true
+  stage3_classification_max_classes: 10
+  dcor_min_threshold: 0.5
   dcor_min_percentile: 0.0
-  stage1_top_n: 100
+  stage1_top_n: 80
   # Additional Stage 1 gating thresholds
   correlation_min_threshold: 0.0   # abs(Pearson) minimum; 0.0 disables
   pvalue_max_alpha: 1.0            # F-test p-value max; 1.0 disables

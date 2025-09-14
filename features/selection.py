@@ -79,18 +79,11 @@ def select_features_with_catboost(
     try:
         cat.fit(X_gpu, y_gpu)
     except Exception as gpu_err:
-        logger.warning(f"Falha no treino CatBoost GPU ({gpu_err}); tentando fallback CPU...")
-        # Fallback CPU: mover para pandas/NumPy
-        X_cpu = X.to_pandas()
-        y_cpu = y.to_pandas()
-        cat = CatBoostClassifier(
-            iterations=200,
-            learning_rate=0.05,
-            random_seed=42,
-            verbose=0,
-            task_type='CPU'
+        # CPU fallback explicitamente desabilitado neste projeto
+        logger.error(
+            f"CatBoost GPU training failed and CPU fallback is disabled: {gpu_err}"
         )
-        cat.fit(X_cpu, y_cpu)
+        raise
 
     # Extrair importâncias e ordenar
     feature_importances = cat.get_feature_importance()

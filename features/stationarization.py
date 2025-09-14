@@ -897,6 +897,7 @@ class StationarizationEngine(BaseFeatureEngine):
         def _deny(name: str) -> bool:
             return name.startswith('y_ret_fwd_') or any(name.startswith(p) for p in deny_prefixes)
         return_features = [c for c in raw_returns if not _deny(c)]
+        denied_returns = [c for c in raw_returns if _deny(c)]
         if 'y_ret_1m' in return_features:
             # Ensure y_ret_1m is first if present
             return_features = ['y_ret_1m'] + [c for c in return_features if c != 'y_ret_1m']
@@ -915,6 +916,10 @@ class StationarizationEngine(BaseFeatureEngine):
         max_lag = int(self.settings.features.frac_diff_max_lag)
         tol = float(self.settings.features.frac_diff_threshold)
 
+        # Audit containers
+        fd_audit_included: List[str] = []
+        fd_audit_skipped: Dict[str, str] = {}
+
         for col in target_cols:
             new_col = f"frac_diff_{col}"
             df[new_col] = df[col].map_partitions(
@@ -924,12 +929,60 @@ class StationarizationEngine(BaseFeatureEngine):
                 tol,
                 meta=(new_col, 'f4'),
             )
+            try:
+                fd_audit_included.append(new_col)
+            except Exception:
+                pass
         # Optionally drop original columns used for FFD
         try:
             if self._drop_after_fd:
                 keep = [c for c in target_cols if c in df.columns]
                 if keep:
                     df = df.drop(columns=keep)
+        except Exception:
+            pass
+
+        # Fill skipped with reasons (best-effort): not selected as primary, or denylisted
+        try:
+            # Candidates considered by heuristic: all price_features and return_features
+            considered = set(price_features + return_features)
+            selected_origins = set(target_cols)
+            for c in considered - selected_origins:
+                fd_audit_skipped[c] = 'not-selected-primary-input'
+            for c in denied_returns:
+                fd_audit_skipped[c] = 'denylist/dataset_target_prefix'
+        except Exception:
+            pass
+
+        # Write audit artifact for frac_diff coverage (best-effort)
+        try:
+            if bool(getattr(self.settings.features, 'debug_write_artifacts', True)):
+                # Determine currency pair if possible
+                ccy = None
+                try:
+                    head = df.head(1)
+                    if 'currency_pair' in head.columns and len(head) > 0:
+                        ccy = str(head.iloc[0]['currency_pair'])
+                except Exception:
+                    ccy = None
+                from pathlib import Path
+                out_root = Path(getattr(self.settings.output, 'output_path', './output'))
+                subdir = str(getattr(self.settings.features, 'artifacts_dir', 'artifacts'))
+                out_dir = (out_root / ccy / subdir / 'stationarization') if ccy else (out_root / subdir / 'stationarization')
+                out_dir.mkdir(parents=True, exist_ok=True)
+                import json as _json
+                audit_payload = {
+                    'stage': 'stationarization-fracdiff',
+                    'targets_considered': target_cols,
+                    'fracdiff_included': fd_audit_included,
+                    'fracdiff_skipped': fd_audit_skipped,
+                    'params': {
+                        'd_default': d_default,
+                        'max_lag': max_lag,
+                        'tol': tol,
+                    },
+                }
+                (out_dir / 'fracdiff_audit.json').write_text(_json.dumps(audit_payload, ensure_ascii=False, indent=2))
         except Exception:
             pass
         return df

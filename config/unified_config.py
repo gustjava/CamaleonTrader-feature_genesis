@@ -197,6 +197,9 @@ class FeatureConfig:
     stage3_importance_type: str = "gain"      # gain|split|weight (backend-dependent)
     stage3_importance_threshold: str = "median"  # 'median' or float as string
     stage3_save_importances_format: str = "json"  # json|parquet
+    # Stage 3 data sampling/labels
+    stage3_stratified_sampling: bool = True
+    stage3_classification_max_classes: int = 10
     # Stage 1 retention controls
     dcor_min_threshold: float = 0.0
     dcor_min_percentile: float = 0.0  # 0.0..1.0

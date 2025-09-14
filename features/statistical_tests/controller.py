@@ -165,6 +165,40 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage3_cv_min_train = int(getattr(uc.features, 'stage3_cv_min_train', 200))
             self.stage3_catboost_early_stopping_rounds = int(getattr(uc.features, 'stage3_catboost_early_stopping_rounds', self.stage3_lgbm_early_stopping_rounds))
             self.stage3_catboost_use_full_dataset = bool(getattr(uc.features, 'stage3_catboost_use_full_dataset', False))
+            # Additional Stage 3 knobs (not always present in dataclass; read via getattr)
+            self.stage3_importance_threshold = getattr(uc.features, 'stage3_importance_threshold', 'median')
+            self.stage3_stratified_sampling = bool(getattr(uc.features, 'stage3_stratified_sampling', True))
+            self.stage3_classification_max_classes = int(getattr(uc.features, 'stage3_classification_max_classes', 10))
+
+            # CPCV controls
+            self.cpcv_enabled = bool(getattr(uc.features, 'cpcv_enabled', True))
+            self.cpcv_n_groups = int(getattr(uc.features, 'cpcv_n_groups', 6))
+            self.cpcv_k_leave_out = int(getattr(uc.features, 'cpcv_k_leave_out', 2))
+            self.cpcv_purge = int(getattr(uc.features, 'cpcv_purge', 0))
+            self.cpcv_embargo = int(getattr(uc.features, 'cpcv_embargo', 0))
+
+            # Propagate key Stage 3 and CPCV configs to FeatureSelection instance
+            try:
+                fs = self.feature_selection
+                for _name in [
+                    'selection_max_rows',
+                    'stage3_task', 'stage3_random_state',
+                    'stage3_catboost_iterations', 'stage3_catboost_learning_rate', 'stage3_catboost_depth',
+                    'stage3_catboost_devices', 'stage3_catboost_task_type', 'stage3_catboost_thread_count',
+                    'stage3_catboost_loss_regression', 'stage3_catboost_use_full_dataset',
+                    'stage3_cv_splits', 'stage3_cv_min_train', 'stage3_catboost_early_stopping_rounds',
+                    'stage3_importance_threshold', 'stage3_stratified_sampling', 'stage3_classification_max_classes',
+                    'cpcv_enabled', 'cpcv_n_groups', 'cpcv_k_leave_out', 'cpcv_purge', 'cpcv_embargo',
+                    # GPU policy flags
+                    'force_gpu_usage', 'gpu_fallback_enabled',
+                ]:
+                    try:
+                        setattr(fs, _name, getattr(self, _name))
+                    except Exception:
+                        pass
+            except Exception:
+                # Best-effort propagation only
+                pass
             
             # MI clustering params (Stage 2 scalable)
             self.mi_cluster_enabled = bool(getattr(uc.features, 'mi_cluster_enabled', True))

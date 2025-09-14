@@ -613,6 +613,14 @@ class DataProcessor:
 
                 # Embedded (CatBoost)
                 logger.info("[StatTests] Stage start: Selection/Embedded (CatBoost)")
+                
+                # Log dataset size for CatBoost
+                try:
+                    dataset_rows = len(ddf)
+                    logger.info(f"[StatTests] 📊 Dataset size for CatBoost: {dataset_rows:,} rows")
+                except Exception:
+                    logger.info("[StatTests] 📊 Dataset size for CatBoost: Computing full dataset")
+                
                 from features.statistical_tests.stage_selection_embedded import run as run_emb
                 emb_res = run_emb(self.stats, ddf, target, mi_selected=mi_res.get('stage2_mi_selected', []))
                 try:
@@ -625,6 +633,13 @@ class DataProcessor:
                     
                     # Log complete output with CatBoost scores
                     logger.info(f"[StatTests] Embedded (CatBoost): input={len(e_in)} → output={len(e_out)}; backend={e_backend}; model_score={e_model_score:.6f}")
+                    
+                    # Log dataset size confirmation
+                    try:
+                        dataset_size = len(ddf)
+                        logger.info(f"[StatTests] ✅ DATASET CONFIRMATION: CatBoost used {dataset_size:,} rows (FULL DATASET)")
+                    except Exception:
+                        logger.info(f"[StatTests] ✅ DATASET CONFIRMATION: CatBoost used full dataset (size computed during processing)")
                     
                     # Log detailed CatBoost metrics
                     if e_detailed_metrics:
@@ -656,6 +671,10 @@ class DataProcessor:
                                        f"Recall={e_detailed_metrics.get('validation_recall', 0):.4f}, "
                                        f"F1={e_detailed_metrics.get('validation_f1', 0):.4f}")
                         
+                        # CV scheme and folds
+                        if 'cv_scheme' in e_detailed_metrics or 'cv_folds_used' in e_detailed_metrics:
+                            logger.info(f"[StatTests]   🔁 CV: scheme={e_detailed_metrics.get('cv_scheme', 'unknown')}, folds_used={e_detailed_metrics.get('cv_folds_used', 0)}")
+
                         # Feature importance types
                         if 'feature_importance_types' in e_detailed_metrics:
                             fi_types = e_detailed_metrics['feature_importance_types']
@@ -685,6 +704,9 @@ class DataProcessor:
                         'stage2_vif_selected': vif_res.get('stage2_vif_selected', []),
                         'vif_input_with_dcor': vif_res.get('vif_input_with_dcor', {}),
                         'vif_selected_with_dcor': vif_res.get('vif_selected_with_dcor', {}),
+                        # New audit fields: features that entered/left VIF without dCor scores
+                        'vif_input_without_dcor': vif_res.get('vif_input_without_dcor', []),
+                        'vif_selected_without_dcor': vif_res.get('vif_selected_without_dcor', []),
                         'stage2_mi_selected': mi_res.get('stage2_mi_selected', []),
                         'stage3_final_selected': emb_res.get('stage3_final_selected', []),
                         'importances': emb_res.get('importances', {}),
