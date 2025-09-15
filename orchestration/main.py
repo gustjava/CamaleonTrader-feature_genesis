@@ -200,8 +200,11 @@ class DaskClusterManager:
 
             try:
                 free_b, total_b = cp.cuda.runtime.memGetInfo()
+                free_gb = free_b / (1024 ** 3)
                 total_gb = total_b / (1024 ** 3)
             except Exception:
+                # Conservative defaults if we cannot query memory
+                free_gb = 4.0
                 total_gb = 8.0
 
             pool_frac = float(getattr(self.config.dask, 'rmm_pool_fraction', 0.0) or 0.0)
@@ -222,10 +225,22 @@ class DaskClusterManager:
                 cap_gb = max(0.25, total_gb * max_frac)
             else:
                 cap_gb = max(0.25, total_gb * 0.60)
-            safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb))
-            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb))
+
+            # New: also cap by currently free memory with headroom to avoid init failures
+            free_headroom = 0.85  # keep some free space for context/UCX/cublas etc.
+            max_pool_by_free = max(0.25, free_gb * free_headroom)
+            safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb, max_pool_by_free))
+
+            # Initial pool should be smaller; also obey free memory headroom (tighter bound)
+            max_init_by_free = max(0.25, free_gb * 0.50)
+            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb * 0.90, max_init_by_free))
+
+            # Ensure initial does not exceed pool size
+            if safe_init_gb > safe_pool_gb:
+                safe_init_gb = max(0.25, min(safe_pool_gb * 0.90, max_init_by_free))
 
             self._safe_rmm_pool_size_str = f"{safe_pool_gb:.2f}GB"
+            self._safe_rmm_initial_pool_size_str = f"{safe_init_gb:.2f}GB"
 
             # Compute initial pool size (bytes) and align to 256-byte boundary as required by RMM
             bytes_per_gb = 1024 ** 3
@@ -253,7 +268,7 @@ class DaskClusterManager:
                 )
                 logger.info(
                     f"RMM configured (pool): initial={initial_pool_size/bytes_per_gb:.2f}GB, "
-                    f"pool={safe_pool_gb:.2f}GB, cap={cap_gb:.2f}GB, total={total_gb:.2f}GB"
+                    f"pool={safe_pool_gb:.2f}GB, cap={cap_gb:.2f}GB, total={total_gb:.2f}GB, free={free_gb:.2f}GB"
                 )
             except Exception as e_pool:
                 logger.warning(f"RMM pool init failed; falling back to default CUDA allocator: {e_pool}")

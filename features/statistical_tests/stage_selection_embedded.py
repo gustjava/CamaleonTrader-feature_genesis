@@ -72,9 +72,9 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
         result = stats_engine.feature_selection._stage3_selectfrommodel(
             sample_df, sample_df[target], mi_selected
         )
-        # Unpack results with backward compatibility (3, 4, or 5 items)
+                # Unpack the selection result (handles various tuple lengths for compatibility)
         if isinstance(result, (list, tuple)):
-            if len(result) >= 5:
+            if len(result) == 5:
                 final_selected, importances, backend, model_score, detailed_metrics = result
             elif len(result) == 4:
                 final_selected, importances, backend, model_score = result
@@ -99,6 +99,28 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
                   input_count=len(mi_selected), 
                   output_count=len(final_selected),
                   threshold_used=stats_engine.feature_selection._parse_importance_threshold('median', list(importances.values())))
+
+        # Emit CatBoost detailed metrics if available (flatten small dictionaries for readability)
+        if isinstance(detailed_metrics, dict) and detailed_metrics:
+            try:
+                # Limit payload size to avoid flooding logs
+                light_metrics = {}
+                for k, v in list(detailed_metrics.items()):
+                    if isinstance(v, dict):
+                        # keep a shallow copy; truncate long sequences
+                        trunc = {}
+                        for mk, mv in list(v.items()):
+                            if isinstance(mv, (list, tuple)):
+                                trunc[mk] = mv[-1] if len(mv) > 0 else None
+                            else:
+                                trunc[mk] = mv
+                        light_metrics[k] = trunc
+                    else:
+                        light_metrics[k] = v
+                stats_engine._log_info("[Embedded] CatBoost detailed metrics", **light_metrics)
+            except Exception:
+                # Best-effort: ignore logging issues
+                pass
         
         # Log all winning features with their importance scores
         if final_selected and importances:
@@ -115,12 +137,13 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, mi_selected: Option
                                   all_features=[f"{name}:{score:.6f}" for name, score in all_features])
         
     except Exception as e:
-        stats_engine._log_error("[Embedded] Selection failed; passing through MI set", error=str(e))
+        import traceback as _tb
+        stats_engine._log_error("[Embedded] Selection failed; passing through MI set", error=str(e), traceback=_tb.format_exc())
         final_selected = list(mi_selected)
         importances = {f: 1.0 for f in mi_selected}
         backend = 'error'
         model_score = 0.0
-        detailed_metrics = {'error': str(e)}
+        detailed_metrics = {'error': str(e), 'traceback': _tb.format_exc()}
 
     stats_engine._log_info(
         "[Embedded] Stage end",

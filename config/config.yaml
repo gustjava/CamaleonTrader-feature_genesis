@@ -49,9 +49,10 @@ dask:
   rmm_initial_pool_size: "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
   rmm_maximum_pool_size: "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
   # Pool proporcional de memória na GPU (ativado)
-  rmm_pool_fraction: 0.40
-  rmm_initial_pool_fraction: 0.30
-  rmm_maximum_pool_fraction: 0.50
+  # Use conservative defaults to avoid pool init failures when free memory is low
+  rmm_pool_fraction: 0.30
+  rmm_initial_pool_fraction: 0.20
+  rmm_maximum_pool_fraction: 0.45
   spilling_enabled: true  # Habilita spill para RAM quando GPU fica cheia
   spilling_target: 0.9  # Alvo de utilização antes do spill
   spilling_max_spill: "32GB"  # Máximo de spill permitido
@@ -401,10 +402,10 @@ features:
   mi_max_candidates: 400
   mi_chunk_size: 128
   cpcv_enabled: true
-  cpcv_n_groups: 6
+  cpcv_n_groups: 10
   cpcv_k_leave_out: 2
-  cpcv_purge: 0
-  cpcv_embargo: 0
+  cpcv_purge: 50       # ~1 hora de purge para evitar leakage
+  cpcv_embargo: 100    # ~2 horas de embargo temporal
   # Stage 4 stability selection
   stage4_enabled: true
   stage4_n_bootstrap: 30
