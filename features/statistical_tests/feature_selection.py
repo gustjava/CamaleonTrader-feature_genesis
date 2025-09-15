@@ -462,6 +462,13 @@ class FeatureSelection:
 
         Returns: (selected_features, importances_map, backend_used, model_score, detailed_metrics)
         """
+        
+        # FORÇA LOGGING PARA DEBUG - SEMPRE APARECER
+        print(f"🚀 [FORCE DEBUG] _stage3_selectfrommodel START - candidates: {len(candidates)}, X_df shape: {X_df.shape}")
+        print(f"🔧 [FORCE DEBUG] y_series shape: {y_series.shape}, dtype: {y_series.dtype}")
+        import sys
+        sys.stdout.flush()
+        
         backend_used = 'catboost'
 
         # Resolve task type
@@ -615,19 +622,65 @@ class FeatureSelection:
 
         def _fit_eval(X_fit, y_fit, tr_idx=None, va_idx=None):
             feat_names = list(candidates)
-            if tr_idx is not None and va_idx is not None and esr > 0:
-                train_pool = _Pool(X_fit[tr_idx], y_fit[tr_idx], feature_names=feat_names)
-                valid_pool = _Pool(X_fit[va_idx], y_fit[va_idx], feature_names=feat_names)
-                model.fit(train_pool, eval_set=[valid_pool], use_best_model=True, od_type='Iter', od_wait=esr)
-                pred_tr = model.predict(train_pool)
-                pred_va = model.predict(valid_pool)
-                ytr, yva = y_fit[tr_idx], y_fit[va_idx]
-            else:
-                train_pool = _Pool(X_fit, y_fit, feature_names=feat_names)
-                model.fit(train_pool)
-                pred_tr = model.predict(train_pool)
-                ytr = y_fit
-                pred_va, yva = None, None
+            try:
+                if tr_idx is not None and va_idx is not None:
+                    train_pool = _Pool(X_fit[tr_idx], y_fit[tr_idx], feature_names=feat_names)
+                    valid_pool = _Pool(X_fit[va_idx], y_fit[va_idx], feature_names=feat_names)
+                    fit_kwargs = {'eval_set': [valid_pool]}
+                    if esr > 0:
+                        fit_kwargs.update({'use_best_model': True, 'early_stopping_rounds': esr})
+                    try:
+                        print(f"🔥 [TERMINAL DEBUG] CatBoost fit START - train_pool: {train_pool}, fit_kwargs: {fit_kwargs}")
+                        sys.stdout.flush()
+                        self._log_info('CatBoost fit start (with validation)', train_size=len(tr_idx), valid_size=len(va_idx))
+                        model.fit(train_pool, **fit_kwargs)
+                        print(f"✅ [TERMINAL DEBUG] CatBoost fit SUCCESS")
+                        sys.stdout.flush()
+                        self._log_info('CatBoost fit successful (with validation)')
+                    except Exception as fit_err:
+                        print(f"❌ [TERMINAL DEBUG] CatBoost fit FAILED: {fit_err}")
+                        sys.stdout.flush()
+                        # Log detailed traceback and re-raise
+                        tb = _tb.format_exc()
+                        print(f"📜 [TERMINAL DEBUG] Full traceback:\n{tb}")
+                        sys.stdout.flush()
+                        self._log_error('CatBoost fit failed (with validation)', error=str(fit_err), traceback=tb)
+                        # Return safe fallback values to prevent pipeline crash
+                        fi = np.ones(len(candidates), dtype=float)  # Uniform importances indicate failure
+                        return fi, 0.0, {'error': str(fit_err), 'traceback': tb}
+                    
+                    try:
+                        pred_tr = model.predict(train_pool)
+                        pred_va = model.predict(valid_pool)
+                        ytr, yva = y_fit[tr_idx], y_fit[va_idx]
+                    except Exception as pred_err:
+                        self._log_error('CatBoost predict failed', error=str(pred_err))
+                        fi = np.ones(len(candidates), dtype=float)
+                        return fi, 0.0, {'error': f'predict failed: {pred_err}'}
+                else:
+                    train_pool = _Pool(X_fit, y_fit, feature_names=feat_names)
+                    try:
+                        self._log_info('CatBoost fit start (no validation)', train_size=len(X_fit))
+                        model.fit(train_pool)
+                        self._log_info('CatBoost fit successful (no validation)')
+                    except Exception as fit_err:
+                        tb = _tb.format_exc()
+                        self._log_error('CatBoost fit failed (no validation)', error=str(fit_err), traceback=tb)
+                        fi = np.ones(len(candidates), dtype=float)
+                        return fi, 0.0, {'error': str(fit_err), 'traceback': tb}
+                    
+                    try:
+                        pred_tr = model.predict(train_pool)
+                        ytr = y_fit
+                        pred_va, yva = None, None
+                    except Exception as pred_err:
+                        self._log_error('CatBoost predict failed (no validation)', error=str(pred_err))
+                        fi = np.ones(len(candidates), dtype=float)
+                        return fi, 0.0, {'error': f'predict failed: {pred_err}'}
+            except Exception as pool_err:
+                self._log_error('CatBoost Pool creation failed', error=str(pool_err), traceback=_tb.format_exc())
+                fi = np.ones(len(candidates), dtype=float)
+                return fi, 0.0, {'error': f'pool creation failed: {pool_err}'}
 
             metrics = {}
             if task == 'classification':
@@ -659,13 +712,77 @@ class FeatureSelection:
                 else:
                     score = metrics['training_r2']
 
-            # Feature importance
+            # Feature importance: always specify a valid type and provide data when possible
+            print(f"🎯 [TERMINAL DEBUG] Getting feature importance from trained model...")
+            sys.stdout.flush()
+            fi = None
+            _fi_errors = []
             try:
-                fi = model.get_feature_importance(type='PredictionValuesChange')
-            except Exception:
+                print(f"🔍 [TERMINAL DEBUG] Trying PredictionValuesChange with data...")
+                sys.stdout.flush()
+                fi = model.get_feature_importance(data=train_pool, type='PredictionValuesChange')
+                print(f"✅ [TERMINAL DEBUG] PredictionValuesChange SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
+                sys.stdout.flush()
+            except Exception as _e1:
+                print(f"❌ [TERMINAL DEBUG] PredictionValuesChange FAILED: {_e1}")
+                sys.stdout.flush()
+                _fi_errors.append(str(_e1))
                 try:
-                    fi = model.get_feature_importance()
-                except Exception:
+                    print(f"🔍 [TERMINAL DEBUG] Trying FeatureImportance with data...")
+                    sys.stdout.flush()
+                    fi = model.get_feature_importance(data=train_pool, type='FeatureImportance')
+                    print(f"✅ [TERMINAL DEBUG] FeatureImportance with data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
+                    sys.stdout.flush()
+                except Exception as _e2:
+                    print(f"❌ [TERMINAL DEBUG] FeatureImportance with data FAILED: {_e2}")
+                    sys.stdout.flush()
+                    _fi_errors.append(str(_e2))
+                    try:
+                        print(f"🔍 [TERMINAL DEBUG] Trying FeatureImportance without data...")
+                        sys.stdout.flush()
+                        fi = model.get_feature_importance(type='FeatureImportance')
+                        print(f"✅ [TERMINAL DEBUG] FeatureImportance no data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
+                        sys.stdout.flush()
+                    except Exception as _e3:
+                        print(f"❌ [TERMINAL DEBUG] FeatureImportance no data FAILED: {_e3}")
+                        sys.stdout.flush()
+                        _fi_errors.append(str(_e3))
+                        try:
+                            print(f"🔍 [TERMINAL DEBUG] Trying PredictionValuesChange without data...")
+                            sys.stdout.flush()
+                            fi = model.get_feature_importance(type='PredictionValuesChange')
+                            print(f"✅ [TERMINAL DEBUG] PredictionValuesChange no data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
+                            sys.stdout.flush()
+                        except Exception as _e4:
+                            print(f"❌ [TERMINAL DEBUG] PredictionValuesChange no data FAILED: {_e4}")
+                            sys.stdout.flush()
+                            _fi_errors.append(str(_e4))
+                            fi = None
+            if fi is None:
+                print(f"🚨 [TERMINAL DEBUG] ALL feature importance methods FAILED - returning zeros")
+                sys.stdout.flush()
+                # As a last resort, produce zeros and log
+                self._log_warn('CatBoost get_feature_importance failed; returning zeros', errors=_fi_errors[:3])
+                fi = np.zeros(len(candidates), dtype=float)
+            else:
+                print(f"🎊 [TERMINAL DEBUG] Feature importance obtained successfully - unique values: {len(np.unique(fi))}")
+                sys.stdout.flush()
+                # Ensure correct length; if mismatch, fallback to zeros to keep pipeline stable
+                try:
+                    fi = np.asarray(fi, dtype=float)
+                    if fi.shape[0] != len(candidates):
+                        self._log_warn('Feature importance length mismatch; normalizing', fi_len=int(fi.shape[0]), n_features=int(len(candidates)))
+                        if fi.shape[0] > 0:
+                            # Try to trim or pad
+                            if fi.shape[0] > len(candidates):
+                                fi = fi[:len(candidates)]
+                            else:
+                                pad = np.zeros(len(candidates) - fi.shape[0], dtype=float)
+                                fi = np.concatenate([fi, pad])
+                        else:
+                            fi = np.zeros(len(candidates), dtype=float)
+                except Exception as _e5:
+                    self._log_warn('Failed to process feature importances; returning zeros', error=str(_e5))
                     fi = np.zeros(len(candidates), dtype=float)
 
             # Model info (log only)
@@ -787,6 +904,32 @@ class FeatureSelection:
                     'task_type': task_type,
                     'depth': int(depth if depth > 0 else 6),
                 }
+        # Check if any errors occurred during training
+        has_errors = False
+        error_messages = []
+        
+        # Check for errors in aggregated metrics
+        if agg_metrics:
+            for m in agg_metrics:
+                if isinstance(m, dict) and 'error' in m:
+                    has_errors = True
+                    error_messages.append(m.get('error', 'unknown error'))
+        
+        # Check if all importances are uniform (indicates failure)
+        if agg_fi is not None:
+            fi_array = np.asarray(agg_fi, dtype=float)
+            if fi_array.size > 1:
+                # Check if all values are identical (uniform)
+                if np.allclose(fi_array, fi_array[0], rtol=1e-10):
+                    has_errors = True
+                    error_messages.append('uniform feature importances detected')
+        
+        # Update backend status based on error detection
+        if has_errors:
+            backend_used = 'error'
+            final_metrics['catboost_errors'] = error_messages
+            self._log_error('CatBoost training had errors', errors=error_messages)
+        
         # Record FI type used for transparency
         final_metrics.setdefault('feature_importance_types', ['PredictionValuesChange'])
 
@@ -800,7 +943,7 @@ class FeatureSelection:
         self._log_info('CatBoost feature selection completed',
                        task=task, selected=len(selected), threshold=float(round(threshold, 6)),
                        model_score=float(round(model_score, 6)), cv_splits_used=int(used_splits),
-                       cv_scheme=final_metrics.get('cv_scheme', 'unknown'))
+                       cv_scheme=final_metrics.get('cv_scheme', 'unknown'), backend=backend_used)
         if final_metrics:
             self._log_info('CatBoost detailed metrics', **final_metrics)
 
@@ -853,7 +996,9 @@ class FeatureSelection:
                 mi_selected = list(vif_selected)
 
             # Stage 3: Embedded CatBoost
-            final_selected, importances, backend = self._stage3_selectfrommodel(df, df[target_col], mi_selected)
+            final_selected, importances, backend, model_score, detailed_metrics = self._stage3_selectfrommodel(
+                df, df[target_col], mi_selected
+            )
 
             # Apply optional top-N cap
             try:
@@ -868,12 +1013,20 @@ class FeatureSelection:
             self._log_info('Selection pipeline completed',
                            candidates=len(candidates), vif_selected=len(vif_selected), mi_selected=len(mi_selected), final_selected=len(final_selected))
 
+            # Merge selection stats with detailed metrics
+            sel_stats = {'backend_used': backend, 'model_score': float(model_score)}
+            try:
+                if isinstance(detailed_metrics, dict):
+                    sel_stats.update(detailed_metrics)
+            except Exception:
+                pass
+
             return {
                 'stage2_vif_selected': vif_selected,
                 'stage2_mi_selected': mi_selected,
                 'stage3_final_selected': final_selected,
                 'importances': importances,
-                'selection_stats': {'backend_used': backend}
+                'selection_stats': sel_stats,
             }
         except Exception as e:
             self._critical_error('Selection pipeline failed', error=str(e))
