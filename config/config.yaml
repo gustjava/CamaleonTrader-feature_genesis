@@ -418,7 +418,7 @@ features:
   # Stage 1: GPU-direct sampling (avoid pandas on driver)
   stage1_gpu_direct: true
   # MI GPU redundancy (Stage 2) - GPU only
-  mi_threshold: 0.2              # Lower threshold for more aggressive redundancy removal (was 0.3)
+  mi_threshold: 0.1              # Lower threshold for more aggressive redundancy removal
   mi_bins: 32                    # Number of bins for MI histogram (default: 64, try 32 for more sensitivity)
   mi_chunk_size: 32              # Chunk size for MI computation (default: 64, try 32 for better memory usage)
   mi_min_samples: 5              # Minimum samples required for MI computation (default: 10)

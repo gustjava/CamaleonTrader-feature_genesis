@@ -54,8 +54,8 @@ class FinalModelTrainer:
         raise RuntimeError(f"FinalModel Critical Error: {message}")
 
     def build_and_evaluate_final_model(self, 
-                                     X_df: cudf.DataFrame, 
-                                     y_series: cudf.Series, 
+                                     X_df,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
+                                     y_series,  # Accept both cudf.Series and dask_cudf.Series
                                      selected_features: List[str], 
                                      feature_importances: Dict[str, float],
                                      selection_metadata: Dict[str, Any],
@@ -76,6 +76,16 @@ class FinalModelTrainer:
         Returns:
             Dictionary with model results and metadata
         """
+        
+        # Check if we need to convert dask_cudf to cudf
+        is_dask = hasattr(X_df, 'compute') and not hasattr(X_df, 'to_arrow')
+        if is_dask:
+            self._log_info('Converting dask_cudf to cudf for final model training...')
+            X_df = X_df.compute()
+            y_series = y_series.compute()
+            self._log_info('Conversion completed', 
+                          samples=len(X_df),
+                          features=len(X_df.columns))
         
         self._log_info('Starting final model training', 
                        symbol=symbol, 

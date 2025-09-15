@@ -530,8 +530,31 @@ class FeatureSelection:
             mask = (Pxy > 0) & (denom > 0)
             I = float(cp.sum(Pxy[mask] * cp.log(Pxy[mask] / denom[mask])).item())
             nmi = I / max(Hx, Hy, 1e-12)
-            return float(max(0.0, min(1.0, nmi)))
-        except Exception:
+            result = float(max(0.0, min(1.0, nmi)))
+            
+            # Debug logging for first few calls
+            if not hasattr(self, '_mi_debug_count'):
+                self._mi_debug_count = 0
+            if self._mi_debug_count < 5:
+                self._log_info("MI GPU debug", 
+                              sample_size=x.size,
+                              x_range=f"{x_min:.4f}-{x_max:.4f}",
+                              y_range=f"{y_min:.4f}-{y_max:.4f}",
+                              bins=bins,
+                              Hx=round(Hx, 4),
+                              Hy=round(Hy, 4),
+                              I=round(I, 4),
+                              nmi=round(nmi, 4),
+                              result=round(result, 4))
+                self._mi_debug_count += 1
+            
+            return result
+        except Exception as e:
+            if not hasattr(self, '_mi_error_count'):
+                self._mi_error_count = 0
+            if self._mi_error_count < 3:
+                self._log_error("MI GPU computation error", error=str(e))
+                self._mi_error_count += 1
             return 0.0
 
     def _compute_mi_redundancy_gpu(self, X: cp.ndarray, features: List[str], dcor_scores: Dict[str, float], threshold: float, bins: int = 64, chunk: int = 64, min_samples: int = 10) -> List[str]:
@@ -542,10 +565,24 @@ class FeatureSelection:
         p = len(features)
         if p < 2:  # Need at least 2 features for redundancy analysis
             return list(features)
+        
+        self._log_info("MI GPU redundancy start", 
+                      features_count=p, 
+                      threshold=threshold, 
+                      bins=bins, 
+                      chunk_size=chunk, 
+                      min_samples=min_samples)
+        
         keep = set(features)  # Start with all features
         order = list(range(p))  # Feature order
         # Pre-extract columns to speed up access
         cols = [X[:, i] for i in range(p)]
+        
+        # Debug: Log some sample MI values
+        sample_mi_values = []
+        pairs_checked = 0
+        redundant_pairs = 0
+        
         # Iterate in blocks to bound memory usage
         for i0 in range(0, p, chunk):  # Process features in chunks
             i1 = min(i0 + chunk, p)
@@ -557,8 +594,16 @@ class FeatureSelection:
                     if features[j] not in keep:  # Skip if already removed
                         continue
                     xj = cols[j]  # Comparison feature
+                    pairs_checked += 1
+                    
                     nmi = self._mi_nmi_gpu(xi, xj, bins=bins, min_samples=min_samples)  # Compute normalized mutual information
+                    
+                    # Collect sample MI values for debugging
+                    if pairs_checked <= 10:
+                        sample_mi_values.append(nmi)
+                    
                     if nmi >= float(threshold):  # If MI above threshold, features are redundant
+                        redundant_pairs += 1
                         fi = features[i]
                         fj = features[j]
                         # Choose by Stage 1 dCor, fallback to keep first
@@ -570,6 +615,16 @@ class FeatureSelection:
                             if fi in keep:
                                 keep.remove(fi)  # Remove feature with lower dCor
                                 self._log_info("MI redundancy (GPU)", pair=f"{fi},{fj}", kept=fj, removed=fi, nmi=round(float(nmi), 4))
+        
+        # Log summary statistics
+        self._log_info("MI GPU redundancy summary", 
+                      pairs_checked=pairs_checked,
+                      redundant_pairs=redundant_pairs,
+                      sample_mi_values=[round(v, 4) for v in sample_mi_values],
+                      max_mi=max(sample_mi_values) if sample_mi_values else 0.0,
+                      min_mi=min(sample_mi_values) if sample_mi_values else 0.0,
+                      features_removed=len(features) - len(keep))
+        
         # Preserve original order
         kept_ordered = [f for f in features if f in keep]  # Return features in original order
         return kept_ordered

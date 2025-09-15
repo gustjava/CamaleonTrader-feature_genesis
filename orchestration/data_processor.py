@@ -734,15 +734,56 @@ class DataProcessor:
                         # Build and evaluate final model with selected features
                         try:
                             logger.info("[FinalModel] 🚀 Building final CatBoost model with selected features...")
-                            self._build_final_model(
-                                full_gdf=full_gdf,
-                                target_col=target_col,
-                                selected_features=final_features,
-                                feature_importances=combined.get('importances', {}),
-                                selection_metadata=combined.get('selection_stats', {}),
-                                symbol=getattr(self, 'current_currency_pair', 'unknown'),
-                                timeframe=getattr(self, 'current_timeframe', 'unknown')
+                            
+                            from catboost import CatBoostRegressor, Pool
+                            from sklearn.model_selection import train_test_split
+                            from sklearn.metrics import mean_squared_error
+                            
+    # Convert to cudf if necessary
+    if hasattr(ddf, 'compute'):
+        full_gdf = ddf.compute()
+    else:
+        full_gdf = ddf
+    
+    X = full_gdf[final_features]
+    y = full_gdf[target]
+    
+    # Clean data - remove NaN values
+    logger.info(f"[FinalModel] Data shape before cleaning: X={X.shape}, y={y.shape}")
+    logger.info(f"[FinalModel] NaN count in X: {X.isnull().sum().sum()}, NaN count in y: {y.isnull().sum()}")
+    
+    # Remove rows with NaN values
+    mask = ~(X.isnull().any(axis=1) | y.isnull())
+    X_clean = X[mask]
+    y_clean = y[mask]
+    
+    logger.info(f"[FinalModel] Data shape after cleaning: X={X_clean.shape}, y={y_clean.shape}")
+    
+    if len(X_clean) == 0:
+        logger.error("[FinalModel] No valid data after cleaning NaN values!")
+        return
+    
+    # Simple CatBoost training based on test_catboost_simple.py
+    X_train, X_test, y_train, y_test = train_test_split(X_clean.to_pandas(), y_clean.to_pandas(), test_size=0.2)
+                            train_pool = Pool(X_train, y_train)
+                            model = CatBoostRegressor(
+                                iterations=1000,
+                                learning_rate=0.03,
+                                depth=6,
+                                task_type='GPU',
+                                verbose=200
                             )
+                            model.fit(train_pool)
+                            y_pred = model.predict(X_test)
+                            mse = mean_squared_error(y_test, y_pred)
+                            importances = model.get_feature_importance(train_pool)
+                            
+                            logger.info(f"[FinalModel] Model trained successfully! MSE: {mse}")
+                            logger.info(f"[FinalModel] Feature importances: {importances}")
+                            
+                            # Save or upload model as needed
+                            model.save_model(f"{symbol}_{timeframe}_model.cbm")
+                            
                         except Exception as e:
                             logger.error(f"[FinalModel] Failed to build final model: {e}")
                             logger.error(f"[FinalModel] Error details: {traceback.format_exc()}")
@@ -999,7 +1040,7 @@ def _noop_ctx():
             return False
 
     def _build_final_model(self, 
-                          full_gdf: cudf.DataFrame,
+                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
                           target_col: str,
                           selected_features: list,
                           feature_importances: dict,
@@ -1030,8 +1071,8 @@ def _noop_ctx():
             
             # Build and evaluate the final model
             final_results = final_model_trainer.build_and_evaluate_final_model(
-                data=full_gdf,
-                target_column=target_col,
+                X_df=full_gdf,
+                y_series=full_gdf[target_col],
                 selected_features=selected_features,
                 feature_importances=feature_importances,
                 selection_metadata=selection_metadata,
@@ -1745,6 +1786,150 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
         except Exception as e:
             logger.error(f"Error registering task failure for {currency_pair}: {e}")
 
+    def _build_final_model(self, 
+                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
+                          target_col: str,
+                          selected_features: list,
+                          feature_importances: dict,
+                          selection_metadata: dict,
+                          symbol: str,
+                          timeframe: str):
+        """Build and evaluate the final CatBoost model with selected features."""
+        import traceback
+        try:
+            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
+
+            # Initialize the final model trainer
+            final_model_trainer = FinalModelTrainer(
+                config=self.settings,
+                logger_instance=logger
+            )
+
+            # Verify target column exists
+            if target_col not in full_gdf.columns:
+                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
+                return
+
+            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
+            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
+            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
+
+            # Build and evaluate the final model
+            final_results = final_model_trainer.build_and_evaluate_final_model(
+                X_df=full_gdf,
+                y_series=full_gdf[target_col],
+                selected_features=selected_features,
+                feature_importances=feature_importances,
+                selection_metadata=selection_metadata,
+                symbol=symbol,
+                timeframe=timeframe
+            )
+
+            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
+            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
+
+            # Log R2 upload status
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 successfully")
+            else:
+                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped")
+
+            # Log feature importances summary
+            if feature_importances:
+                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
+                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+                for i, (feature, importance) in enumerate(sorted_features, 1):
+                    logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
+
+            # Log query commands for easy access
+            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
+            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
+
+            # Log R2 management commands
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
+                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
+
+            # Store results for potential later use
+            self._last_final_model_results = final_results
+
+        except Exception as e:
+            logger.error(f"[FinalModel] Failed to build final model: {e}")
+            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
+            raise
+
+    def _build_final_model(self, 
+                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
+                          target_col: str,
+                          selected_features: list,
+                          feature_importances: dict,
+                          selection_metadata: dict,
+                          symbol: str,
+                          timeframe: str):
+        """Build and evaluate the final CatBoost model with selected features."""
+        import traceback
+        try:
+            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
+
+            # Initialize the final model trainer
+            final_model_trainer = FinalModelTrainer(
+                config=self.settings,
+                logger_instance=logger
+            )
+
+            # Verify target column exists
+            if target_col not in full_gdf.columns:
+                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
+                return
+
+            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
+            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
+            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
+
+            # Build and evaluate the final model
+            final_results = final_model_trainer.build_and_evaluate_final_model(
+                X_df=full_gdf,
+                y_series=full_gdf[target_col],
+                selected_features=selected_features,
+                feature_importances=feature_importances,
+                selection_metadata=selection_metadata,
+                symbol=symbol,
+                timeframe=timeframe
+            )
+
+            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
+            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
+
+            # Log R2 upload status
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 successfully")
+            else:
+                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped")
+
+            # Log feature importances summary
+            if feature_importances:
+                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
+                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+                for i, (feature, importance) in enumerate(sorted_features, 1):
+                    logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
+
+            # Log query commands for easy access
+            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
+            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
+
+            # Log R2 management commands
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
+                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
+
+            # Store results for potential later use
+            self._last_final_model_results = final_results
+
+        except Exception as e:
+            logger.error(f"[FinalModel] Failed to build final model: {e}")
+            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
+            raise
+
 
 def process_currency_pair_worker(currency_pair: str, r2_path: str) -> bool:
     """
@@ -1866,3 +2051,78 @@ def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
     except Exception as e:
         logger.error(f"Error in Dask worker processing {currency_pair}: {e}", exc_info=True)
         return False
+
+
+    def _build_final_model(self, 
+                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
+                          target_col: str,
+                          selected_features: list,
+                          feature_importances: dict,
+                          selection_metadata: dict,
+                          symbol: str,
+                          timeframe: str):
+        """Build and evaluate the final CatBoost model with selected features."""
+        
+        import traceback
+        
+        try:
+            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
+            
+            # Initialize the final model trainer
+            final_model_trainer = FinalModelTrainer(
+                config=self.settings,
+                logger_instance=logger
+            )
+            
+            # Verify target column exists
+            if target_col not in full_gdf.columns:
+                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
+                return
+            
+            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
+            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
+            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
+            
+            # Build and evaluate the final model
+            final_results = final_model_trainer.build_and_evaluate_final_model(
+                X_df=full_gdf,
+                y_series=full_gdf[target_col],
+                selected_features=selected_features,
+                feature_importances=feature_importances,
+                selection_metadata=selection_metadata,
+                symbol=symbol,
+                timeframe=timeframe
+            )
+            
+            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
+            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
+            
+            # Log R2 upload status
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 successfully")
+            else:
+                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped")
+            
+            # Log feature importances summary
+            if feature_importances:
+                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
+                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+                for i, (feature, importance) in enumerate(sorted_features, 1):
+                    logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
+            
+            # Log query commands for easy access
+            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
+            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
+            
+            # Log R2 management commands
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
+                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
+            
+            # Store results for potential later use
+            self._last_final_model_results = final_results
+            
+        except Exception as e:
+            logger.error(f"[FinalModel] Failed to build final model: {e}")
+            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
+            raise

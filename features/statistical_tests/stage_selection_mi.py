@@ -25,8 +25,17 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, vif_selected: Optio
             'stage2_vif_selected': [],
         }
 
-    # Build sample
-    sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
+    # Build sample - convert dask_cudf to cudf for MI computation
+    try:
+        sample_df = ddf.head(stats_engine.selection_max_rows).compute()
+        stats_engine._log_info("[MI] Sample created", sample_rows=len(sample_df), sample_cols=len(sample_df.columns))
+    except Exception as e:
+        stats_engine._log_error("[MI] Failed to create sample", error=str(e))
+        return {
+            'stage': 'mi',
+            'stage2_mi_selected': vif_selected,
+            'stage2_vif_selected': vif_selected,
+        }
 
     # Leakage check
     forbidden = [c for c in vif_selected if (c.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')))]
@@ -55,13 +64,29 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, vif_selected: Optio
                               mi_chunk_size=mi_chunk_size,
                               mi_min_samples=mi_min_samples,
                               mi_threshold=stats_engine.mi_threshold)
-        mi_selected = stats_engine.feature_selection._compute_mi_redundancy_gpu(
-            sample_df, vif_selected, dcor_scores, 
-            float(stats_engine.mi_threshold),
-            bins=mi_bins,
-            chunk=mi_chunk_size,
-            min_samples=mi_min_samples
-        )
+        
+        # Convert cudf DataFrame to cupy array for MI computation
+        try:
+            import cupy as cp
+            # Select only the VIF-selected features
+            X_array = sample_df[vif_selected].values
+            if hasattr(X_array, 'get'):  # If it's a cudf array, get the cupy array
+                X_array = X_array.get()
+            
+            stats_engine._log_info("[MI] Data prepared for GPU MI", 
+                                  array_shape=X_array.shape,
+                                  array_dtype=str(X_array.dtype))
+            
+            mi_selected = stats_engine.feature_selection._compute_mi_redundancy_gpu(
+                X_array, vif_selected, dcor_scores, 
+                float(stats_engine.mi_threshold),
+                bins=mi_bins,
+                chunk=mi_chunk_size,
+                min_samples=mi_min_samples
+            )
+        except Exception as e:
+            stats_engine._log_error("[MI] Failed to prepare data for GPU MI", error=str(e))
+            mi_selected = list(vif_selected)
         stats_engine._log_info("[MI] GPU MI redundancy completed", selected_features=len(mi_selected))
     except Exception as e:
         stats_engine._log_error("[MI] GPU MI redundancy failed; passing through VIF set", error=str(e))
