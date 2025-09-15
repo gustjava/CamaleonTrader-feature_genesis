@@ -739,50 +739,82 @@ class DataProcessor:
                             from sklearn.model_selection import train_test_split
                             from sklearn.metrics import mean_squared_error
                             
-    # Convert to cudf if necessary
-    if hasattr(ddf, 'compute'):
-        full_gdf = ddf.compute()
-    else:
-        full_gdf = ddf
-    
-    X = full_gdf[final_features]
-    y = full_gdf[target]
-    
-    # Clean data - remove NaN values
-    logger.info(f"[FinalModel] Data shape before cleaning: X={X.shape}, y={y.shape}")
-    logger.info(f"[FinalModel] NaN count in X: {X.isnull().sum().sum()}, NaN count in y: {y.isnull().sum()}")
-    
-    # Remove rows with NaN values
-    mask = ~(X.isnull().any(axis=1) | y.isnull())
-    X_clean = X[mask]
-    y_clean = y[mask]
-    
-    logger.info(f"[FinalModel] Data shape after cleaning: X={X_clean.shape}, y={y_clean.shape}")
-    
-    if len(X_clean) == 0:
-        logger.error("[FinalModel] No valid data after cleaning NaN values!")
-        return
-    
-    # Simple CatBoost training based on test_catboost_simple.py
-    X_train, X_test, y_train, y_test = train_test_split(X_clean.to_pandas(), y_clean.to_pandas(), test_size=0.2)
+                            # Convert to cudf if necessary
+                            if hasattr(ddf, 'compute'):
+                                full_gdf = ddf.compute()
+                            else:
+                                full_gdf = ddf
+                            
+                            X = full_gdf[final_features]
+                            y = full_gdf[target]
+                            
+                            # Clean data - remove NaN values
+                            logger.info(f"[FinalModel] Data shape before cleaning: X={X.shape}, y={y.shape}")
+                            logger.info(f"[FinalModel] NaN count in X: {X.isnull().sum().sum()}, NaN count in y: {y.isnull().sum()}")
+                            
+                            # Remove rows with NaN values
+                            mask = ~(X.isnull().any(axis=1) | y.isnull())
+                            X_clean = X[mask]
+                            y_clean = y[mask]
+                            
+                            logger.info(f"[FinalModel] Data shape after cleaning: X={X_clean.shape}, y={y_clean.shape}")
+                            
+                            if len(X_clean) == 0:
+                                logger.error("[FinalModel] No valid data after cleaning NaN values!")
+                                return
+                            
+                            # Simple CatBoost training based on test_catboost_simple.py
+                            X_train, X_test, y_train, y_test = train_test_split(X_clean.to_pandas(), y_clean.to_pandas(), test_size=0.2)
                             train_pool = Pool(X_train, y_train)
-                            model = CatBoostRegressor(
-                                iterations=1000,
-                                learning_rate=0.03,
-                                depth=6,
-                                task_type='GPU',
-                                verbose=200
-                            )
+                            
+                            # Suppress only the specific GPU memory warning
+                            import warnings
+                            import os
+                            
+                            # Suppress only the specific "less than 75% GPU memory" warning
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                                model = CatBoostRegressor(
+                                    iterations=1000,
+                                    learning_rate=0.03,
+                                    depth=6,
+                                    task_type='GPU',
+                                    verbose=200
+                                )
                             model.fit(train_pool)
                             y_pred = model.predict(X_test)
                             mse = mean_squared_error(y_test, y_pred)
                             importances = model.get_feature_importance(train_pool)
                             
-                            logger.info(f"[FinalModel] Model trained successfully! MSE: {mse}")
-                            logger.info(f"[FinalModel] Feature importances: {importances}")
+                            # Calculate additional metrics
+                            from sklearn.metrics import r2_score, mean_absolute_error
+                            r2 = r2_score(y_test, y_pred)
+                            mae = mean_absolute_error(y_test, y_pred)
                             
-                            # Save or upload model as needed
-                            model.save_model(f"{symbol}_{timeframe}_model.cbm")
+                            # Get feature names and create importance mapping
+                            feature_names = X_clean.columns.tolist()
+                            feature_importance_map = dict(zip(feature_names, importances))
+                            
+                            # Sort features by importance
+                            sorted_features = sorted(feature_importance_map.items(), key=lambda x: x[1], reverse=True)
+                            
+                            logger.info(f"[FinalModel] Model trained successfully!")
+                            logger.info(f"[FinalModel] 📊 Performance Metrics:")
+                            logger.info(f"[FinalModel]   - MSE: {mse:.8f}")
+                            logger.info(f"[FinalModel]   - MAE: {mae:.8f}")
+                            logger.info(f"[FinalModel]   - R²: {r2:.6f}")
+                            logger.info(f"[FinalModel]   - RMSE: {mse**0.5:.8f}")
+                            
+                            logger.info(f"[FinalModel] 🎯 All Feature Importances:")
+                            for i, (feature_name, importance) in enumerate(sorted_features, 1):
+                                logger.info(f"[FinalModel]   {i:2d}. {feature_name}: {importance:.6f}")
+                            
+                            # Save model with proper naming
+                            currency_pair = getattr(self, 'current_currency_pair', 'unknown')
+                            timeframe = getattr(self, 'current_timeframe', 'unknown')
+                            model_filename = f"{currency_pair}_{timeframe}_model.cbm"
+                            model.save_model(model_filename)
+                            logger.info(f"[FinalModel] 💾 Model saved as: {model_filename}")
                             
                         except Exception as e:
                             logger.error(f"[FinalModel] Failed to build final model: {e}")
