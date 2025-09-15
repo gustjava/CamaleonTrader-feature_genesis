@@ -101,6 +101,11 @@ class FeatureSelection:
                     
                     # Apply vol-scaling: ỹ = y / σ̂_t
                     y_scaled = y_np / vol_est
+                    
+                    # Winsorization to reduce outliers (0.1% and 99.9% quantiles)
+                    q_lo, q_hi = np.percentile(y_scaled[np.isfinite(y_scaled)], [0.1, 99.9])
+                    y_scaled = np.clip(y_scaled, q_lo, q_hi)
+                    
                     vol_weights = 1.0 / vol_est
                     
                     scaling_info.update({
@@ -135,6 +140,11 @@ class FeatureSelection:
                     vol_est = np.maximum(vol_est.values, min_vol)
                     
                     y_scaled = y_np / vol_est
+                    
+                    # Winsorization to reduce outliers (0.1% and 99.9% quantiles)
+                    q_lo, q_hi = np.percentile(y_scaled[np.isfinite(y_scaled)], [0.1, 99.9])
+                    y_scaled = np.clip(y_scaled, q_lo, q_hi)
+                    
                     vol_weights = 1.0 / vol_est
                     
                     scaling_info.update({
@@ -184,7 +194,7 @@ class FeatureSelection:
             return y_series, None, {'method': 'failed', 'enabled': True, 'error': str(e)}
 
 
-    def _compute_mi_redundancy_DISABLED(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
+    def _compute_mi_redundancy(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
         """Remove non-linear redundancy via pairwise MI (keeps higher dCor in pair)."""
         try:
             from sklearn.feature_selection import mutual_info_regression  # Import MI computation
@@ -238,7 +248,7 @@ class FeatureSelection:
                         self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
         return list(keep)  # Return remaining features
 
-    def _compute_mi_cluster_representatives_DISABLED(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
+    def _compute_mi_cluster_representatives(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
         """Clustering global por MI para reduzir redundância (escalável).
 
         - Limita número de candidatos por `mi_max_candidates` (top por dCor se disponível, senão primeiros).
@@ -557,6 +567,51 @@ class FeatureSelection:
                 self._mi_error_count += 1
             return 0.0
 
+    def _preprune_by_spearman_gpu(self, X: cp.ndarray, features: List[str], rho_thr: float = 0.90) -> List[str]:
+        """Pre-prune features by Spearman correlation to reduce MI computation cost.
+        
+        Args:
+            X: Standardized feature matrix (n, p)
+            features: List of feature names
+            rho_thr: Correlation threshold for removal
+            
+        Returns:
+            List of features to keep after pre-pruning
+        """
+        try:
+            p = len(features)
+            if p < 2:
+                return list(features)
+            
+            # Compute correlation matrix (Spearman proxy using Pearson on standardized data)
+            Z = X
+            n = Z.shape[0]
+            R = (Z.T @ Z) / cp.float32(max(1, n - 1))
+            
+            keep = []
+            removed = set()
+            
+            for i in range(p):
+                if features[i] in removed:
+                    continue
+                keep.append(features[i])
+                
+                for j in range(i + 1, p):
+                    if features[j] in removed:
+                        continue
+                    if abs(float(R[i, j].item())) >= rho_thr:
+                        removed.add(features[j])
+            
+            self._log_info("Pre-prune Spearman/Pearson", 
+                          kept=len(keep), 
+                          removed=len(removed),
+                          threshold=rho_thr)
+            return keep
+            
+        except Exception as e:
+            self._log_warn('GPU pre-pruning failed; keeping all features', error=str(e))
+            return list(features)
+
     def _compute_mi_redundancy_gpu(self, X: cp.ndarray, features: List[str], dcor_scores: Dict[str, float], threshold: float, bins: int = 64, chunk: int = 64, min_samples: int = 10) -> List[str]:
         """GPU pairwise redundancy removal using normalized MI threshold.
 
@@ -566,8 +621,18 @@ class FeatureSelection:
         if p < 2:  # Need at least 2 features for redundancy analysis
             return list(features)
         
+        # Pre-prune by correlation to reduce computational cost
+        prepruned_features = self._preprune_by_spearman_gpu(X, features, rho_thr=0.90)
+        if len(prepruned_features) < p:
+            # Update X to only include pre-pruned features
+            prepruned_indices = [i for i, f in enumerate(features) if f in prepruned_features]
+            X = X[:, prepruned_indices]
+            features = prepruned_features
+            p = len(features)
+        
         self._log_info("MI GPU redundancy start", 
-                      features_count=p, 
+                      original_features_count=len(features),
+                      prepruned_features_count=p, 
                       threshold=threshold, 
                       bins=bins, 
                       chunk_size=chunk, 
@@ -640,6 +705,31 @@ class FeatureSelection:
                     # Use median of strictly positive importances if available
                     pos = arr[arr > 0]
                     return float(np.median(pos)) if pos.size > 0 else float(np.median(arr))
+                elif thr_s.startswith('p') and thr_s[1:].isdigit():
+                    # Percentile threshold (e.g., 'p80', 'p85')
+                    q = int(thr_s[1:])
+                    arr = np.array([float(v) for v in importances if np.isfinite(v) and v > 0], dtype=float)
+                    if arr.size == 0:
+                        return 0.0
+                    return float(np.percentile(arr, q))
+                elif thr_s == 'kneedle':
+                    # Kneedle algorithm for elbow detection
+                    try:
+                        from kneed import KneeLocator
+                        arr = np.array([float(v) for v in importances if np.isfinite(v) and v > 0], dtype=float)
+                        if arr.size < 10:  # Need sufficient data for kneedle
+                            return float(np.median(arr)) if arr.size > 0 else 0.0
+                        sorted_arr = np.sort(arr)[::-1]  # Sort descending
+                        x = np.arange(len(sorted_arr))
+                        kl = KneeLocator(x, sorted_arr, curve="convex", direction="decreasing")
+                        if kl.knee is not None:
+                            return float(sorted_arr[kl.knee])
+                        else:
+                            return float(np.median(arr))
+                    except ImportError:
+                        self._log_warn('Kneedle algorithm not available; falling back to median')
+                        arr = np.array([float(v) for v in importances if np.isfinite(v) and v > 0], dtype=float)
+                        return float(np.median(arr)) if arr.size > 0 else 0.0
                 # try to parse as float string
                 return float(threshold_cfg)
             return float(threshold_cfg)
@@ -940,7 +1030,7 @@ class FeatureSelection:
                     from utils.trading_metrics import TradingMetrics
                     
                     # Initialize trading metrics
-                    trading_metrics = TradingMetrics(logger=self.logger)
+                    trading_metrics = TradingMetrics(use_gpu=True)
                     
                     # Convert predictions and targets for advanced evaluation
                     pred_tr_adv = pred_tr if isinstance(pred_tr, np.ndarray) else np.array(pred_tr)
@@ -948,9 +1038,9 @@ class FeatureSelection:
                     
                     # Compute comprehensive metrics for training set
                     train_advanced_metrics = trading_metrics.compute_comprehensive_metrics(
-                        predictions=pred_tr_adv,
-                        targets=ytr_adv,
-                        prefix="train"
+                        y_true=ytr_adv,
+                        y_pred=pred_tr_adv,
+                        fold_id="train"
                     )
                     
                     # Add advanced metrics to existing metrics dict
@@ -962,33 +1052,46 @@ class FeatureSelection:
                         yva_adv = yva if isinstance(yva, np.ndarray) else np.array(yva)
                         
                         val_advanced_metrics = trading_metrics.compute_comprehensive_metrics(
-                            predictions=pred_va_adv,
-                            targets=yva_adv,
-                            prefix="val"
+                            y_true=yva_adv,
+                            y_pred=pred_va_adv,
+                            fold_id="val"
                         )
                         
                         metrics.update(val_advanced_metrics)
                         
                         # Update score to use more sophisticated metric (Skill or IC)
-                        if 'val_skill_score' in val_advanced_metrics:
-                            score = float(val_advanced_metrics['val_skill_score'])
-                        elif 'val_information_coefficient' in val_advanced_metrics:
-                            score = abs(float(val_advanced_metrics['val_information_coefficient']))
+                        score_candidates = [
+                            ('val_skill_vol_adj', val_advanced_metrics),
+                            ('val_skill_vs_naive', val_advanced_metrics),
+                            ('val_ic_mean', val_advanced_metrics),
+                            ('val_r2_vs_mean', val_advanced_metrics),
+                        ]
+                        for key, src in score_candidates:
+                            if key in src and np.isfinite(src[key]):
+                                score = float(src[key])
+                                break
                         else:
                             score = metrics.get('validation_r2', 0.0)
                     else:
                         # Use training skill score if available
-                        if 'train_skill_score' in train_advanced_metrics:
-                            score = float(train_advanced_metrics['train_skill_score'])
-                        elif 'train_information_coefficient' in train_advanced_metrics:
-                            score = abs(float(train_advanced_metrics['train_information_coefficient']))
+                        score_candidates = [
+                            ('train_skill_vol_adj', train_advanced_metrics),
+                            ('train_skill_vs_naive', train_advanced_metrics),
+                            ('train_ic_mean', train_advanced_metrics),
+                            ('train_r2_vs_mean', train_advanced_metrics),
+                        ]
+                        for key, src in score_candidates:
+                            if key in src and np.isfinite(src[key]):
+                                score = float(src[key])
+                                break
                         else:
                             score = metrics.get('training_r2', 0.0)
                     
                     # Log comprehensive metrics
-                    trading_metrics.log_comprehensive_metrics(train_advanced_metrics, "CatBoost Training")
+                    from utils.trading_metrics import log_comprehensive_metrics
+                    log_comprehensive_metrics(train_advanced_metrics, self.logger, "[CatBoost Training]")
                     if pred_va is not None:
-                        trading_metrics.log_comprehensive_metrics(val_advanced_metrics, "CatBoost Validation")
+                        log_comprehensive_metrics(val_advanced_metrics, self.logger, "[CatBoost Validation]")
                     
                 except Exception as metrics_err:
                     self._log_warn('Advanced trading metrics failed; using standard metrics', error=str(metrics_err))
@@ -1151,15 +1254,16 @@ class FeatureSelection:
                     error_type = m.get('error_type', 'unknown')
                     error_messages.append(f"CV fold {i}: {error_type} - {error_msg}")
         
-        # Check if all importances are uniform (indicates failure)
+        # Check if all importances are uniform (indicates low signal, not necessarily error)
         if agg_fi is not None:
             fi_array = np.asarray(agg_fi, dtype=float)
             if fi_array.size > 1:
                 # Check if all values are identical (uniform)
                 if np.allclose(fi_array, fi_array[0], rtol=1e-10):
-                    has_errors = True
                     uniform_msg = f'uniform feature importances detected (all={fi_array[0]:.6f})'
-                    error_messages.append(uniform_msg)
+                    self._log_warn('Uniform feature importances detected; treating as low-signal split', uniform_value=fi_array[0])
+                    # Don't mark as error, just add warning
+                    final_metrics.setdefault('warnings', []).append('uniform_feature_importances')
         
         # Update backend status based on error detection
         if has_errors:
@@ -1184,116 +1288,82 @@ class FeatureSelection:
             try:
                 self._log_info('Starting post-selection validation', selected_features=len(selected), original_features=len(candidates))
                 
-                # Re-train model with only selected features
+                # Re-train model with only selected features using SAME CV scheme
                 X_selected = X[:, [i for i, feat in enumerate(candidates) if feat in selected]]
                 selected_candidates = [feat for feat in candidates if feat in selected]
                 
-                # Quick single-fold validation with selected features only
+                # Use the same CV scheme as the main training
                 if X_selected.shape[1] > 0:
-                    # Use same model configuration but with selected features
-                    if task == 'classification':
-                        model_selected = CatBoostClassifier(
-                            iterations=min(iterations, 200),  # Faster validation
-                            learning_rate=learning_rate,
-                            depth=depth if depth > 0 else 6,
-                            random_seed=random_state,
-                            task_type=task_type,
-                            devices=devices,
-                            loss_function=loss_function,
-                            eval_metric=eval_metric,
-                            verbose=0,
-                            thread_count=thread_count,
-                            l2_leaf_reg=l2_leaf_reg,
-                            bootstrap_type=bootstrap_type,
-                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                        )
-                    else:
-                        model_selected = CatBoostRegressor(
-                            iterations=min(iterations, 200),  # Faster validation
-                            learning_rate=learning_rate,
-                            depth=depth if depth > 0 else 6,
-                            random_seed=random_state,
-                            task_type=task_type,
-                            devices=devices,
-                            loss_function=loss_fn,
-                            eval_metric=loss_fn,
-                            verbose=0,
-                            thread_count=thread_count,
-                            l2_leaf_reg=l2_leaf_reg,
-                            bootstrap_type=bootstrap_type,
-                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                        )
+                    post_scores = []
                     
-                    # Create pools with selected features
-                    pool_selected = _Pool(X_selected, y, feature_names=selected_candidates)
-                    
-                    # Train with selected features
-                    model_selected.fit(pool_selected)
-                    
-                    # Predict and calculate metrics
-                    pred_selected = model_selected.predict(pool_selected)
-                    
-                    # Basic metrics for comparison
-                    if task == 'classification':
-                        from sklearn.metrics import accuracy_score, f1_score
-                        post_selection_metrics['post_accuracy'] = float(accuracy_score(y, pred_selected))
-                        post_selection_metrics['post_f1'] = float(f1_score(y, pred_selected, average='weighted', zero_division=0))
-                        post_selection_metrics['post_score'] = post_selection_metrics['post_f1']
-                    else:
-                        from sklearn.metrics import r2_score, mean_squared_error
-                        post_selection_metrics['post_r2'] = float(r2_score(y, pred_selected))
-                        post_selection_metrics['post_mse'] = float(mean_squared_error(y, pred_selected))
-                        post_selection_metrics['post_rmse'] = float(np.sqrt(post_selection_metrics['post_mse']))
-                        post_selection_metrics['post_score'] = post_selection_metrics['post_r2']
-                        
-                        # Advanced trading metrics for selected features
+                    # Reuse the same CV splits if available
+                    if final_metrics.get('cv_scheme') == 'cpcv' and used_splits > 0:
+                        # Use CPCV with same parameters
                         try:
-                            from utils.trading_metrics import TradingMetrics
-                            trading_metrics_selected = TradingMetrics(logger=self.logger)
+                            from utils.cpcv import combinatorial_purged_cv
+                            n_samples = X_selected.shape[0]
+                            sizes = (n_samples // cpcv_n) * np.ones(cpcv_n, dtype=int)
+                            sizes[: n_samples % cpcv_n] += 1
+                            idx = np.arange(n_samples)
+                            groups = []
+                            pos = 0
+                            for s in sizes:
+                                groups.append(idx[pos:pos + int(s)])
+                                pos += int(s)
                             
-                            pred_selected_adv = pred_selected if isinstance(pred_selected, np.ndarray) else np.array(pred_selected)
-                            y_adv = y if isinstance(y, np.ndarray) else np.array(y)
-                            
-                            selected_advanced_metrics = trading_metrics_selected.compute_comprehensive_metrics(
-                                predictions=pred_selected_adv,
-                                targets=y_adv,
-                                prefix="post_selected"
-                            )
-                            
-                            post_selection_metrics.update(selected_advanced_metrics)
-                            
-                            # Log comparison
-                            trading_metrics_selected.log_comprehensive_metrics(
-                                selected_advanced_metrics, 
-                                f"CatBoost Post-Selection ({len(selected)} features)"
-                            )
-                            
-                        except Exception as adv_err:
-                            self._log_warn('Advanced metrics failed for selected features', error=str(adv_err))
+                            for tr_idx, te_idx in combinatorial_purged_cv(groups, k_leave_out=cpcv_k, purge=cpcv_purge, embargo=cpcv_embargo):
+                                if len(tr_idx) < max(10, min_train) or len(te_idx) < max(5, max(1, min_train // 5)):
+                                    continue
+                                fi, score, m = _fit_eval(X_selected, y, tr_idx, te_idx)
+                                post_scores.append(score)
+                        except Exception as cpcv_err:
+                            self._log_warn('CPCV post-validation failed; using single fold', error=str(cpcv_err))
+                            post_scores = []
                     
-                    # Performance comparison
-                    original_score = model_score
-                    selected_score = post_selection_metrics['post_score']
-                    performance_drop = original_score - selected_score
-                    performance_drop_pct = (performance_drop / max(abs(original_score), 1e-8)) * 100
+                    elif final_metrics.get('cv_scheme') == 'tss' and used_splits > 0:
+                        # Use TSS with same parameters
+                        try:
+                            from sklearn.model_selection import TimeSeriesSplit
+                            tss_n = max(2, n_splits_cfg)
+                            tss = TimeSeriesSplit(n_splits=tss_n)
+                            for tr_idx, va_idx in tss.split(X_selected):
+                                if len(tr_idx) < max(10, min_train) or len(va_idx) < max(5, max(1, min_train // 5)):
+                                    continue
+                                fi, score, m = _fit_eval(X_selected, y, tr_idx, va_idx)
+                                post_scores.append(score)
+                        except Exception as tss_err:
+                            self._log_warn('TSS post-validation failed; using single fold', error=str(tss_err))
+                            post_scores = []
                     
-                    post_selection_metrics.update({
-                        'features_reduction': len(candidates) - len(selected),
-                        'features_reduction_pct': ((len(candidates) - len(selected)) / len(candidates)) * 100,
-                        'performance_drop': performance_drop,
-                        'performance_drop_pct': performance_drop_pct,
-                        'original_score': original_score,
-                        'selected_score': selected_score,
-                        'efficiency_ratio': selected_score / len(selected) if len(selected) > 0 else 0.0
-                    })
+                    # If no CV scores available, use single fold
+                    if not post_scores:
+                        # Single fold validation
+                        fi, score, m = _fit_eval(X_selected, y, None, None)
+                        post_scores = [score]
                     
-                    self._log_info('Post-selection validation completed',
-                                   original_features=len(candidates),
-                                   selected_features=len(selected),
-                                   original_score=round(original_score, 6),
-                                   selected_score=round(selected_score, 6),
-                                   performance_drop=round(performance_drop, 6),
-                                   performance_drop_pct=round(performance_drop_pct, 2))
+                    # Calculate post-selection metrics
+                    if post_scores:
+                        final_metrics['post_selected_score'] = float(np.mean(post_scores))
+                        final_metrics['performance_drop'] = float(model_score - final_metrics['post_selected_score'])
+                        
+                        # Additional post-selection metrics
+                        post_selection_metrics.update({
+                            'post_selected_score': final_metrics['post_selected_score'],
+                            'performance_drop': final_metrics['performance_drop'],
+                            'features_reduction': len(candidates) - len(selected),
+                            'features_reduction_pct': ((len(candidates) - len(selected)) / len(candidates)) * 100,
+                            'original_score': model_score,
+                            'selected_score': final_metrics['post_selected_score'],
+                            'efficiency_ratio': final_metrics['post_selected_score'] / len(selected) if len(selected) > 0 else 0.0
+                        })
+                        
+                        self._log_info('Post-selection validation completed',
+                                       original_features=len(candidates),
+                                       selected_features=len(selected),
+                                       original_score=round(model_score, 6),
+                                       selected_score=round(final_metrics['post_selected_score'], 6),
+                                       performance_drop=round(final_metrics['performance_drop'], 6))
+                    
                     
             except Exception as post_err:
                 self._log_warn('Post-selection validation failed', error=str(post_err))

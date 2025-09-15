@@ -100,7 +100,7 @@ class R2ModelUploader:
             "model_version": model_info["model_version"],
             "symbol": model_info["symbol"],
             "timeframe": model_info.get("timeframe", "1H"),
-            "created_at": datetime.now().isoformat(),
+            "created_at": model_info.get("created_at", datetime.now().isoformat()),
             
             # Model configuration
             "model_type": "CatBoost",
@@ -144,7 +144,7 @@ class R2ModelUploader:
             "file_info": {
                 "model_file": f"{model_info['model_name']}.cbm",
                 "metadata_file": f"{model_info['model_name']}_metadata.json",
-                "upload_timestamp": datetime.now().isoformat(),
+                "upload_timestamp": model_info.get("created_at", datetime.now().isoformat()),
                 "r2_path": f"models/{model_info['symbol']}/",
                 "size_bytes": None  # Will be filled after upload
             }
@@ -267,7 +267,7 @@ class R2ModelUploader:
                     'model_name': model_info['model_name'],
                     'symbol': symbol,
                     'version': str(model_info['model_version']),
-                    'created_at': datetime.now().isoformat()
+                    'created_at': model_info.get("created_at", datetime.now().isoformat())
                 }
             )
             

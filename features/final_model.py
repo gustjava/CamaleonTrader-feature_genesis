@@ -29,7 +29,7 @@ class FinalModelTrainer:
         """Initialize the final model trainer."""
         self.config = config
         self.logger = logger_instance or logger
-        self.trading_metrics = TradingMetrics(config)
+        self.trading_metrics = TradingMetrics(use_gpu=True)
         self.db_handler = DatabaseHandler()
         self.r2_uploader = R2ModelUploader()  # Initialize R2 uploader
         
@@ -446,6 +446,48 @@ class FinalModelTrainer:
                     except:
                         pass
                 
+                # Advanced trading metrics for classification
+                try:
+                    # For classification, we need to convert predictions to probabilities or use directional accuracy
+                    # Training advanced metrics
+                    train_advanced = self.trading_metrics.compute_comprehensive_metrics(
+                        y_true=y_train,
+                        y_pred=train_pred,
+                        fold_id="train"
+                    )
+                    
+                    # Add prefix to training metrics
+                    train_metrics_prefixed = {f"train_{k}": v for k, v in train_advanced.items()}
+                    evaluation_results.update(train_metrics_prefixed)
+                    
+                    # Test advanced metrics
+                    self.logger.info("[Final Model] Computing advanced trading metrics for test data...")
+                    test_advanced = self.trading_metrics.compute_comprehensive_metrics(
+                        y_true=y_test,
+                        y_pred=test_pred,
+                        fold_id="test"
+                    )
+                    self.logger.info(f"[Final Model] Test advanced metrics computed: {len(test_advanced)} metrics")
+                    
+                    # Verify metrics were computed successfully
+                    if not test_advanced or len(test_advanced) == 0:
+                        self.logger.warning("[Final Model] Test advanced metrics is empty!")
+                        raise ValueError("Test advanced metrics is empty")
+                    
+                    # Add prefix to test metrics
+                    test_metrics_prefixed = {f"test_{k}": v for k, v in test_advanced.items()}
+                    evaluation_results.update(test_metrics_prefixed)
+                    
+                    # Log advanced metrics using the proper logging function
+                    self.logger.info("[Final Model] Logging comprehensive metrics...")
+                    from utils.trading_metrics import log_comprehensive_metrics
+                    log_comprehensive_metrics(train_advanced, self.logger, "[Final Model Training]")
+                    log_comprehensive_metrics(test_advanced, self.logger, "[Final Model Testing]")
+                    self.logger.info("[Final Model] Comprehensive metrics logged successfully")
+                    
+                except Exception as e:
+                    self._log_warn('Advanced trading metrics for classification failed; using standard metrics', error=str(e))
+                
                 # Primary metric for classification
                 evaluation_results['train_primary_metric'] = evaluation_results['train_f1']
                 evaluation_results['test_primary_metric'] = evaluation_results['test_f1']
@@ -472,43 +514,68 @@ class FinalModelTrainer:
                 
                 # Advanced trading metrics for regression
                 try:
+                    self.logger.info("[Final Model] Computing advanced trading metrics for training data...")
                     # Training advanced metrics
                     train_advanced = self.trading_metrics.compute_comprehensive_metrics(
-                        predictions=train_pred,
-                        targets=y_train,
-                        prefix="train"
+                        y_true=y_train,
+                        y_pred=train_pred,
+                        fold_id="train"
                     )
-                    evaluation_results.update(train_advanced)
+                    self.logger.info(f"[Final Model] Training advanced metrics computed: {len(train_advanced)} metrics")
+                    
+                    # Verify metrics were computed successfully
+                    if not train_advanced or len(train_advanced) == 0:
+                        self.logger.warning("[Final Model] Training advanced metrics is empty!")
+                        raise ValueError("Training advanced metrics is empty")
+                    
+                    # Add prefix to training metrics
+                    train_metrics_prefixed = {f"train_{k}": v for k, v in train_advanced.items()}
+                    evaluation_results.update(train_metrics_prefixed)
                     
                     # Test advanced metrics
+                    self.logger.info("[Final Model] Computing advanced trading metrics for test data...")
                     test_advanced = self.trading_metrics.compute_comprehensive_metrics(
-                        predictions=test_pred,
-                        targets=y_test,
-                        prefix="test"
+                        y_true=y_test,
+                        y_pred=test_pred,
+                        fold_id="test"
                     )
-                    evaluation_results.update(test_advanced)
+                    self.logger.info(f"[Final Model] Test advanced metrics computed: {len(test_advanced)} metrics")
                     
-                    # Log advanced metrics
-                    self.trading_metrics.log_comprehensive_metrics(train_advanced, "Final Model Training")
-                    self.trading_metrics.log_comprehensive_metrics(test_advanced, "Final Model Testing")
+                    # Verify metrics were computed successfully
+                    if not test_advanced or len(test_advanced) == 0:
+                        self.logger.warning("[Final Model] Test advanced metrics is empty!")
+                        raise ValueError("Test advanced metrics is empty")
                     
-                    # Primary metric: use Skill Score or Information Coefficient if available
-                    if 'test_skill_score' in test_advanced:
-                        evaluation_results['test_primary_metric'] = float(test_advanced['test_skill_score'])
-                    elif 'test_information_coefficient' in test_advanced:
-                        evaluation_results['test_primary_metric'] = abs(float(test_advanced['test_information_coefficient']))
+                    # Add prefix to test metrics
+                    test_metrics_prefixed = {f"test_{k}": v for k, v in test_advanced.items()}
+                    evaluation_results.update(test_metrics_prefixed)
+                    
+                    # Log advanced metrics using the proper logging function
+                    self.logger.info("[Final Model] Logging comprehensive metrics...")
+                    from utils.trading_metrics import log_comprehensive_metrics
+                    log_comprehensive_metrics(train_advanced, self.logger, "[Final Model Training]")
+                    log_comprehensive_metrics(test_advanced, self.logger, "[Final Model Testing]")
+                    self.logger.info("[Final Model] Comprehensive metrics logged successfully")
+                    
+                    # Primary metric: use Skill Score vs Naive (most important for trading)
+                    if 'test_skill_vs_naive' in test_metrics_prefixed:
+                        evaluation_results['test_primary_metric'] = float(test_metrics_prefixed['test_skill_vs_naive'])
+                    elif 'test_ic_mean' in test_metrics_prefixed:
+                        evaluation_results['test_primary_metric'] = abs(float(test_metrics_prefixed['test_ic_mean']))
                     else:
                         evaluation_results['test_primary_metric'] = evaluation_results['test_r2']
                     
-                    if 'train_skill_score' in train_advanced:
-                        evaluation_results['train_primary_metric'] = float(train_advanced['train_skill_score'])
-                    elif 'train_information_coefficient' in train_advanced:
-                        evaluation_results['train_primary_metric'] = abs(float(train_advanced['train_information_coefficient']))
+                    if 'train_skill_vs_naive' in train_metrics_prefixed:
+                        evaluation_results['train_primary_metric'] = float(train_metrics_prefixed['train_skill_vs_naive'])
+                    elif 'train_ic_mean' in train_metrics_prefixed:
+                        evaluation_results['train_primary_metric'] = abs(float(train_metrics_prefixed['train_ic_mean']))
                     else:
                         evaluation_results['train_primary_metric'] = evaluation_results['train_r2']
                         
                 except Exception as e:
                     self._log_warn('Advanced trading metrics failed; using standard metrics', error=str(e))
+                    import traceback
+                    self.logger.error(f"[Final Model] Advanced metrics error details: {traceback.format_exc()}")
                     evaluation_results['train_primary_metric'] = evaluation_results['train_r2']
                     evaluation_results['test_primary_metric'] = evaluation_results['test_r2']
             
@@ -554,8 +621,10 @@ class FinalModelTrainer:
             timestamp = datetime.utcnow()
             
             # Create model name with symbol prefix
-            model_name = f"catboost_{symbol.lower()}_{timeframe}"
-            model_version = self._get_next_model_version(symbol, timeframe)
+            # Include target name in model name
+            target_name = selection_metadata.get('target_column', 'unknown_target')
+            model_name = f"catboost_{symbol.lower()}_{timeframe}_{target_name}"
+            model_version = self._get_next_model_version(symbol, timeframe, target_name)
             
             # Main model record
             model_record = {
@@ -688,15 +757,21 @@ class FinalModelTrainer:
                            traceback=_tb.format_exc())
             raise
 
-    def _get_next_model_version(self, symbol: str, timeframe: str) -> int:
-        """Get the next version number for this symbol/timeframe combination."""
+    def _get_next_model_version(self, symbol: str, timeframe: str, target_name: str = None) -> int:
+        """Get the next version number for this symbol/timeframe/target combination."""
         try:
             with self.db_handler.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT COALESCE(MAX(model_version), 0) + 1 FROM final_models WHERE symbol = %s AND timeframe = %s",
-                    (symbol, timeframe)
-                )
+                if target_name:
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(model_version), 0) + 1 FROM final_models WHERE symbol = %s AND timeframe = %s AND model_name LIKE %s",
+                        (symbol, timeframe, f"%{target_name}%")
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(model_version), 0) + 1 FROM final_models WHERE symbol = %s AND timeframe = %s",
+                        (symbol, timeframe)
+                    )
                 result = cursor.fetchone()
                 return result[0] if result else 1
         except Exception as e:
@@ -858,9 +933,10 @@ class FinalModelTrainer:
                           timeframe=timeframe,
                           db_record_id=db_record_id)
             
-            # 1. Generate model name and version
-            model_name = f"catboost_{symbol}_{timeframe}"
-            model_version = self._get_next_model_version(symbol, timeframe)
+            # 1. Generate model name and version (include target name)
+            target_name = selection_metadata.get('target_column', 'unknown_target')
+            model_name = f"catboost_{symbol}_{timeframe}_{target_name}"
+            model_version = self._get_next_model_version(symbol, timeframe, target_name)
             
             # 2. Save model to temporary file
             import tempfile
@@ -888,7 +964,7 @@ class FinalModelTrainer:
                 'timeframe': timeframe,
                 'task_type': task_type,
                 'db_record_id': db_record_id,
-                'created_at': datetime.now().isoformat(),
+                'created_at': timestamp.isoformat(),
                 
                 # Training configuration
                 'iterations': model_results['model_info']['iterations_used'],

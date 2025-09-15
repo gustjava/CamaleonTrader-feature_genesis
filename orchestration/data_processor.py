@@ -110,6 +110,29 @@ class DataProcessor:
             if not self._save_processed_data(gdf, currency_pair):  # Salva dados processados
                 self._register_task_failure(currency_pair, r2_path, "Data saving failed")
                 return False
+
+            # Build and save the final model
+            # Get target column from settings
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+            
+            # Get selected features from the data (all columns except target and metadata)
+            all_columns = list(gdf.columns)
+            selected_features = [col for col in all_columns if not col.startswith(('y_ret_fwd_', 'is_', 'y_is_'))]
+            
+            # Create dummy selection metadata
+            selection_metadata = {
+                'target_column': target_col,
+                'selected_features': selected_features,
+                'feature_count': len(selected_features)
+            }
+            
+            # Create dummy feature importances
+            feature_importances = {col: 1.0 for col in selected_features}
+            
+            # Build final model
+            if not self._build_final_model(gdf, target_col, selected_features, feature_importances, selection_metadata, currency_pair, "1h"):
+                self._register_task_failure(currency_pair, r2_path, "Final model building failed")
+                return False
             
             # Register successful completion
             self._register_task_success(currency_pair, r2_path)
@@ -561,6 +584,8 @@ class DataProcessor:
             logger.info("[StatTests] Stage start: dCor analysis")
             from features.statistical_tests.stage_dcor import run as run_dcor
             target = getattr(self.settings.features, 'selection_target_column', None)
+            # Store target for model naming
+            self.current_target_column = target
             if target and target in ddf.columns:
                 candidates = self.stats._find_candidate_features(ddf)
                 with dask.annotate(task_key_name="stat_dcor") if dask else _noop_ctx():
@@ -809,10 +834,11 @@ class DataProcessor:
                             for i, (feature_name, importance) in enumerate(sorted_features, 1):
                                 logger.info(f"[FinalModel]   {i:2d}. {feature_name}: {importance:.6f}")
                             
-                            # Save model with proper naming
+                            # Save model with proper naming (include target)
                             currency_pair = getattr(self, 'current_currency_pair', 'unknown')
                             timeframe = getattr(self, 'current_timeframe', 'unknown')
-                            model_filename = f"{currency_pair}_{timeframe}_model.cbm"
+                            target_name = getattr(self, 'current_target_column', 'unknown_target')
+                            model_filename = f"{currency_pair}_{timeframe}_{target_name}_model.cbm"
                             model.save_model(model_filename)
                             logger.info(f"[FinalModel] 💾 Model saved as: {model_filename}")
                             
@@ -1125,7 +1151,10 @@ def _noop_ctx():
             else:
                 logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped - model only in database")
             
-            logger.info(f"[FinalModel] 🏷️  Model Name: catboost_{symbol.lower()}_{timeframe}")
+            # Get target name from selection metadata
+            target_name = selection_metadata.get('target_column', 'unknown_target')
+            model_name = f"catboost_{symbol.lower()}_{timeframe}_{target_name}"
+            logger.info(f"[FinalModel] 🏷️  Model Name: {model_name}")
             logger.info(f"[FinalModel] 📊 Task Type: {final_results['task_type']}")
             logger.info(f"[FinalModel] 🎯 Features Used: {final_results['feature_count']}")
             logger.info(f"[FinalModel] 📈 Training Score: {final_results['evaluation_results']['train_primary_metric']:.6f}")
@@ -1296,6 +1325,35 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                 def _fb_log_stat_tests_plan(_df):
                     logger.debug("[fallback] Stats tests plan log skipped (helper missing)")
                 self._log_statistical_tests_plan_dask = _fb_log_stat_tests_plan  # type: ignore
+
+            if not hasattr(self, '_build_final_model'):
+                def _fb_build_final_model(gdf, target_col, selected_features, feature_importances, selection_metadata, symbol, timeframe):
+                    logger.warning(f"[fallback] Missing _build_final_model for {symbol}; using direct call")
+                    try:
+                        # Try to call the method directly from the class
+                        from features.final_model import FinalModelTrainer
+                        from config.unified_config import get_settings
+                        
+                        settings = get_settings()
+                        final_model_trainer = FinalModelTrainer(
+                            config=settings,
+                            logger_instance=logger
+                        )
+                        
+                        # Build final model using the provided parameters
+                        return final_model_trainer.build_final_model(
+                            full_gdf=gdf,
+                            target_col=target_col,
+                            selected_features=selected_features,
+                            feature_importances=feature_importances,
+                            selection_metadata=selection_metadata,
+                            symbol=symbol,
+                            timeframe=timeframe
+                        )
+                    except Exception as e:
+                        logger.error(f"[fallback] Failed to build final model for {symbol}: {e}")
+                        return False
+                self._build_final_model = _fb_build_final_model  # type: ignore
 
             # Set currency pair context for all subsequent logs
             set_currency_pair_context(currency_pair)
@@ -1580,6 +1638,41 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                     save_ok = self._save_processed_data_dask(ddf, currency_pair)
             if not save_ok:
                 self._register_task_failure(currency_pair, r2_path, "Data saving failed")
+                return False
+
+            # Build and save the final model (materialize data for model training)
+            logger.info(f"[FinalModel] Building final model for {currency_pair} from Dask data")
+            try:
+                # Materialize the data for model training
+                gdf = ddf.compute()
+                logger.info(f"[FinalModel] Materialized data: {gdf.shape}")
+                
+                # Build final model
+                # Get target column from settings
+                target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+                
+                # Get selected features from the data (all columns except target and metadata)
+                all_columns = list(gdf.columns)
+                selected_features = [col for col in all_columns if not col.startswith(('y_ret_fwd_', 'is_', 'y_is_'))]
+                
+                # Create dummy selection metadata
+                selection_metadata = {
+                    'target_column': target_col,
+                    'selected_features': selected_features,
+                    'feature_count': len(selected_features)
+                }
+                
+                # Create dummy feature importances
+                feature_importances = {col: 1.0 for col in selected_features}
+                
+                # Build final model
+                if not self._build_final_model(gdf, target_col, selected_features, feature_importances, selection_metadata, currency_pair, "1h"):
+                    self._register_task_failure(currency_pair, r2_path, "Final model building failed")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"[FinalModel] Failed to build final model for {currency_pair}: {e}")
+                self._register_task_failure(currency_pair, r2_path, f"Final model building failed: {e}")
                 return False
 
             # Aggressive cleanup to free GPU memory before next task

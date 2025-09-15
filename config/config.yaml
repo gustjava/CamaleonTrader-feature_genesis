@@ -1,17 +1,30 @@
-# Dynamic Stage 0 - Unified Configuration File
-# GPU-Accelerated Feature Engineering Pipeline
+# =============================================================================
+# CAMALEON TRADER - FEATURE GENESIS PIPELINE CONFIGURATION
+# =============================================================================
 # 
-# This configuration file consolidates all settings for the pipeline including:
-# - Database connectivity
-# - Cloud storage (R2)
-# - Dask-CUDA cluster settings
-# - Feature engineering parameters
-# - Processing pipeline configuration
-# - Error handling and monitoring
-# - Development and debugging options
+# This configuration file is organized by pipeline stages and contains all
+# settings for the GPU-accelerated feature engineering pipeline.
+# 
+# PIPELINE STAGES:
+# 0. Infrastructure & Data Sources (Database, R2, Dask-CUDA)
+# 1. Signal Processing (EMD decomposition)
+# 2. Stationarization (Fractional differentiation, ADF tests)
+# 3. Feature Engineering (Baxter-King filter, rolling windows)
+# 4. GARCH Models (Volatility modeling)
+# 5. Statistical Tests (Distance correlation, feature selection)
+# 6. Final Model Training (CatBoost with robust metrics)
+# 
+# Each section below corresponds to a specific pipeline stage or infrastructure
+# component, with detailed comments explaining the purpose of each parameter.
+# =============================================================================
+
+# =============================================================================
+# STAGE 0: INFRASTRUCTURE & DATA SOURCES
+# =============================================================================
 
 # Database Configuration
-# MySQL database connection settings for task tracking and metadata
+# MySQL database connection settings for task tracking and metadata storage
+# Used for: Pipeline orchestration, model metadata, task status tracking
 database:
   host: ${MYSQL_HOST:localhost}
   port: ${MYSQL_PORT:3010}
@@ -25,7 +38,8 @@ database:
   pool_recycle: 3600
 
 # Cloudflare R2 Storage Configuration
-# Cloud storage settings for data input/output
+# Cloud storage settings for data input/output and model persistence
+# Used for: Raw data loading, processed data storage, model file uploads
 r2:
   account_id: ${R2_ACCOUNT_ID:ac68ac775ba99b267edee7f9b4b3bc4e}
   access_key: ${R2_ACCESS_KEY:0e315105695707ca4fe1e5f83a38f807}
@@ -35,7 +49,8 @@ r2:
   region: auto
 
 # Dask-CUDA Cluster Configuration
-# GPU cluster settings for distributed processing
+# GPU cluster settings for distributed processing across multiple GPUs
+# Used for: Parallel feature engineering, distributed statistical tests
 dask:
   # Worker configuration
   gpus_per_worker: 1  # Uma GPU por worker (otimizado para isolamento)
@@ -68,13 +83,23 @@ dask:
   enable_infiniband: false
   enable_nvlink: false  # RTX 3060 não possui NVLink
 
+# =============================================================================
+# STAGE 1-6: FEATURE ENGINEERING & MODELING PIPELINE
+# =============================================================================
+
 # Feature Engineering Configuration
-# Parameters for all feature engineering engines
+# Parameters for all feature engineering engines organized by pipeline stage
 features:
+  # =============================================================================
+  # STAGE 1: SIGNAL PROCESSING & BASIC FEATURES
+  # =============================================================================
+  
   # Rolling window configurations for various calculations
+  # Used for: Moving averages, rolling statistics, technical indicators
   rolling_windows: [10, 20, 50, 100, 200]
   rolling_min_periods: 1
-  # JB (Jarque–Bera) aggregates base column and windows
+  # JB (Jarque–Bera) normality test configuration
+  # Used for: Testing normality of fractional differenced returns
   # Define which series to use as base for JB normality aggregates.
   # If not present in the dataset, the code falls back to the first available return (prefers y_ret_1m).
   jb_base_column: frac_diff_y_ret_1m
@@ -82,24 +107,36 @@ features:
   # jb_windows: [10, 20]
   
   # Rolling correlation configuration
+  # Used for: Computing rolling correlations between price series and external drivers
   rolling_corr:
-    windows: [15, 30, 60]
-    min_periods: 1
+    windows: [15, 30, 60]  # Time windows in minutes for correlation calculation
+    min_periods: 1        # Minimum periods required for valid correlation
+  
+  # =============================================================================
+  # STAGE 2: STATIONARIZATION
+  # =============================================================================
   
   # Fractional differentiation configuration
+  # Used for: Making time series stationary while preserving long-term memory
   frac_diff:
-    d_values: [0.1, 0.2, 0.3, 0.4, 0.5]
-    threshold: 1e-5
-    max_lag: 1000
+    d_values: [0.1, 0.2, 0.3, 0.4, 0.5]  # Fractional differencing orders
+    threshold: 1e-5                       # Convergence threshold for d estimation
+    max_lag: 1000                         # Maximum lag for d estimation
   
-  # Baxter-King filter configuration - Filtro passa-banda para séries temporais
+  # =============================================================================
+  # STAGE 3: FEATURE ENGINEERING (BAXTER-KING FILTER)
+  # =============================================================================
+  
+  # Baxter-King filter configuration - Band-pass filter for time series
+  # Used for: Extracting cyclical components from price levels
   baxter_king:
-    low_freq: 6  # Frequência baixa (período longo) - remove tendências
-    high_freq: 32  # Frequência alta (período curto) - remove ruído
-    k: 12  # Tamanho do kernel do filtro
+    low_freq: 6   # Low frequency (long period) - removes trends
+    high_freq: 32 # High frequency (short period) - removes noise
+    k: 12         # Filter kernel size
   # Batch sizes for graph checkpointing (smaller = more frequent persists)
   feature_engineering_batch_size: 8
-  # Stage 0: Feature Engineering (generalized) - Engine 2 do pipeline
+  
+  # Stage 3: Feature Engineering (generalized) - Engine 2 do pipeline
   feature_engineering:
     baxter_king:
       k: 12  # Tamanho do kernel (2k+1 pontos)
@@ -119,44 +156,61 @@ features:
         - 'y_low'                   # Mínima (nível)
         - 'y_spread_lvl'            # Nível do spread (se usado como série de nível)
   
+  # =============================================================================
+  # STAGE 4: GARCH VOLATILITY MODELING
+  # =============================================================================
+  
   # GARCH model configuration
+  # Used for: Modeling volatility clustering and generating volatility features
   garch:
-    p: 1
-    q: 1
-    max_iter: 1000
-    tolerance: 1e-6
-    max_samples: 10000          # Limite de linhas usadas no ajuste GARCH
-    min_price_rows: 200         # Mínimo de pontos de preço após limpeza
-    min_return_rows: 100        # Mínimo de retornos após diff(log)
-    log_price: true             # Usa log para calcular retornos (robusto para escala)
+    p: 1                        # GARCH order (autoregressive terms)
+    q: 1                        # GARCH order (moving average terms)
+    max_iter: 1000              # Maximum iterations for model fitting
+    tolerance: 1e-6             # Convergence tolerance
+    max_samples: 10000          # Maximum rows used in GARCH fitting
+    min_price_rows: 200         # Minimum price points after cleaning
+    min_return_rows: 100        # Minimum returns after diff(log)
+    log_price: true             # Use log for return calculation (scale robust)
+  
+  # =============================================================================
+  # STAGE 5: STATISTICAL TESTS & FEATURE SELECTION
+  # =============================================================================
   
   # Distance correlation configuration
+  # Used for: Measuring non-linear relationships between features and targets
   distance_corr:
-    max_samples: 20000
+    max_samples: 20000          # Maximum samples for distance correlation computation
   
   # Empirical Mode Decomposition configuration
+  # Used for: Decomposing signals into intrinsic mode functions (Stage 1)
   emd:
-    max_imfs: 10
-    tolerance: 1e-8
-    max_iterations: 100
+    max_imfs: 10                # Maximum number of intrinsic mode functions
+    tolerance: 1e-8             # Convergence tolerance
+    max_iterations: 100         # Maximum iterations for EMD
   
-  # Statistical tests parameters
+  # Statistical tests parameters for feature selection
+  # Used for: Stage 5 feature selection and ranking
   distance_corr_max_samples: 20000
   distance_corr_tile_size: 2048
-  selection_target_column: y_ret_fwd_60m    # Mudado de 15m para 60m para melhor signal-to-noise
+  selection_target_column: y_ret_fwd_60m    # Primary target (changed from 15m to 60m for better signal-to-noise)
   # Optional list to run multi-target sweep (per run, per pair)
   selection_target_columns: []
-  dcor_top_k: 50
-  dcor_include_permutation: true
-  dcor_permutations: 100
-  selection_max_rows: 100000
-  vif_threshold: 5.0
-  mi_threshold: 0.3
-  stage3_top_n: 50
+  dcor_top_k: 50                    # Top K features selected by distance correlation
+  dcor_include_permutation: true    # Include permutation testing for significance
+  dcor_permutations: 100            # Number of permutations for significance testing
+  selection_max_rows: 100000        # Maximum rows for feature selection
+  vif_threshold: 5.0                # Variance Inflation Factor threshold (multicollinearity)
+  mi_threshold: 0.3                 # Mutual Information threshold (redundancy removal)
+  stage3_top_n: 50                  # Top N features for Stage 3 selection
+  # =============================================================================
+  # STAGE 6: FINAL MODEL TRAINING (CATBOOST)
+  # =============================================================================
+  
   # Stage 3 wrappers (LightGBM) - Legacy format (maintained for compatibility)
   stage3_task: auto  # auto|regression|classification
   stage3_random_state: 42
   stage3_lgbm_enabled: true
+  # LightGBM parameters (legacy - maintained for compatibility)
   stage3_lgbm_num_leaves: 31
   stage3_lgbm_max_depth: -1
   stage3_lgbm_n_estimators: 300
@@ -167,52 +221,66 @@ features:
   stage3_lgbm_early_stopping_rounds: 0
   stage3_use_gpu: true
   stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
-  # Stage 3 CatBoost (explicit keys; fallback to LGBM values if omitted)
-  stage3_catboost_iterations: 750           # Aumentado para treino mais longo e estável
-  stage3_catboost_learning_rate: 0.025      # Reduzido para treinamento mais conservador
-  stage3_catboost_depth: 6                  # Aumentado para capturar mais complexidade
-  stage3_catboost_l2_leaf_reg: 10           # Regularização L2 para evitar overfitting
-  stage3_catboost_bootstrap_type: Bernoulli # Bootstrap robusto
-  stage3_catboost_subsample: 0.7           # Subsample para regularização
+  # CatBoost parameters for final model training
+  # Used for: Final model training with robust metrics (Skill, NRMSE, IC, DM test)
+  stage3_catboost_iterations: 750           # Increased for longer, more stable training
+  stage3_catboost_learning_rate: 0.025      # Reduced for more conservative training
+  stage3_catboost_depth: 6                  # Increased to capture more complexity
+  stage3_catboost_l2_leaf_reg: 10           # L2 regularization to prevent overfitting
+  stage3_catboost_bootstrap_type: Bernoulli # Robust bootstrap
+  stage3_catboost_subsample: 0.7           # Subsample for regularization
   stage3_catboost_task_type: GPU            # GPU|CPU
   stage3_catboost_devices: "0"               # GPU device id(s)
   stage3_catboost_thread_count: 1
   stage3_catboost_loss_regression: RMSE
   stage3_catboost_loss_classification: Logloss
-  # Walkforward / temporal validation for embedded CatBoost selection
+  # Cross-validation and temporal validation for CatBoost selection
+  # Used for: Time series cross-validation to prevent look-ahead bias
   stage3_cv_splits: 5                       # Use TimeSeriesSplit with K folds (>=2 enables aggregation)
   stage3_cv_min_train: 200                  # Minimum rows in each training fold
-  stage3_catboost_early_stopping_rounds: 100 # Aumentado para não cortar prematuramente
+  stage3_catboost_early_stopping_rounds: 100 # Increased to avoid premature stopping
   # Data usage control for embedded stage
   stage3_catboost_use_full_dataset: true    # Use full dataset (disable selection_max_rows sampling)
   
-  # Vol-scaling target configuration
+  # =============================================================================
+  # ADVANCED FEATURE SELECTION & TARGET CONFIGURATION
+  # =============================================================================
+  
+  # Volatility-scaling target configuration
+  # Used for: Creating volatility-adjusted targets for more robust model training
   enable_vol_scaling: true                  # Enable volatility-adjusted targets
   vol_scaling_method: garch                 # garch|realized_vol|rolling_std
   vol_scaling_window: 60                    # Window for volatility estimation
   vol_scaling_min_vol: 1e-6                # Minimum volatility to avoid division by zero
   
   # Enhanced feature selection stability
+  # Used for: Improving feature selection robustness across cross-validation folds
   feature_selection_stability: true        # Enable stability-based selection
   stability_threshold: 0.65                # Keep features present in >= 65% of folds
   enable_mrmr_diversification: true        # Apply mRMR for diversity post-ranking
   mrmr_k: 30                               # Top-k features for mRMR
   
   # Post-selection validation
+  # Used for: Validating selected features by re-training and comparing metrics
   stage3_post_selection_validation: true   # Re-train with selected features and compare metrics
-  
-  # Post-selection validation
   stage3_enable_post_validation: true      # Re-train with selected features for real performance metrics
   
+  # =============================================================================
+  # GPU & PERFORMANCE CONFIGURATION
+  # =============================================================================
+  
   # Force GPU usage for all stages
+  # Used for: Ensuring all computations run on GPU for maximum performance
   force_gpu_usage: true
   gpu_fallback_enabled: false  # Disable CPU fallbacks to force GPU usage
   # Stage 3 embedded selector (SelectFromModel)
+  # Used for: Feature selection using model-based importance scores
   stage3_selector_method: selectfrommodel   # wrappers|selectfrommodel
   stage3_importance_type: gain              # gain|split|weight (backend-dependent)
-  stage3_importance_threshold: 0.75        # Percentil 75% em vez de median para seleção mais rigorosa
+  stage3_importance_threshold: 0.75        # 75th percentile instead of median for more rigorous selection
   stage3_save_importances_format: json      # json|parquet
   # Stage 3 sampling/labels controls
+  # Used for: Controlling data sampling and label handling in model training
   stage3_stratified_sampling: true
   stage3_classification_max_classes: 10
   dcor_min_threshold: 0.5
@@ -238,28 +306,35 @@ features:
   stage1_rolling_max_rows: 20000
   stage1_rolling_max_windows: 20
   stage1_agg: median  # diagnóstico: usar mediana para robustez
+  # =============================================================================
+  # SESSION MASKS & TEMPORAL FILTERING
+  # =============================================================================
+  
   # Session masks (UTC) for external drivers (applied in Stage 1 dCor/permutation)
+  # Used for: Filtering features based on market session hours for external drivers
   sessions:
     drivers:
+      # Dollar Index (DXY) - 24h Monday-Friday
       dxy:
-        weekmask: [0,1,2,3,4]
+        weekmask: [0,1,2,3,4]  # Monday to Friday
         # 24h Mon-Fri (adjust if you have exact sessions)
         open_windows:
-          0: [[0, 1440]]
-          1: [[0, 1440]]
-          2: [[0, 1440]]
-          3: [[0, 1440]]
-          4: [[0, 1440]]
+          0: [[0, 1440]]  # Monday: 00:00-23:59 UTC
+          1: [[0, 1440]]  # Tuesday: 00:00-23:59 UTC
+          2: [[0, 1440]]  # Wednesday: 00:00-23:59 UTC
+          3: [[0, 1440]]  # Thursday: 00:00-23:59 UTC
+          4: [[0, 1440]]  # Friday: 00:00-23:59 UTC
         holidays: []
+      # S&P 500 (SPX) - US cash market hours
       spx:
-        weekmask: [0,1,2,3,4]
+        weekmask: [0,1,2,3,4]  # Monday to Friday
         # US cash 13:30–20:00 UTC (810–1200 minutes)
         open_windows:
-          0: [[810, 1200]]
-          1: [[810, 1200]]
-          2: [[810, 1200]]
-          3: [[810, 1200]]
-          4: [[810, 1200]]
+          0: [[810, 1200]]  # Monday: 13:30-20:00 UTC
+          1: [[810, 1200]]  # Tuesday: 13:30-20:00 UTC
+          2: [[810, 1200]]  # Wednesday: 13:30-20:00 UTC
+          3: [[810, 1200]]  # Thursday: 13:30-20:00 UTC
+          4: [[810, 1200]]  # Friday: 13:30-20:00 UTC
         holidays: []
       brent:
         weekmask: [0,1,2,3,4]
@@ -527,8 +602,13 @@ features:
   # If true, drops features that didn't pass Stage 1 retention gates
   drop_nonretained_after_stage1: true
 
+# =============================================================================
+# INFRASTRUCTURE & SYSTEM CONFIGURATION
+# =============================================================================
+
 # Processing Pipeline Configuration
 # Settings for data processing and pipeline execution
+# Used for: Controlling batch processing, timeouts, and error handling
 processing:
   batch_size: 1000
   chunk_size: "100MB"
@@ -539,6 +619,7 @@ processing:
 
 # Logging Configuration
 # Logging settings for monitoring and debugging
+# Used for: Pipeline monitoring, error tracking, and performance analysis
 logging:
   level: INFO
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -548,6 +629,7 @@ logging:
 
 # Monitoring Configuration
 # Performance monitoring and metrics collection
+# Used for: Real-time pipeline monitoring, dashboard, and health checks
 monitoring:
   metrics_enabled: true
   dashboard_enabled: true  # Set to false to disable dashboard and reduce WebSocket logs
@@ -556,6 +638,7 @@ monitoring:
 
 # Output Configuration
 # Data output settings and file formats
+# Used for: Controlling output file formats, compression, and storage paths
 output:
   output_path: "./output"
   compression: "lz4"
@@ -564,6 +647,7 @@ output:
 
 # Development Configuration
 # Development and debugging options
+# Used for: Debug mode, profiling, validation, and development tools
 development:
   debug_mode: false
   clean_existing_output: false
@@ -575,30 +659,40 @@ development:
 
 # Pipeline Engine Configuration
 # Individual engine settings and execution order
+# Used for: Controlling which engines run and their execution order
 pipeline:
   engines:
+    # Stage 1: Signal Processing (EMD decomposition)
     signal_processing:
       enabled: true
       order: 1
       description: "Signal processing (EMD decomposition)"
+    
+    # Stage 2: Stationarization (Fractional differentiation, ADF tests)
     stationarization:
       enabled: true
       order: 2
       description: "Stationarization techniques including fractional differentiation"
       timeout: 300
       retry_count: 3
+    
+    # Stage 3: Feature Engineering (Baxter-King filter, rolling windows)
     feature_engineering:
       enabled: true
       order: 3
       description: "Early feature engineering (e.g., Baxter–King over multiple sources)"
       timeout: 300
       retry_count: 3
+    
+    # Stage 4: GARCH Models (Volatility modeling)
     garch_models:
       enabled: true
       order: 4
       description: "GARCH volatility modeling"
       timeout: 300
       retry_count: 3
+    
+    # Stage 5: Statistical Tests (Distance correlation, feature selection)
     statistical_tests:
       enabled: true
       order: 5
@@ -608,6 +702,7 @@ pipeline:
 
 # Error Handling Configuration
 # Error handling and recovery settings
+# Used for: Pipeline error recovery, retry logic, and failure handling
 error_handling:
   continue_on_error: false
   max_retries: 3
@@ -616,6 +711,7 @@ error_handling:
 
 # Memory Management Configuration
 # Advanced memory management settings
+# Used for: GPU memory management, RMM configuration, and memory optimization
 memory:
   # RMM Configuration
   rmm_pool_size_gb: 8.0
@@ -641,6 +737,7 @@ memory:
 
 # Performance Optimization Configuration
 # GPU and computation optimization settings
+# Used for: GPU optimization, kernel settings, and performance tuning
 optimization:
   # GPU optimization
   use_float32: true
@@ -662,6 +759,7 @@ optimization:
 
 # Data Validation Configuration
 # Data quality and validation settings
+# Used for: Input/output validation, data quality checks, and outlier detection
 validation:
   # Input validation
   validate_input_data: true
@@ -686,6 +784,7 @@ validation:
 
 # Security Configuration
 # Security and access control settings
+# Used for: Database SSL, R2 encryption, and access control
 security:
   # Database security
   use_ssl: false
@@ -701,6 +800,7 @@ security:
 
 # Selection Configuration
 # Feature selection settings organized by stage
+# Used for: Legacy feature selection configuration (deprecated)
 selection:
   stage3:
     model: lgbm            # lgbm
@@ -716,6 +816,7 @@ selection:
 
 # Backup and Recovery Configuration
 # Data backup and recovery settings
+# Used for: Automated backups, recovery checkpoints, and data retention
 backup:
   # Backup settings
   enable_backup: true
