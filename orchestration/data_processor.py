@@ -8,6 +8,7 @@ import logging
 import sys
 import os
 import time
+import traceback
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from features import (
 )
 from features.signal_processing import apply_emd_to_series
 from features.base_engine import CriticalPipelineError
+from features.final_model import FinalModelTrainer
 from utils.logging_utils import get_logger, set_currency_pair_context
 from features.engine_metrics import EngineMetrics
 
@@ -728,6 +730,23 @@ class DataProcessor:
                         for i, feature in enumerate(final_features, 1):
                             importance = combined.get('importances', {}).get(feature, 0.0)
                             logger.info(f"[StatTests]   {i:2d}. {feature} (importance: {importance:.6f})")
+                        
+                        # Build and evaluate final model with selected features
+                        try:
+                            logger.info("[FinalModel] 🚀 Building final CatBoost model with selected features...")
+                            self._build_final_model(
+                                full_gdf=full_gdf,
+                                target_col=target_col,
+                                selected_features=final_features,
+                                feature_importances=combined.get('importances', {}),
+                                selection_metadata=combined.get('selection_stats', {}),
+                                symbol=getattr(self, 'current_currency_pair', 'unknown'),
+                                timeframe=getattr(self, 'current_timeframe', 'unknown')
+                            )
+                        except Exception as e:
+                            logger.error(f"[FinalModel] Failed to build final model: {e}")
+                            logger.error(f"[FinalModel] Error details: {traceback.format_exc()}")
+                            
                     else:
                         logger.warning("[StatTests] ⚠️  FINAL SELECTION: No features selected!")
                     try:
@@ -979,6 +998,95 @@ def _noop_ctx():
             logger.error(f"Error validating Dask data for {currency_pair} after {engine_name}: {e}")
             return False
 
+    def _build_final_model(self, 
+                          full_gdf: cudf.DataFrame,
+                          target_col: str,
+                          selected_features: list,
+                          feature_importances: dict,
+                          selection_metadata: dict,
+                          symbol: str,
+                          timeframe: str):
+        """Build and evaluate the final CatBoost model with selected features."""
+        
+        import traceback
+        
+        try:
+            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
+            
+            # Initialize the final model trainer
+            final_model_trainer = FinalModelTrainer(
+                config=self.settings,
+                logger_instance=logger
+            )
+            
+            # Verify target column exists
+            if target_col not in full_gdf.columns:
+                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
+                return
+            
+            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
+            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
+            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
+            
+            # Build and evaluate the final model
+            final_results = final_model_trainer.build_and_evaluate_final_model(
+                data=full_gdf,
+                target_column=target_col,
+                selected_features=selected_features,
+                feature_importances=feature_importances,
+                selection_metadata=selection_metadata,
+                symbol=symbol,
+                timeframe=timeframe
+            )
+            
+            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
+            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
+            
+            # Log R2 upload status
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 cloud storage successfully!")
+                model_name = f"catboost_{symbol.lower()}_{timeframe}"
+                logger.info(f"[FinalModel] 🌐 R2 Path: models/{symbol}/{model_name}_v*.cbm")
+                logger.info(f"[FinalModel] 📤 Upload includes model file and JSON metadata")
+                logger.info(f"[FinalModel] 🧹 Local temporary files cleaned up automatically")
+            else:
+                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped - model only in database")
+            
+            logger.info(f"[FinalModel] 🏷️  Model Name: catboost_{symbol.lower()}_{timeframe}")
+            logger.info(f"[FinalModel] 📊 Task Type: {final_results['task_type']}")
+            logger.info(f"[FinalModel] 🎯 Features Used: {final_results['feature_count']}")
+            logger.info(f"[FinalModel] 📈 Training Score: {final_results['evaluation_results']['train_primary_metric']:.6f}")
+            logger.info(f"[FinalModel] 🎖️  Test Score: {final_results['evaluation_results']['test_primary_metric']:.6f}")
+            
+            # Log database connection info
+            db_config = self.settings.database
+            logger.info(f"[FinalModel] 🗄️  Database: {db_config.host}:{db_config.port}/{db_config.database}")
+            
+            # Log top features from final model
+            final_importances = final_results['model_results']['feature_importances']
+            top_features = sorted(final_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+            
+            logger.info(f"[FinalModel] 🏆 Top 10 most important features in final model:")
+            for i, (feature, importance) in enumerate(top_features, 1):
+                logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
+            
+            # Log query commands for easy access
+            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
+            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
+            
+            # Log R2 management commands
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
+                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
+            
+            # Store results for potential later use
+            self._last_final_model_results = final_results
+            
+        except Exception as e:
+            logger.error(f"[FinalModel] Failed to build final model: {e}")
+            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
+            raise
+
     def process_currency_pair_dask(self, currency_pair: str, r2_path: str, client: Client) -> bool:
         """Process a single currency pair using dask_cudf (delegates to module impl)."""
         return _process_currency_pair_dask_impl(self, currency_pair, r2_path, client)
@@ -1013,6 +1121,8 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                     '_drop_denied_columns',
                     '_execute_engine_dask',
                     '_log_statistical_tests_plan_dask',
+                    '_build_final_model',
+                    '_run_statistical_tests_stages',
                 ]
                 for _name in _need:
                     if not hasattr(self, _name) and hasattr(_src_cls, _name):
@@ -1723,6 +1833,8 @@ def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
                 '_drop_denied_columns',
                 '_execute_engine_dask',
                 '_log_statistical_tests_plan_dask',
+                '_build_final_model',
+                '_run_statistical_tests_stages',
             ]
             _bound = []
             _missing_after = []

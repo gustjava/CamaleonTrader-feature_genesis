@@ -184,7 +184,7 @@ class FeatureSelection:
             return y_series, None, {'method': 'failed', 'enabled': True, 'error': str(e)}
 
 
-    def _compute_mi_redundancy(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
+    def _compute_mi_redundancy_DISABLED(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
         """Remove non-linear redundancy via pairwise MI (keeps higher dCor in pair)."""
         try:
             from sklearn.feature_selection import mutual_info_regression  # Import MI computation
@@ -238,7 +238,7 @@ class FeatureSelection:
                         self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
         return list(keep)  # Return remaining features
 
-    def _compute_mi_cluster_representatives(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
+    def _compute_mi_cluster_representatives_DISABLED(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
         """Clustering global por MI para reduzir redundância (escalável).
 
         - Limita número de candidatos por `mi_max_candidates` (top por dCor se disponível, senão primeiros).
@@ -496,7 +496,7 @@ class FeatureSelection:
                       kept_features=keep)
         return keep  # Return remaining features
 
-    def _mi_nmi_gpu(self, x: cp.ndarray, y: cp.ndarray, bins: int = 64) -> float:
+    def _mi_nmi_gpu(self, x: cp.ndarray, y: cp.ndarray, bins: int = 64, min_samples: int = 10) -> float:
         """Compute normalized mutual information on GPU via 2D histograms.
 
         NMI = I(X;Y) / max(H(X), H(Y)) in [0,1].
@@ -506,7 +506,7 @@ class FeatureSelection:
             m = ~(cp.isnan(x) | cp.isnan(y))
             x = x[m]
             y = y[m]
-            if x.size < 10:
+            if x.size < min_samples:
                 return 0.0
             # Histogram edges (uniform)
             x_min, x_max = float(cp.min(x)), float(cp.max(x))
@@ -534,7 +534,7 @@ class FeatureSelection:
         except Exception:
             return 0.0
 
-    def _compute_mi_redundancy_gpu(self, X: cp.ndarray, features: List[str], dcor_scores: Dict[str, float], threshold: float, bins: int = 64, chunk: int = 64) -> List[str]:
+    def _compute_mi_redundancy_gpu(self, X: cp.ndarray, features: List[str], dcor_scores: Dict[str, float], threshold: float, bins: int = 64, chunk: int = 64, min_samples: int = 10) -> List[str]:
         """GPU pairwise redundancy removal using normalized MI threshold.
 
         Keeps the feature with higher Stage 1 dCor within each redundant pair.
@@ -557,7 +557,7 @@ class FeatureSelection:
                     if features[j] not in keep:  # Skip if already removed
                         continue
                     xj = cols[j]  # Comparison feature
-                    nmi = self._mi_nmi_gpu(xi, xj, bins=bins)  # Compute normalized mutual information
+                    nmi = self._mi_nmi_gpu(xi, xj, bins=bins, min_samples=min_samples)  # Compute normalized mutual information
                     if nmi >= float(threshold):  # If MI above threshold, features are redundant
                         fi = features[i]
                         fj = features[j]
@@ -766,9 +766,6 @@ class FeatureSelection:
                 l2_leaf_reg=l2_leaf_reg,
                 bootstrap_type=bootstrap_type,
                 subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                eval_metric=loss_fn,
-                verbose=0,
-                thread_count=thread_count,
             )
 
         # Early stopping + CV setup

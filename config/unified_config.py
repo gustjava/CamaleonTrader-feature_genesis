@@ -160,6 +160,9 @@ class FeatureConfig:
     selection_max_rows: int = 100000
     vif_threshold: float = 5.0
     mi_threshold: float = 0.3
+    mi_bins: int = 64
+    mi_chunk_size: int = 64
+    mi_min_samples: int = 10
     stage3_top_n: int = 50
     # ADF rolling feature generation (disabled by default; diagnostics only)
     enable_adf_rolling: bool = False
@@ -186,12 +189,33 @@ class FeatureConfig:
     stage3_catboost_thread_count: int = 1
     stage3_catboost_loss_regression: str = "RMSE"
     stage3_catboost_loss_classification: str = "Logloss"  # or MultiClass automatically if needed
+    # Enhanced CatBoost parameters for better performance
+    stage3_catboost_l2_leaf_reg: float = 10.0            # L2 regularization
+    stage3_catboost_bootstrap_type: str = "Bernoulli"    # Bootstrap method
+    stage3_catboost_subsample: float = 0.7               # Subsample ratio for bootstrap
     # Walkforward / temporal CV controls for CatBoost embedded selection
     stage3_cv_splits: int = 3               # TimeSeriesSplit folds for aggregated importances (>=2 -> enabled)
     stage3_cv_min_train: int = 200          # Minimum train rows per split
     stage3_catboost_early_stopping_rounds: int = 0  # Overrides lgbm early stopping if > 0
     # Data usage control for embedded stage
     stage3_catboost_use_full_dataset: bool = False   # If true, do not sample selection_max_rows for Stage 3
+    # Post-validation: Re-train with selected features for real performance metrics
+    stage3_enable_post_validation: bool = True       # Enable post-selection validation
+    # Volatility scaling for targets
+    enable_vol_scaling: bool = True                   # Enable volatility-adjusted targets
+    vol_scaling_method: str = "garch"                 # garch|realized_vol|rolling_std
+    vol_scaling_window: int = 60                      # Window for volatility estimation  
+    vol_scaling_min_vol: float = 1e-6                # Minimum volatility to avoid division by zero
+    # Feature selection stability
+    feature_selection_stability: bool = True          # Enable stability-based selection
+    stability_threshold: float = 0.65                 # Keep features present in >= 65% of folds
+    enable_mrmr_diversification: bool = True          # Apply mRMR for diversity post-ranking
+    mrmr_k: int = 30                                  # Top-k features for mRMR
+    # Post-selection validation
+    stage3_post_selection_validation: bool = True     # Re-train with selected features and compare metrics
+    # GPU usage enforcement
+    force_gpu_usage: bool = True                      # Force GPU usage for all stages
+    gpu_fallback_enabled: bool = False                # Disable CPU fallbacks to force GPU usage
     # Stage 3 embedded selector (SelectFromModel)
     stage3_selector_method: str = "wrappers"  # wrappers|selectfrommodel
     stage3_importance_type: str = "gain"      # gain|split|weight (backend-dependent)

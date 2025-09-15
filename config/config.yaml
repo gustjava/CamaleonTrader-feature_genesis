@@ -199,6 +199,9 @@ features:
   mrmr_k: 30                               # Top-k features for mRMR
   
   # Post-selection validation
+  stage3_post_selection_validation: true   # Re-train with selected features and compare metrics
+  
+  # Post-selection validation
   stage3_enable_post_validation: true      # Re-train with selected features for real performance metrics
   
   # Force GPU usage for all stages
@@ -414,12 +417,11 @@ features:
   stage1_dashboard_per_feature: true
   # Stage 1: GPU-direct sampling (avoid pandas on driver)
   stage1_gpu_direct: true
-  # MI clustering (Stage 2) scalable options
-  mi_cluster_enabled: true
-  mi_cluster_method: agglo
-  mi_cluster_threshold: 0.3
-  mi_max_candidates: 400
-  mi_chunk_size: 128
+  # MI GPU redundancy (Stage 2) - GPU only
+  mi_threshold: 0.2              # Lower threshold for more aggressive redundancy removal (was 0.3)
+  mi_bins: 32                    # Number of bins for MI histogram (default: 64, try 32 for more sensitivity)
+  mi_chunk_size: 32              # Chunk size for MI computation (default: 64, try 32 for better memory usage)
+  mi_min_samples: 5              # Minimum samples required for MI computation (default: 10)
   cpcv_enabled: true
   cpcv_n_groups: 10
   cpcv_k_leave_out: 2

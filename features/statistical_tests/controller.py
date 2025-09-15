@@ -200,12 +200,11 @@ class StatisticalTests(BaseFeatureEngine):
                 # Best-effort propagation only
                 pass
             
-            # MI clustering params (Stage 2 scalable)
-            self.mi_cluster_enabled = bool(getattr(uc.features, 'mi_cluster_enabled', True))
-            self.mi_cluster_method = str(getattr(uc.features, 'mi_cluster_method', 'agglo'))
-            self.mi_cluster_threshold = float(getattr(uc.features, 'mi_cluster_threshold', 0.3))
-            self.mi_max_candidates = int(getattr(uc.features, 'mi_max_candidates', 400))
-            self.mi_chunk_size = int(getattr(uc.features, 'mi_chunk_size', 128))
+            # MI GPU redundancy params (Stage 2 - GPU only)
+            self.mi_threshold = float(getattr(uc.features, 'mi_threshold', 0.3))
+            self.mi_bins = int(getattr(uc.features, 'mi_bins', 64))
+            self.mi_chunk_size = int(getattr(uc.features, 'mi_chunk_size', 64))
+            self.mi_min_samples = int(getattr(uc.features, 'mi_min_samples', 10))
             
         except Exception:
             # Fallback defaults when unified config is not available

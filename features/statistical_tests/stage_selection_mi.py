@@ -42,14 +42,29 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, vif_selected: Optio
     except Exception:
         dcor_scores = {}
 
-    # Choose method: clustering preferred when enabled
+    # GPU MI redundancy only - no CPU fallback
     try:
-        if bool(getattr(stats_engine, 'mi_cluster_enabled', True)) and len(vif_selected) > 1:
-            mi_selected = stats_engine.feature_selection._compute_mi_cluster_representatives(sample_df, vif_selected, dcor_scores)
-        else:
-            mi_selected = stats_engine.feature_selection._compute_mi_redundancy(sample_df, vif_selected, dcor_scores, float(stats_engine.mi_threshold))
+        # Get configurable MI parameters
+        mi_bins = getattr(stats_engine, 'mi_bins', 64)
+        mi_chunk_size = getattr(stats_engine, 'mi_chunk_size', 64)
+        mi_min_samples = getattr(stats_engine, 'mi_min_samples', 10)
+        
+        stats_engine._log_info("[MI] Starting GPU MI redundancy", 
+                              vif_features=len(vif_selected),
+                              mi_bins=mi_bins,
+                              mi_chunk_size=mi_chunk_size,
+                              mi_min_samples=mi_min_samples,
+                              mi_threshold=stats_engine.mi_threshold)
+        mi_selected = stats_engine.feature_selection._compute_mi_redundancy_gpu(
+            sample_df, vif_selected, dcor_scores, 
+            float(stats_engine.mi_threshold),
+            bins=mi_bins,
+            chunk=mi_chunk_size,
+            min_samples=mi_min_samples
+        )
+        stats_engine._log_info("[MI] GPU MI redundancy completed", selected_features=len(mi_selected))
     except Exception as e:
-        stats_engine._log_error("[MI] MI computation failed; passing through VIF set", error=str(e))
+        stats_engine._log_error("[MI] GPU MI redundancy failed; passing through VIF set", error=str(e))
         mi_selected = list(vif_selected)
 
     stats_engine._log_info(
