@@ -35,10 +35,41 @@ fi
 echo "📋 Conectando em: $SSH_HOST:$SSH_PORT"
 
 # Executar pkill via SSH
-echo '🛑 Executando pkill no servidor remoto...'
-ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@$SSH_HOST 'pkill -9 -f orchestration/main.py && echo "✅ Processo orchestration/main.py morto" || echo "⚠️  Processo não encontrado ou já estava morto"'
+echo '🛑 Executando limpeza completa no servidor remoto...'
+ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@$SSH_HOST '
+echo "🔪 Matando processos Python do pipeline..."
+pkill -9 -f "orchestration/main.py" 2>/dev/null || true
+pkill -9 -f "python.*main.py" 2>/dev/null || true
 
-echo '🔍 Verificando se o processo foi morto...'
-ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@$SSH_HOST 'ps aux | grep orchestration/main.py | grep -v grep || echo "✅ Nenhum processo encontrado"'
+echo "🔪 Matando processos Dask..."
+pkill -9 -f "dask" 2>/dev/null || true
+pkill -9 -f "distributed" 2>/dev/null || true
+
+echo "🔪 Matando processos CuDF/Rapids..."
+pkill -9 -f "cudf" 2>/dev/null || true
+pkill -9 -f "rapids" 2>/dev/null || true
+
+echo "🧹 Limpando portas UCX..."
+lsof -ti:8889 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+lsof -ti:8888 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+lsof -ti:8890 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+
+echo "🧹 Limpando memória GPU..."
+nvidia-smi --gpu-reset-ecc=0 2>/dev/null || true
+
+echo "✅ Limpeza completa finalizada"
+'
+
+echo '🔍 Verificando se todos os processos foram mortos...'
+ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i ~/.ssh/id_ed25519 root@$SSH_HOST '
+echo "📊 Processos Python restantes:"
+ps aux | grep python | grep -v grep || echo "✅ Nenhum processo Python encontrado"
+echo "📊 Processos Dask restantes:"
+ps aux | grep dask | grep -v grep || echo "✅ Nenhum processo Dask encontrado"
+echo "📊 Portas UCX em uso:"
+lsof -i:8889 2>/dev/null || echo "✅ Porta 8889 livre"
+lsof -i:8888 2>/dev/null || echo "✅ Porta 8888 livre"
+lsof -i:8890 2>/dev/null || echo "✅ Porta 8890 livre"
+'
 
 echo '🎯 Comando concluído!'

@@ -9,6 +9,7 @@ import logging
 import numpy as np
 import cupy as cp
 import cudf
+import traceback as _tb
 from typing import List, Dict, Any, Tuple
 from .utils import _hermitian_pinv_gpu
 from utils.logging_utils import get_logger
@@ -48,6 +49,139 @@ class FeatureSelection:
         """Log critical error and raise exception."""
         self._log_error(message, **kwargs)
         raise RuntimeError(f"FeatureSelection Critical Error: {message}")
+    
+    def _apply_vol_scaling(self, y_series, X_df=None):
+        """Apply volatility scaling to targets based on configuration.
+        
+        Args:
+            y_series: Target series to scale
+            X_df: Feature dataframe (may contain volatility features)
+            
+        Returns:
+            tuple: (scaled_y, vol_weights, scaling_info)
+        """
+        try:
+            # Check if vol-scaling is enabled
+            enable_vol_scaling = bool(getattr(self, 'enable_vol_scaling', False))
+            if not enable_vol_scaling:
+                return y_series, None, {'method': 'none', 'enabled': False}
+            
+            vol_method = str(getattr(self, 'vol_scaling_method', 'garch')).lower()
+            self._log_info('Applying volatility scaling', method=vol_method, y_shape=y_series.shape)
+            
+            # Convert to numpy for processing
+            if hasattr(y_series, 'values'):
+                y_np = y_series.values
+            else:
+                y_np = np.asarray(y_series)
+            
+            vol_weights = None
+            scaling_info = {'method': vol_method, 'enabled': True}
+            
+            if vol_method == 'garch':
+                try:
+                    # Simple GARCH(1,1) approximation using rolling volatility
+                    # Convert to pandas if needed for rolling operations
+                    import pandas as pd
+                    if hasattr(y_series, 'to_pandas'):
+                        y_pd = y_series.to_pandas()
+                    else:
+                        y_pd = pd.Series(y_np)
+                    
+                    # Compute rolling volatility (GARCH approximation)
+                    window = int(getattr(self, 'vol_scaling_window', 50))
+                    vol_est = y_pd.rolling(window=window, min_periods=10).std()
+                    
+                    # Fill initial NAs with expanding std
+                    vol_est = vol_est.fillna(y_pd.expanding(min_periods=1).std())
+                    
+                    # Ensure positive volatility with minimum threshold
+                    min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
+                    vol_est = np.maximum(vol_est.values, min_vol)
+                    
+                    # Apply vol-scaling: ỹ = y / σ̂_t
+                    y_scaled = y_np / vol_est
+                    vol_weights = 1.0 / vol_est
+                    
+                    scaling_info.update({
+                        'window': window,
+                        'min_vol': min_vol,
+                        'mean_vol': float(np.mean(vol_est)),
+                        'vol_range': [float(np.min(vol_est)), float(np.max(vol_est))]
+                    })
+                    
+                    self._log_info('GARCH vol-scaling applied', 
+                                   mean_vol=scaling_info['mean_vol'],
+                                   vol_range=scaling_info['vol_range'])
+                    
+                except Exception as garch_err:
+                    self._log_warn('GARCH vol-scaling failed; using rolling std', error=str(garch_err))
+                    vol_method = 'rolling'  # Fallback
+            
+            if vol_method == 'rolling' or vol_method == 'realized':
+                try:
+                    # Rolling realized volatility
+                    import pandas as pd
+                    if hasattr(y_series, 'to_pandas'):
+                        y_pd = y_series.to_pandas()
+                    else:
+                        y_pd = pd.Series(y_np)
+                    
+                    window = int(getattr(self, 'vol_scaling_window', 50))
+                    vol_est = y_pd.rolling(window=window, min_periods=10).std()
+                    vol_est = vol_est.fillna(y_pd.expanding(min_periods=1).std())
+                    
+                    min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
+                    vol_est = np.maximum(vol_est.values, min_vol)
+                    
+                    y_scaled = y_np / vol_est
+                    vol_weights = 1.0 / vol_est
+                    
+                    scaling_info.update({
+                        'window': window,
+                        'min_vol': min_vol,
+                        'mean_vol': float(np.mean(vol_est)),
+                        'vol_range': [float(np.min(vol_est)), float(np.max(vol_est))]
+                    })
+                    
+                except Exception as rolling_err:
+                    self._log_warn('Rolling vol-scaling failed; using constant', error=str(rolling_err))
+                    vol_method = 'constant'
+            
+            if vol_method == 'constant' or vol_method not in ['garch', 'rolling', 'realized']:
+                # Fallback: constant volatility (standard deviation of full series)
+                vol_const = float(np.std(y_np))
+                min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
+                vol_const = max(vol_const, min_vol)
+                
+                y_scaled = y_np / vol_const
+                vol_weights = np.full_like(y_np, 1.0 / vol_const)
+                
+                scaling_info.update({
+                    'constant_vol': vol_const,
+                    'min_vol': min_vol
+                })
+                
+                self._log_info('Constant vol-scaling applied', constant_vol=vol_const)
+            
+            # Convert back to original format
+            if hasattr(y_series, 'values'):
+                # Assume cudf Series
+                import cudf
+                y_scaled_series = cudf.Series(y_scaled, index=y_series.index)
+            else:
+                y_scaled_series = y_scaled
+            
+            self._log_info('Vol-scaling completed', 
+                           original_std=float(np.std(y_np)),
+                           scaled_std=float(np.std(y_scaled)),
+                           scaling_factor=float(np.std(y_np) / np.std(y_scaled)))
+            
+            return y_scaled_series, vol_weights, scaling_info
+            
+        except Exception as e:
+            self._log_warn('Vol-scaling failed; returning original targets', error=str(e))
+            return y_series, None, {'method': 'failed', 'enabled': True, 'error': str(e)}
 
 
     def _compute_mi_redundancy(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
@@ -463,19 +597,26 @@ class FeatureSelection:
         Returns: (selected_features, importances_map, backend_used, model_score, detailed_metrics)
         """
         
-        # FORÇA LOGGING PARA DEBUG - SEMPRE APARECER
-        print(f"🚀 [FORCE DEBUG] _stage3_selectfrommodel START - candidates: {len(candidates)}, X_df shape: {X_df.shape}")
-        print(f"🔧 [FORCE DEBUG] y_series shape: {y_series.shape}, dtype: {y_series.dtype}")
+        # Critical sync point - resolves timing issues
         import sys
         sys.stdout.flush()
         
         backend_used = 'catboost'
+        self._log_info('Stage3 CatBoost start', candidates=len(candidates), X_shape=X_df.shape, y_shape=y_series.shape)
+
+        # Apply volatility scaling to targets if enabled
+        y_scaled, vol_weights, vol_scaling_info = self._apply_vol_scaling(y_series, X_df)
+        if vol_scaling_info.get('enabled', False):
+            self._log_info('Vol-scaling applied to targets', **vol_scaling_info)
+            y_for_training = y_scaled
+        else:
+            y_for_training = y_series
 
         # Resolve task type
         task = str(getattr(self, 'stage3_task', 'auto')).lower()
         if task == 'auto':
             try:
-                y_vals = y_series.values if hasattr(y_series, 'values') else np.asarray(y_series)
+                y_vals = y_for_training.values if hasattr(y_for_training, 'values') else np.asarray(y_for_training)
                 uniq = np.unique(y_vals)
                 max_classes = int(getattr(self, 'stage3_classification_max_classes', 10))
                 task = 'classification' if (len(uniq) <= max(2, max_classes) and np.allclose(uniq, np.round(uniq))) else 'regression'
@@ -581,8 +722,14 @@ class FeatureSelection:
             self._log_error('CPU CatBoost not allowed; GPU-only policy enforced')
             raise RuntimeError('CPU CatBoost not allowed')
 
-        # Build model
+        # Build model with enhanced parameters
         from catboost import CatBoostClassifier, CatBoostRegressor, Pool as _Pool
+        
+        # Enhanced parameters from config
+        l2_leaf_reg = float(getattr(self, 'stage3_catboost_l2_leaf_reg', 10.0))
+        bootstrap_type = str(getattr(self, 'stage3_catboost_bootstrap_type', 'Bernoulli'))
+        subsample = float(getattr(self, 'stage3_catboost_subsample', 0.7))
+        
         if task == 'classification':
             unique_y = np.unique(y)
             is_binary = len(unique_y) == 2
@@ -599,6 +746,9 @@ class FeatureSelection:
                 eval_metric=eval_metric,
                 verbose=0,
                 thread_count=thread_count,
+                l2_leaf_reg=l2_leaf_reg,
+                bootstrap_type=bootstrap_type,
+                subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
             )
         else:
             loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
@@ -610,6 +760,12 @@ class FeatureSelection:
                 task_type=task_type,
                 devices=devices,
                 loss_function=loss_fn,
+                eval_metric=loss_fn,
+                verbose=0,
+                thread_count=thread_count,
+                l2_leaf_reg=l2_leaf_reg,
+                bootstrap_type=bootstrap_type,
+                subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
                 eval_metric=loss_fn,
                 verbose=0,
                 thread_count=thread_count,
@@ -630,33 +786,25 @@ class FeatureSelection:
                     if esr > 0:
                         fit_kwargs.update({'use_best_model': True, 'early_stopping_rounds': esr})
                     try:
-                        print(f"🔥 [TERMINAL DEBUG] CatBoost fit START - train_pool: {train_pool}, fit_kwargs: {fit_kwargs}")
-                        sys.stdout.flush()
                         self._log_info('CatBoost fit start (with validation)', train_size=len(tr_idx), valid_size=len(va_idx))
                         model.fit(train_pool, **fit_kwargs)
-                        print(f"✅ [TERMINAL DEBUG] CatBoost fit SUCCESS")
-                        sys.stdout.flush()
                         self._log_info('CatBoost fit successful (with validation)')
                     except Exception as fit_err:
-                        print(f"❌ [TERMINAL DEBUG] CatBoost fit FAILED: {fit_err}")
-                        sys.stdout.flush()
                         # Log detailed traceback and re-raise
                         tb = _tb.format_exc()
-                        print(f"📜 [TERMINAL DEBUG] Full traceback:\n{tb}")
-                        sys.stdout.flush()
-                        self._log_error('CatBoost fit failed (with validation)', error=str(fit_err), traceback=tb)
+                        self._log_error('CatBoost fit failed (with validation)', error=str(fit_err), error_type=type(fit_err).__name__, traceback=tb)
                         # Return safe fallback values to prevent pipeline crash
                         fi = np.ones(len(candidates), dtype=float)  # Uniform importances indicate failure
-                        return fi, 0.0, {'error': str(fit_err), 'traceback': tb}
+                        return fi, 0.0, {'error': str(fit_err), 'error_type': type(fit_err).__name__, 'traceback': tb}
                     
                     try:
                         pred_tr = model.predict(train_pool)
                         pred_va = model.predict(valid_pool)
                         ytr, yva = y_fit[tr_idx], y_fit[va_idx]
                     except Exception as pred_err:
-                        self._log_error('CatBoost predict failed', error=str(pred_err))
+                        self._log_error('CatBoost predict failed', error=str(pred_err), error_type=type(pred_err).__name__)
                         fi = np.ones(len(candidates), dtype=float)
-                        return fi, 0.0, {'error': f'predict failed: {pred_err}'}
+                        return fi, 0.0, {'error': f'predict failed: {pred_err}', 'error_type': type(pred_err).__name__}
                 else:
                     train_pool = _Pool(X_fit, y_fit, feature_names=feat_names)
                     try:
@@ -665,7 +813,7 @@ class FeatureSelection:
                         self._log_info('CatBoost fit successful (no validation)')
                     except Exception as fit_err:
                         tb = _tb.format_exc()
-                        self._log_error('CatBoost fit failed (no validation)', error=str(fit_err), traceback=tb)
+                        self._log_error('CatBoost fit failed (no validation)', error=str(fit_err), error_type=type(fit_err).__name__, traceback=tb)
                         fi = np.ones(len(candidates), dtype=float)
                         return fi, 0.0, {'error': str(fit_err), 'traceback': tb}
                     
@@ -713,60 +861,94 @@ class FeatureSelection:
                     score = metrics['training_r2']
 
             # Feature importance: always specify a valid type and provide data when possible
-            print(f"🎯 [TERMINAL DEBUG] Getting feature importance from trained model...")
-            sys.stdout.flush()
             fi = None
             _fi_errors = []
             try:
-                print(f"🔍 [TERMINAL DEBUG] Trying PredictionValuesChange with data...")
-                sys.stdout.flush()
                 fi = model.get_feature_importance(data=train_pool, type='PredictionValuesChange')
-                print(f"✅ [TERMINAL DEBUG] PredictionValuesChange SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                sys.stdout.flush()
             except Exception as _e1:
-                print(f"❌ [TERMINAL DEBUG] PredictionValuesChange FAILED: {_e1}")
-                sys.stdout.flush()
                 _fi_errors.append(str(_e1))
                 try:
-                    print(f"🔍 [TERMINAL DEBUG] Trying FeatureImportance with data...")
-                    sys.stdout.flush()
                     fi = model.get_feature_importance(data=train_pool, type='FeatureImportance')
-                    print(f"✅ [TERMINAL DEBUG] FeatureImportance with data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                    sys.stdout.flush()
                 except Exception as _e2:
-                    print(f"❌ [TERMINAL DEBUG] FeatureImportance with data FAILED: {_e2}")
-                    sys.stdout.flush()
                     _fi_errors.append(str(_e2))
                     try:
-                        print(f"🔍 [TERMINAL DEBUG] Trying FeatureImportance without data...")
-                        sys.stdout.flush()
                         fi = model.get_feature_importance(type='FeatureImportance')
-                        print(f"✅ [TERMINAL DEBUG] FeatureImportance no data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                        sys.stdout.flush()
                     except Exception as _e3:
-                        print(f"❌ [TERMINAL DEBUG] FeatureImportance no data FAILED: {_e3}")
-                        sys.stdout.flush()
                         _fi_errors.append(str(_e3))
                         try:
-                            print(f"🔍 [TERMINAL DEBUG] Trying PredictionValuesChange without data...")
-                            sys.stdout.flush()
                             fi = model.get_feature_importance(type='PredictionValuesChange')
-                            print(f"✅ [TERMINAL DEBUG] PredictionValuesChange no data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                            sys.stdout.flush()
                         except Exception as _e4:
-                            print(f"❌ [TERMINAL DEBUG] PredictionValuesChange no data FAILED: {_e4}")
-                            sys.stdout.flush()
                             _fi_errors.append(str(_e4))
                             fi = None
+            
+            # Advanced trading metrics integration
+            if task == 'regression' and pred_tr is not None:
+                try:
+                    # Use comprehensive trading metrics for regression evaluation
+                    from utils.trading_metrics import TradingMetrics
+                    
+                    # Initialize trading metrics
+                    trading_metrics = TradingMetrics(logger=self.logger)
+                    
+                    # Convert predictions and targets for advanced evaluation
+                    pred_tr_adv = pred_tr if isinstance(pred_tr, np.ndarray) else np.array(pred_tr)
+                    ytr_adv = ytr if isinstance(ytr, np.ndarray) else np.array(ytr)
+                    
+                    # Compute comprehensive metrics for training set
+                    train_advanced_metrics = trading_metrics.compute_comprehensive_metrics(
+                        predictions=pred_tr_adv,
+                        targets=ytr_adv,
+                        prefix="train"
+                    )
+                    
+                    # Add advanced metrics to existing metrics dict
+                    metrics.update(train_advanced_metrics)
+                    
+                    # If validation predictions exist, compute validation metrics
+                    if pred_va is not None and yva is not None:
+                        pred_va_adv = pred_va if isinstance(pred_va, np.ndarray) else np.array(pred_va)
+                        yva_adv = yva if isinstance(yva, np.ndarray) else np.array(yva)
+                        
+                        val_advanced_metrics = trading_metrics.compute_comprehensive_metrics(
+                            predictions=pred_va_adv,
+                            targets=yva_adv,
+                            prefix="val"
+                        )
+                        
+                        metrics.update(val_advanced_metrics)
+                        
+                        # Update score to use more sophisticated metric (Skill or IC)
+                        if 'val_skill_score' in val_advanced_metrics:
+                            score = float(val_advanced_metrics['val_skill_score'])
+                        elif 'val_information_coefficient' in val_advanced_metrics:
+                            score = abs(float(val_advanced_metrics['val_information_coefficient']))
+                        else:
+                            score = metrics.get('validation_r2', 0.0)
+                    else:
+                        # Use training skill score if available
+                        if 'train_skill_score' in train_advanced_metrics:
+                            score = float(train_advanced_metrics['train_skill_score'])
+                        elif 'train_information_coefficient' in train_advanced_metrics:
+                            score = abs(float(train_advanced_metrics['train_information_coefficient']))
+                        else:
+                            score = metrics.get('training_r2', 0.0)
+                    
+                    # Log comprehensive metrics
+                    trading_metrics.log_comprehensive_metrics(train_advanced_metrics, "CatBoost Training")
+                    if pred_va is not None:
+                        trading_metrics.log_comprehensive_metrics(val_advanced_metrics, "CatBoost Validation")
+                    
+                except Exception as metrics_err:
+                    self._log_warn('Advanced trading metrics failed; using standard metrics', error=str(metrics_err))
+                    # Fall back to standard R² scoring
+                    if pred_va is not None:
+                        score = metrics.get('validation_r2', 0.0)
+                    else:
+                        score = metrics.get('training_r2', 0.0)
             if fi is None:
-                print(f"🚨 [TERMINAL DEBUG] ALL feature importance methods FAILED - returning zeros")
-                sys.stdout.flush()
                 # As a last resort, produce zeros and log
                 self._log_warn('CatBoost get_feature_importance failed; returning zeros', errors=_fi_errors[:3])
                 fi = np.zeros(len(candidates), dtype=float)
-            else:
-                print(f"🎊 [TERMINAL DEBUG] Feature importance obtained successfully - unique values: {len(np.unique(fi))}")
-                sys.stdout.flush()
                 # Ensure correct length; if mismatch, fallback to zeros to keep pipeline stable
                 try:
                     fi = np.asarray(fi, dtype=float)
@@ -910,10 +1092,12 @@ class FeatureSelection:
         
         # Check for errors in aggregated metrics
         if agg_metrics:
-            for m in agg_metrics:
+            for i, m in enumerate(agg_metrics):
                 if isinstance(m, dict) and 'error' in m:
                     has_errors = True
-                    error_messages.append(m.get('error', 'unknown error'))
+                    error_msg = m.get('error', 'unknown error')
+                    error_type = m.get('error_type', 'unknown')
+                    error_messages.append(f"CV fold {i}: {error_type} - {error_msg}")
         
         # Check if all importances are uniform (indicates failure)
         if agg_fi is not None:
@@ -922,7 +1106,8 @@ class FeatureSelection:
                 # Check if all values are identical (uniform)
                 if np.allclose(fi_array, fi_array[0], rtol=1e-10):
                     has_errors = True
-                    error_messages.append('uniform feature importances detected')
+                    uniform_msg = f'uniform feature importances detected (all={fi_array[0]:.6f})'
+                    error_messages.append(uniform_msg)
         
         # Update backend status based on error detection
         if has_errors:
@@ -938,6 +1123,133 @@ class FeatureSelection:
         thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
         threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
         selected = [f for f, v in importances.items() if float(v) >= float(threshold)]
+
+        # Post-selection validation: re-train with only selected features
+        post_selection_metrics = {}
+        enable_post_validation = bool(getattr(self, 'stage3_enable_post_validation', True))
+        
+        if enable_post_validation and selected and len(selected) > 0 and len(selected) < len(candidates):
+            try:
+                self._log_info('Starting post-selection validation', selected_features=len(selected), original_features=len(candidates))
+                
+                # Re-train model with only selected features
+                X_selected = X[:, [i for i, feat in enumerate(candidates) if feat in selected]]
+                selected_candidates = [feat for feat in candidates if feat in selected]
+                
+                # Quick single-fold validation with selected features only
+                if X_selected.shape[1] > 0:
+                    # Use same model configuration but with selected features
+                    if task == 'classification':
+                        model_selected = CatBoostClassifier(
+                            iterations=min(iterations, 200),  # Faster validation
+                            learning_rate=learning_rate,
+                            depth=depth if depth > 0 else 6,
+                            random_seed=random_state,
+                            task_type=task_type,
+                            devices=devices,
+                            loss_function=loss_function,
+                            eval_metric=eval_metric,
+                            verbose=0,
+                            thread_count=thread_count,
+                            l2_leaf_reg=l2_leaf_reg,
+                            bootstrap_type=bootstrap_type,
+                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                        )
+                    else:
+                        model_selected = CatBoostRegressor(
+                            iterations=min(iterations, 200),  # Faster validation
+                            learning_rate=learning_rate,
+                            depth=depth if depth > 0 else 6,
+                            random_seed=random_state,
+                            task_type=task_type,
+                            devices=devices,
+                            loss_function=loss_fn,
+                            eval_metric=loss_fn,
+                            verbose=0,
+                            thread_count=thread_count,
+                            l2_leaf_reg=l2_leaf_reg,
+                            bootstrap_type=bootstrap_type,
+                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                        )
+                    
+                    # Create pools with selected features
+                    pool_selected = _Pool(X_selected, y, feature_names=selected_candidates)
+                    
+                    # Train with selected features
+                    model_selected.fit(pool_selected)
+                    
+                    # Predict and calculate metrics
+                    pred_selected = model_selected.predict(pool_selected)
+                    
+                    # Basic metrics for comparison
+                    if task == 'classification':
+                        from sklearn.metrics import accuracy_score, f1_score
+                        post_selection_metrics['post_accuracy'] = float(accuracy_score(y, pred_selected))
+                        post_selection_metrics['post_f1'] = float(f1_score(y, pred_selected, average='weighted', zero_division=0))
+                        post_selection_metrics['post_score'] = post_selection_metrics['post_f1']
+                    else:
+                        from sklearn.metrics import r2_score, mean_squared_error
+                        post_selection_metrics['post_r2'] = float(r2_score(y, pred_selected))
+                        post_selection_metrics['post_mse'] = float(mean_squared_error(y, pred_selected))
+                        post_selection_metrics['post_rmse'] = float(np.sqrt(post_selection_metrics['post_mse']))
+                        post_selection_metrics['post_score'] = post_selection_metrics['post_r2']
+                        
+                        # Advanced trading metrics for selected features
+                        try:
+                            from utils.trading_metrics import TradingMetrics
+                            trading_metrics_selected = TradingMetrics(logger=self.logger)
+                            
+                            pred_selected_adv = pred_selected if isinstance(pred_selected, np.ndarray) else np.array(pred_selected)
+                            y_adv = y if isinstance(y, np.ndarray) else np.array(y)
+                            
+                            selected_advanced_metrics = trading_metrics_selected.compute_comprehensive_metrics(
+                                predictions=pred_selected_adv,
+                                targets=y_adv,
+                                prefix="post_selected"
+                            )
+                            
+                            post_selection_metrics.update(selected_advanced_metrics)
+                            
+                            # Log comparison
+                            trading_metrics_selected.log_comprehensive_metrics(
+                                selected_advanced_metrics, 
+                                f"CatBoost Post-Selection ({len(selected)} features)"
+                            )
+                            
+                        except Exception as adv_err:
+                            self._log_warn('Advanced metrics failed for selected features', error=str(adv_err))
+                    
+                    # Performance comparison
+                    original_score = model_score
+                    selected_score = post_selection_metrics['post_score']
+                    performance_drop = original_score - selected_score
+                    performance_drop_pct = (performance_drop / max(abs(original_score), 1e-8)) * 100
+                    
+                    post_selection_metrics.update({
+                        'features_reduction': len(candidates) - len(selected),
+                        'features_reduction_pct': ((len(candidates) - len(selected)) / len(candidates)) * 100,
+                        'performance_drop': performance_drop,
+                        'performance_drop_pct': performance_drop_pct,
+                        'original_score': original_score,
+                        'selected_score': selected_score,
+                        'efficiency_ratio': selected_score / len(selected) if len(selected) > 0 else 0.0
+                    })
+                    
+                    self._log_info('Post-selection validation completed',
+                                   original_features=len(candidates),
+                                   selected_features=len(selected),
+                                   original_score=round(original_score, 6),
+                                   selected_score=round(selected_score, 6),
+                                   performance_drop=round(performance_drop, 6),
+                                   performance_drop_pct=round(performance_drop_pct, 2))
+                    
+            except Exception as post_err:
+                self._log_warn('Post-selection validation failed', error=str(post_err))
+                post_selection_metrics['post_validation_error'] = str(post_err)
+        
+        # Merge post-selection metrics into final metrics
+        if post_selection_metrics:
+            final_metrics.update(post_selection_metrics)
 
         # Log summary
         self._log_info('CatBoost feature selection completed',

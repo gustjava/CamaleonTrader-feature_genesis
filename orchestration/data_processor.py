@@ -678,7 +678,12 @@ class DataProcessor:
                         # Feature importance types
                         if 'feature_importance_types' in e_detailed_metrics:
                             fi_types = e_detailed_metrics['feature_importance_types']
-                            logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {list(fi_types.keys())}")
+                            if isinstance(fi_types, dict):
+                                logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {list(fi_types.keys())}")
+                            elif isinstance(fi_types, list):
+                                logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {fi_types}")
+                            else:
+                                logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {str(fi_types)}")
                     
                     # Log all winning features with their CatBoost importance scores
                     if e_out and e_importances:
