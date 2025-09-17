@@ -399,7 +399,7 @@ class StatisticalAnalysis:
             key_columns = [
                 col for col in df.columns
                 if any(term in str(col).lower() for term in ['y_close', 'y_ret', 'frac_diff'])
-                and (not str(col).startswith(("adf_", "adf_stat_")))
+                # ADF references removed
             ]
             
             # 3. Compute correlation matrix for frac_diff columns (exclude ADF metrics)
@@ -442,7 +442,7 @@ class StatisticalAnalysis:
             key_columns = [
                 col for col in df.columns
                 if any(term in str(col).lower() for term in ['y_close', 'y_ret', 'frac_diff'])
-                and (not str(col).startswith(("adf_", "adf_stat_")))
+                # ADF references removed
             ]
 
             # Statistical summaries

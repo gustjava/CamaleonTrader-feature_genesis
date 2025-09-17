@@ -6,6 +6,6 @@ the master process that coordinates GPU workers and manages task execution.
 """
 
 from .main import DaskClusterManager, managed_dask_cluster, run_pipeline
-from .data_processor import process_currency_pair_worker
+from .data_processor import process_currency_pair_dask_worker
 
-__all__ = ['DaskClusterManager', 'managed_dask_cluster', 'run_pipeline', 'process_currency_pair_worker']
+__all__ = ['DaskClusterManager', 'managed_dask_cluster', 'run_pipeline', 'process_currency_pair_dask_worker']

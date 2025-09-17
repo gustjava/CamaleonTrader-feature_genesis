@@ -43,10 +43,16 @@ from contextlib import contextmanager
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
+    # Defer CUDA context initialization to avoid conflicts with Dask-CUDA
+    import os
+    # Don't limit CUDA_VISIBLE_DEVICES - let Dask-CUDA detect all available GPUs
+    os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
+    
     from dask_cuda import LocalCUDACluster
     from dask.distributed import Client
-    import cupy as cp
-    import cudf
+    
+    # Don't import CUDA libraries here - they will be imported after cluster creation
+    # This prevents the CUDA context warning
 except ImportError as e:
     print(f"Error importing Dask-CUDA libraries: {e}")
     print("Make sure the GPU environment is properly set up.")
@@ -58,6 +64,7 @@ from orchestration.pipeline_orchestrator import PipelineOrchestrator
 from features.base_engine import CriticalPipelineError
 from utils.logging_utils import (
     get_logger,
+    apply_gpu_memory_warning_filter,
 )
 
 def setup_logging(default_path='config/logging.yaml', default_level=logging.INFO):
@@ -97,6 +104,10 @@ def setup_logging(default_path='config/logging.yaml', default_level=logging.INFO
         print("logging.yaml not found, using basic logging.")
 
 setup_logging()
+
+# Apply GPU memory warning filter to suppress specific CatBoost warnings
+apply_gpu_memory_warning_filter()
+
 logger = get_logger(__name__, component="orchestration.main")
 
 # Global flag for emergency shutdown
@@ -138,9 +149,49 @@ class DaskClusterManager:
     def _get_gpu_count(self) -> int:
         """Get the number of available GPUs."""
         try:
-            return cp.cuda.runtime.getDeviceCount()
+            # Try multiple methods to detect GPUs
+            gpu_count = 0
+            
+            # Method 1: nvidia-smi (if available) - preferred to avoid CUDA context issues
+            try:
+                import subprocess
+                result = subprocess.run(['nvidia-smi', '--list-gpus'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    gpu_count = len(result.stdout.strip().split('\n'))
+                    logger.info(f"nvidia-smi detected {gpu_count} GPUs")
+            except Exception as e:
+                logger.warning(f"nvidia-smi GPU detection failed: {e}")
+            
+            # Method 2: Check CUDA_VISIBLE_DEVICES
+            if gpu_count == 0:
+                cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+                if cuda_visible:
+                    if cuda_visible == 'all' or cuda_visible == '':
+                        # Try to detect all GPUs
+                        try:
+                            import subprocess
+                            result = subprocess.run(['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'], 
+                                                  capture_output=True, text=True, timeout=10)
+                            if result.returncode == 0:
+                                gpu_count = len(result.stdout.strip().split('\n'))
+                                logger.info(f"CUDA_VISIBLE_DEVICES detected {gpu_count} GPUs")
+                        except:
+                            pass
+                    else:
+                        # Count comma-separated GPU IDs
+                        gpu_count = len([x for x in cuda_visible.split(',') if x.strip()])
+                        logger.info(f"CUDA_VISIBLE_DEVICES specified {gpu_count} GPUs: {cuda_visible}")
+            
+            # Fallback: assume 1 GPU if detection fails
+            if gpu_count == 0:
+                logger.warning("Could not detect GPU count, assuming 1 GPU")
+                gpu_count = 1
+            
+            return max(1, gpu_count)
+            
         except Exception as e:
-            logger.warning(f"Could not detect GPU count: {e}")
+            logger.warning(f"Could not detect GPU count: {e}, assuming 1 GPU")
             return 1
 
     def _get_system_memory_gb(self) -> float:
@@ -189,7 +240,7 @@ class DaskClusterManager:
         """Configure RMM (RAPIDS Memory Manager) for optimal memory management."""
         try:
             from rmm import reinitialize
-            
+
             def parse_size_gb(val: str) -> float:
                 v = str(val).strip().upper()
                 if v.endswith('GB'):
@@ -198,14 +249,43 @@ class DaskClusterManager:
                     return float(v[:-2]) / 1024.0
                 return float(v)
 
-            try:
-                free_b, total_b = cp.cuda.runtime.memGetInfo()
-                free_gb = free_b / (1024 ** 3)
-                total_gb = total_b / (1024 ** 3)
-            except Exception:
-                # Conservative defaults if we cannot query memory
-                free_gb = 4.0
+            def _query_gpu_memory_via_nvidia_smi() -> Optional[Dict[str, float]]:
+                """Return {'free': free_gb, 'total': total_gb} using nvidia-smi, or None."""
+                try:
+                    import subprocess
+
+                    cmd = [
+                        'nvidia-smi',
+                        '--query-gpu=memory.total,memory.free',
+                        '--format=csv,noheader,nounits'
+                    ]
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode != 0:
+                        return None
+                    lines = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+                    if not lines:
+                        return None
+                    # Use the first GPU as reference (assume homogeneous GPUs)
+                    total_str, free_str = [part.strip() for part in lines[0].split(',')]
+                    total_gb = float(total_str) / 1024.0  # convert MB → GB
+                    free_gb = float(free_str) / 1024.0
+                    return {'total': total_gb, 'free': free_gb}
+                except Exception:
+                    return None
+
+            mem_info = _query_gpu_memory_via_nvidia_smi()
+            if mem_info:
+                total_gb = mem_info['total']
+                free_gb = mem_info['free']
+            else:
+                # Conservative defaults if we cannot query via nvidia-smi
                 total_gb = 8.0
+                free_gb = 4.0
 
             pool_frac = float(getattr(self.config.dask, 'rmm_pool_fraction', 0.0) or 0.0)
             init_frac = float(getattr(self.config.dask, 'rmm_initial_pool_fraction', 0.0) or 0.0)
@@ -226,14 +306,14 @@ class DaskClusterManager:
             else:
                 cap_gb = max(0.25, total_gb * 0.60)
 
-            # New: also cap by currently free memory with headroom to avoid init failures
-            free_headroom = 0.85  # keep some free space for context/UCX/cublas etc.
+            # New: also cap by currently free memory with headroom to avoid init failures (RTX 5090 conservative)
+            free_headroom = 0.75  # keep adequate free space for context/UCX/cublas etc. (RTX 5090 conservative)
             max_pool_by_free = max(0.25, free_gb * free_headroom)
             safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb, max_pool_by_free))
 
-            # Initial pool should be smaller; also obey free memory headroom (tighter bound)
-            max_init_by_free = max(0.25, free_gb * 0.50)
-            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb * 0.90, max_init_by_free))
+            # Initial pool should be smaller; also obey free memory headroom (tighter bound) (RTX 5090 conservative)
+            max_init_by_free = max(0.25, free_gb * 0.40)  # RTX 5090 conservative
+            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb * 0.75, max_init_by_free))  # RTX 5090 conservative
 
             # Ensure initial does not exceed pool size
             if safe_init_gb > safe_pool_gb:
@@ -357,6 +437,7 @@ class DaskClusterManager:
                 dask.config.set({
                     'distributed.worker.memory.target': float(self.config.dask.memory_target_fraction),
                     'distributed.worker.memory.spill': float(self.config.dask.memory_spill_fraction),
+                    'distributed.scheduler.work-stealing': False,
                 })
                 logger.info(f"Dask memory config set: target={self.config.dask.memory_target_fraction}, "
                            f"spill={self.config.dask.memory_spill_fraction}")
@@ -388,6 +469,8 @@ class DaskClusterManager:
                 'local_directory': self.config.dask.local_directory,
                 'dashboard_address': dashboard_address,
                 'scheduler_port': scheduler_port,
+                # Force each worker to use a different GPU
+                'CUDA_VISIBLE_DEVICES': ','.join(str(i) for i in range(gpu_count)),
             }
 
             # Explicitly set protocol (e.g., 'tcp' for stability)

@@ -66,19 +66,19 @@ class DaskConfig:
     threads_per_worker: int = 1
     memory_limit: str = "0GB"  # Desabilitado - usar memory_limit_fraction
     # New: proportional memory sizing (fraction of system RAM). If > 0, this overrides fixed memory_limit.
-    memory_limit_fraction: float = 0.70             # e.g., 0.70 -> 70% of system RAM per worker
+    memory_limit_fraction: float = 0.85             # e.g., 0.85 -> 85% of system RAM per worker
     rmm_pool_size: str = "0GB"  # Desabilitado - usar rmm_pool_fraction
     rmm_initial_pool_size: str = "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
     rmm_maximum_pool_size: str = "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
     # New: proportional pool sizing (fractions of device total). If > 0, these override fixed sizes.
-    rmm_pool_fraction: float = 0.40                 # e.g., 0.40 -> 40% of device total (adaptável)
-    rmm_initial_pool_fraction: float = 0.30         # e.g., 0.30 -> 30% of rmm_pool (or total)
-    rmm_maximum_pool_fraction: float = 0.50         # optional cap; if 0.0, default safety cap is used
+    rmm_pool_fraction: float = 0.60                 # e.g., 0.60 -> 60% of device total (RTX 5090 optimized)
+    rmm_initial_pool_fraction: float = 0.30         # e.g., 0.30 -> 30% of rmm_pool (RTX 5090 conservative)
+    rmm_maximum_pool_fraction: float = 0.60         # optional cap; if 0.0, default safety cap is used (RTX 5090 conservative)
     spilling_enabled: bool = True
-    spilling_target: float = 0.9
-    spilling_max_spill: str = "32GB"
-    memory_target_fraction: float = 0.8
-    memory_spill_fraction: float = 0.9
+    spilling_target: float = 0.85
+    spilling_max_spill: str = "64GB"
+    memory_target_fraction: float = 0.90
+    memory_spill_fraction: float = 0.90
     local_directory: str = "/tmp/dask-worker-space"
     protocol: str = "ucx"
     enable_tcp_over_ucx: bool = True
@@ -145,11 +145,11 @@ class FeatureConfig:
     garch_q: int = 1
     garch_max_iter: int = 1000
     garch_tolerance: float = 1e-6
-    garch_max_samples: int = 10000
+    garch_max_samples: int = 50000
     garch_min_price_rows: int = 200
     garch_min_return_rows: int = 100
     garch_log_price: bool = True
-    distance_corr_max_samples: int = 10000
+    distance_corr_max_samples: int = 500000
     distance_corr_tile_size: int = 2048
     # Selection stage (Stage 1) and dCor extras
     selection_target_column: str = "y_ret_1m"
@@ -157,15 +157,14 @@ class FeatureConfig:
     dcor_top_k: int = 50
     dcor_include_permutation: bool = True
     dcor_permutations: int = 100
-    selection_max_rows: int = 100000
+    selection_max_rows: int = 500000
     vif_threshold: float = 5.0
     mi_threshold: float = 0.3
     mi_bins: int = 64
-    mi_chunk_size: int = 64
+    mi_chunk_size: int = 128
     mi_min_samples: int = 10
     stage3_top_n: int = 50
-    # ADF rolling feature generation (disabled by default; diagnostics only)
-    enable_adf_rolling: bool = False
+    # ADF removed from project
     # Stage 3 wrappers (LightGBM tuning)
     stage3_task: str = "auto"  # auto|regression|classification
     stage3_random_state: int = 42
@@ -180,23 +179,23 @@ class FeatureConfig:
     stage3_lgbm_early_stopping_rounds: int = 0
     stage3_use_gpu: bool = True
     stage3_wrapper_backend: str = "xgb_gpu"  # lgbm|xgb_gpu
-    # Stage 3 CatBoost (new explicit keys; fall back to LGBM keys if not provided)
-    stage3_catboost_iterations: int = 200
-    stage3_catboost_learning_rate: float = 0.05
-    stage3_catboost_depth: int = 6
+    # Stage 3 CatBoost (RTX 5090 optimized)
+    stage3_catboost_iterations: int = 1500
+    stage3_catboost_learning_rate: float = 0.02
+    stage3_catboost_depth: int = 8
     stage3_catboost_devices: str = "0"
     stage3_catboost_task_type: str = "GPU"  # GPU|CPU
     stage3_catboost_thread_count: int = 1
     stage3_catboost_loss_regression: str = "RMSE"
     stage3_catboost_loss_classification: str = "Logloss"  # or MultiClass automatically if needed
-    # Enhanced CatBoost parameters for better performance
-    stage3_catboost_l2_leaf_reg: float = 10.0            # L2 regularization
+    # Enhanced CatBoost parameters for RTX 5090 performance
+    stage3_catboost_l2_leaf_reg: float = 5.0            # L2 regularization (RTX 5090 optimized)
     stage3_catboost_bootstrap_type: str = "Bernoulli"    # Bootstrap method
-    stage3_catboost_subsample: float = 0.7               # Subsample ratio for bootstrap
-    # Walkforward / temporal CV controls for CatBoost embedded selection
-    stage3_cv_splits: int = 3               # TimeSeriesSplit folds for aggregated importances (>=2 -> enabled)
-    stage3_cv_min_train: int = 200          # Minimum train rows per split
-    stage3_catboost_early_stopping_rounds: int = 0  # Overrides lgbm early stopping if > 0
+    stage3_catboost_subsample: float = 0.8               # Subsample ratio for bootstrap (RTX 5090 optimized)
+    # Walkforward / temporal CV controls for CatBoost embedded selection (RTX 5090 optimized)
+    stage3_cv_splits: int = 10              # TimeSeriesSplit folds for aggregated importances (>=2 -> enabled)
+    stage3_cv_min_train: int = 500          # Minimum train rows per split
+    stage3_catboost_early_stopping_rounds: int = 200  # Overrides lgbm early stopping if > 0
     # Data usage control for embedded stage
     stage3_catboost_use_full_dataset: bool = False   # If true, do not sample selection_max_rows for Stage 3
     # Post-validation: Re-train with selected features for real performance metrics
@@ -206,11 +205,11 @@ class FeatureConfig:
     vol_scaling_method: str = "garch"                 # garch|realized_vol|rolling_std
     vol_scaling_window: int = 60                      # Window for volatility estimation  
     vol_scaling_min_vol: float = 1e-6                # Minimum volatility to avoid division by zero
-    # Feature selection stability
+    # Feature selection stability (RTX 5090 optimized)
     feature_selection_stability: bool = True          # Enable stability-based selection
-    stability_threshold: float = 0.65                 # Keep features present in >= 65% of folds
+    stability_threshold: float = 0.70                 # Keep features present in >= 70% of folds
     enable_mrmr_diversification: bool = True          # Apply mRMR for diversity post-ranking
-    mrmr_k: int = 30                                  # Top-k features for mRMR
+    mrmr_k: int = 50                                  # Top-k features for mRMR
     # Post-selection validation
     stage3_post_selection_validation: bool = True     # Re-train with selected features and compare metrics
     # GPU usage enforcement
@@ -231,36 +230,35 @@ class FeatureConfig:
     # Additional Stage 1 gates
     correlation_min_threshold: float = 0.0  # abs(Pearson)
     pvalue_max_alpha: float = 1.0           # F-test p-value
-    # Stage 0 ADF
-    adf_alpha: float = 0.05
+    # ADF removed from project
     # dCor fast 1D approximation and permutation stage
     dcor_fast_1d_enabled: bool = True
     dcor_fast_1d_bins: int = 2048
     dcor_permutation_top_k: int = 20   # 0 = disabled, else apply on top-K by dCor
     dcor_pvalue_alpha: float = 0.05
-    # Stage 1 batching for progress logging
-    dcor_batch_size: int = 64
-    # Stage 1 rolling dCor (new)
+    # Stage 1 batching for progress logging (RTX 5090 optimized)
+    dcor_batch_size: int = 128
+    # Stage 1 rolling dCor (RTX 5090 optimized)
     stage1_rolling_enabled: bool = True
     stage1_rolling_window: int = 2000
-    stage1_rolling_step: int = 500
-    stage1_rolling_min_periods: int = 200
+    stage1_rolling_step: int = 800
+    stage1_rolling_min_periods: int = 300
     # New: minimum pairwise valid (non-NaN) observations required per rolling window
-    stage1_rolling_min_valid_pairs: int = 200
-    stage1_rolling_max_rows: int = 20000
-    stage1_rolling_max_windows: int = 20
+    stage1_rolling_min_valid_pairs: int = 600
+    stage1_rolling_max_rows: int = 50000
+    stage1_rolling_max_windows: int = 50
     stage1_agg: str = "median"  # one of: mean, median, min, max, p25, p75
     stage1_use_rolling_scores: bool = True
     # If open fraction for candidate drivers in the Stage 1 sample falls below this,
     # expand the sampling window (use more recent partitions) before pre-gating
-    stage1_min_open_fraction_for_sampling: float = 0.20
+    stage1_min_open_fraction_for_sampling: float = 0.25
     # Logging controls for Stage 1
     stage1_log_top_k: int = 20
     stage1_log_all_scores: bool = False
     # Stage 1 quality gates
     stage1_min_coverage_ratio: float = 0.30   # min fraction of valid (target & feature finite) pairs
     # Session-aware coverage: threshold for driver-based features (applies pre-gate, using open-session masks)
-    stage1_min_coverage_ratio_driver: float = 0.10
+    stage1_min_coverage_ratio_driver: float = 0.15
     stage1_min_variance: float = 1e-12        # variance threshold to avoid constant features
     stage1_min_unique_values: int = 2         # require at least 2 unique finite values
     stage1_min_rolling_windows: int = 5       # min finite rolling windows required per feature
@@ -276,13 +274,10 @@ class FeatureConfig:
     ])
     feature_deny_prefixes: List[str] = field(default_factory=lambda: [
         'y_ret_fwd_',
-        'adf_',        # exclude rolling ADF metrics from candidate processing
-        'adf_stat_',   # explicit legacy prefix variant
     ])
     feature_deny_regex: List[str] = field(default_factory=list)
     metrics_prefixes: List[str] = field(default_factory=lambda: [
         'dcor_', 'dcor_roll_', 'dcor_pvalue_',
-        'adf_', 'adf_stat_',   # ADF metrics are diagnostics, not model features
         'stage1_', 'cpcv_'
     ])
     # Selection protection (always keep)
@@ -297,23 +292,23 @@ class FeatureConfig:
     stage1_broadcast_rolling: bool = False    # add dcor_roll_* and cnt_* columns
     debug_write_artifacts: bool = True        # persist JSON artifacts per stage
     artifacts_dir: str = "artifacts"         # subfolder under output_path
-    # Stage 2 MI clustering (scalable)
+    # Stage 2 MI clustering (RTX 5090 optimized)
     mi_cluster_enabled: bool = True
     mi_cluster_method: str = "agglo"  # only 'agglo' supported now
     mi_cluster_threshold: float = 0.3
-    mi_max_candidates: int = 400
-    mi_chunk_size: int = 128
-    # CPCV controls
+    mi_max_candidates: int = 800
+    mi_chunk_size: int = 256
+    # CPCV controls (RTX 5090 optimized)
     cpcv_enabled: bool = True
-    cpcv_n_groups: int = 6
-    cpcv_k_leave_out: int = 2
-    cpcv_purge: int = 0
-    cpcv_embargo: int = 0
-    # Stage 4 stability selection
-    stage4_enabled: bool = False
-    stage4_n_bootstrap: int = 30
-    stage4_block_size: int = 5000
-    stage4_stability_threshold: float = 0.7
+    cpcv_n_groups: int = 20
+    cpcv_k_leave_out: int = 3
+    cpcv_purge: int = 100
+    cpcv_embargo: int = 200
+    # Stage 4 stability selection (RTX 5090 optimized)
+    stage4_enabled: bool = True
+    stage4_n_bootstrap: int = 100
+    stage4_block_size: int = 10000
+    stage4_stability_threshold: float = 0.75
     stage4_plot: bool = True
     stage4_random_state: int = 42
     stage4_bootstrap_method: str = "block"  # block|tssplit
@@ -363,9 +358,9 @@ class FeatureConfig:
     })
     # Index gap imputation configuration (Kalman session-aware)
     index_imputation: Dict[str, Any] = field(default_factory=dict)
-    # Dask checkpointing batch sizes (controls graph growth during engines)
-    feature_engineering_batch_size: int = 16
-    stationarization_batch_size: int = 16
+    # Dask checkpointing batch sizes (RTX 5090 conservative)
+    feature_engineering_batch_size: int = 32
+    stationarization_batch_size: int = 32
 
 
 @dataclass 
@@ -389,11 +384,11 @@ class SelectionConfig:
 
 @dataclass
 class ProcessingConfig:
-    """Processing pipeline configuration."""
-    batch_size: int = 1000
-    chunk_size: str = "100MB"
-    max_workers: int = 4
-    timeout: int = 1800  # 30 minutes
+    """Processing pipeline configuration (RTX 5090 optimized)."""
+    batch_size: int = 5000  # Aumentado para RTX 5090
+    chunk_size: str = "500MB"  # Aumentado para RTX 5090
+    max_workers: int = 8  # Aumentado para RTX 5090
+    timeout: int = 3600  # 60 minutes - RTX 5090 pode processar mais dados
     continue_on_error: bool = False
     fail_fast: bool = True
 
@@ -442,17 +437,17 @@ class MonitoringConfig:
 @dataclass
 class MemoryConfig:
     """Advanced memory management configuration."""
-    # RMM configuration (GB)
-    rmm_pool_size_gb: float = 8.0
-    rmm_initial_pool_size_gb: float = 4.0
-    rmm_maximum_pool_size_gb: float = 16.0
-    rmm_memory_target_fraction: float = 0.8
-    rmm_memory_spill_threshold: float = 0.9
+    # RMM configuration (RTX 5090 - 32GB VRAM conservative)
+    rmm_pool_size_gb: float = 20.0
+    rmm_initial_pool_size_gb: float = 8.0
+    rmm_maximum_pool_size_gb: float = 19.2
+    rmm_memory_target_fraction: float = 0.80
+    rmm_memory_spill_threshold: float = 0.85
 
-    # Chunked processing (rows)
-    chunk_size: int = 10000
-    chunk_overlap: int = 1000
-    max_memory_gb: float = 8.0
+    # Chunked processing (RTX 5090 conservative)
+    chunk_size: int = 50000
+    chunk_overlap: int = 2000
+    max_memory_gb: float = 20.0
 
     # Spilling
     enable_spilling: bool = True
@@ -498,7 +493,7 @@ class PipelineEngineConfig:
     enabled: bool = True
     order: int = 999
     description: str = ""
-    timeout: int = 300
+    timeout: int = 900
     retry_count: int = 3
 
 

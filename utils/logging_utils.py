@@ -18,6 +18,179 @@ from datetime import datetime
 from .log_context import get_context, set_task
 
 
+class GPUMemoryWarningFilter(logging.Filter):
+    """
+    Filter to suppress specific GPU memory warning messages from CatBoost and other libraries.
+    """
+    
+    def filter(self, record):
+        # Check if this is the specific GPU memory warning we want to suppress
+        if hasattr(record, 'getMessage'):
+            message = record.getMessage()
+        else:
+            message = record.msg % record.args if hasattr(record, 'args') else str(record.msg)
+        
+        # Suppress the specific GPU memory warning (with variations)
+        warning_patterns = [
+            "less than 75% GPU memory available for training",
+            "Warning: less than 75% GPU memory available for training",
+            "WARNING: less than 75% GPU memory available for training",
+            "75% GPU memory available for training",
+            "GPU memory available for training",
+            # Dask warnings about insufficient elements
+            "Insufficient elements for `head`",
+            "elements requested, only",
+            "elements available. Try passing larger `npartitions` to `head`",
+            # Dask large graph warnings
+            "Sending large graph of size",
+            "This may cause some slowdown",
+            "Consider loading the data with Dask directly",
+            "or using futures or delayed objects to embed the data into the graph without repetition"
+        ]
+        
+        for pattern in warning_patterns:
+            if pattern in message:
+                return False
+        
+        # Allow all other messages
+        return True
+
+
+class GPUMemoryWarningSuppressor:
+    """
+    Alternative approach to suppress GPU memory warnings by intercepting stdout/stderr.
+    """
+    
+    def __init__(self):
+        self.original_stdout = None
+        self.original_stderr = None
+        self.suppressed_count = 0
+    
+    def _should_suppress(self, text):
+        """Check if the text should be suppressed."""
+        warning_patterns = [
+            "less than 75% GPU memory available for training",
+            "Warning: less than 75% GPU memory available for training",
+            "WARNING: less than 75% GPU memory available for training",
+            "75% GPU memory available for training",
+            "GPU memory available for training",
+            # Dask warnings about insufficient elements
+            "Insufficient elements for `head`",
+            "elements requested, only",
+            "elements available. Try passing larger `npartitions` to `head`",
+            # Dask large graph warnings
+            "Sending large graph of size",
+            "This may cause some slowdown",
+            "Consider loading the data with Dask directly",
+            "or using futures or delayed objects to embed the data into the graph without repetition"
+        ]
+        
+        for pattern in warning_patterns:
+            if pattern in text:
+                return True
+        return False
+    
+    def _filtered_write(self, original_write, text):
+        """Write function that filters out GPU memory warnings."""
+        if self._should_suppress(text):
+            self.suppressed_count += 1
+            return  # Suppress the message
+        return original_write(text)
+    
+    def start_suppression(self):
+        """Start suppressing GPU memory warnings."""
+        import sys
+        import io
+        
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        
+        # Create filtered stdout
+        class FilteredStdout:
+            def __init__(self, original, suppressor):
+                self.original = original
+                self.suppressor = suppressor
+            
+            def write(self, text):
+                return self.suppressor._filtered_write(self.original.write, text)
+            
+            def flush(self):
+                return self.original.flush()
+            
+            def __getattr__(self, name):
+                return getattr(self.original, name)
+        
+        sys.stdout = FilteredStdout(self.original_stdout, self)
+        sys.stderr = FilteredStdout(self.original_stderr, self)
+    
+    def stop_suppression(self):
+        """Stop suppressing GPU memory warnings."""
+        import sys
+        if self.original_stdout:
+            sys.stdout = self.original_stdout
+        if self.original_stderr:
+            sys.stderr = self.original_stderr
+    
+    def get_suppressed_count(self):
+        """Get the number of suppressed messages."""
+        return self.suppressed_count
+
+
+# Global suppressor instance
+_gpu_warning_suppressor = None
+
+def apply_gpu_memory_warning_filter():
+    """
+    Apply the GPU memory warning filter to suppress specific CatBoost warnings.
+    This should be called early in the application startup.
+    """
+    global _gpu_warning_suppressor
+    
+    # Use the stdout/stderr interception approach
+    _gpu_warning_suppressor = GPUMemoryWarningSuppressor()
+    _gpu_warning_suppressor.start_suppression()
+    
+    # Also apply the logging filter as backup
+    gpu_filter = GPUMemoryWarningFilter()
+    
+    # Apply to root logger to catch all warnings
+    root_logger = logging.getLogger()
+    root_logger.addFilter(gpu_filter)
+    
+    # Also apply to all existing handlers
+    for handler in root_logger.handlers:
+        handler.addFilter(gpu_filter)
+    
+    # Also apply to common library loggers that might generate this warning
+    library_loggers = [
+        'catboost',
+        'catboost.core',
+        'catboost.utils',
+        'cudf',
+        'cupy',
+        'rapids',
+        'dask',
+        'distributed'
+    ]
+    
+    for logger_name in library_loggers:
+        logger = logging.getLogger(logger_name)
+        logger.addFilter(gpu_filter)
+        # Also apply to handlers of these loggers
+        for handler in logger.handlers:
+            handler.addFilter(gpu_filter)
+
+
+def get_suppressed_gpu_warnings_count():
+    """
+    Get the number of GPU memory warnings that have been suppressed.
+    """
+    global _gpu_warning_suppressor
+    if _gpu_warning_suppressor:
+        return _gpu_warning_suppressor.get_suppressed_count()
+    return 0
+
+
 class ContextualLoggerAdapter(logging.LoggerAdapter):
     """
     LoggerAdapter that automatically injects context variables and component information.

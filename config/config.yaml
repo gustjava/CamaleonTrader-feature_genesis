@@ -41,7 +41,7 @@ dask:
   gpus_per_worker: 1  # Uma GPU por worker (otimizado para isolamento)
   threads_per_worker: 1  # Uma thread por worker (evita conflitos GPU)
   memory_limit: "0GB"  # Desabilitado - usar memory_limit_fraction
-  memory_limit_fraction: 0.70  # Usa 70% da RAM total, dividido igualmente entre workers
+  memory_limit_fraction: 0.85  # Usa 85% da RAM total, dividido igualmente entre workers
   
   # RMM (RAPIDS Memory Manager) settings - Gerenciamento de memória GPU
   # Tamanhos fixos desabilitados - usando apenas configurações proporcionais
@@ -49,24 +49,24 @@ dask:
   rmm_initial_pool_size: "0GB"  # Desabilitado - usar rmm_initial_pool_fraction
   rmm_maximum_pool_size: "0GB"  # Desabilitado - usar rmm_maximum_pool_fraction
   # Pool proporcional de memória na GPU (ativado)
-  # Use conservative defaults to avoid pool init failures when free memory is low
-  rmm_pool_fraction: 0.30
-  rmm_initial_pool_fraction: 0.20
-  rmm_maximum_pool_fraction: 0.45
+  # Conservative settings for RTX 5090 (32GB VRAM) - stable
+  rmm_pool_fraction: 0.60
+  rmm_initial_pool_fraction: 0.30
+  rmm_maximum_pool_fraction: 0.60
   spilling_enabled: true  # Habilita spill para RAM quando GPU fica cheia
-  spilling_target: 0.9  # Alvo de utilização antes do spill
-  spilling_max_spill: "32GB"  # Máximo de spill permitido
+  spilling_target: 0.85  # Alvo de utilização antes do spill (RTX 5090 optimized)
+  spilling_max_spill: "64GB"  # Máximo de spill permitido (RTX 5090 conservative)
   
   # Memory management - Gerenciamento de memória RAM
-  memory_target_fraction: 0.8  # Alvo de utilização de RAM (80%)
-  memory_spill_fraction: 0.9  # Inicia spill quando RAM atinge 90%
+  memory_target_fraction: 0.90  # Alvo de utilização de RAM (90% - RTX 5090 optimized)
+  memory_spill_fraction: 0.90  # Inicia spill quando RAM atinge 90% (RTX 5090 conservative)
   local_directory: "/tmp/dask-worker-space"  # Diretório para spill de dados
   
   # Network protocol settings - usar UCX para transfers GPU↔GPU/host
   protocol: "ucx"
   enable_tcp_over_ucx: true
   enable_infiniband: false
-  enable_nvlink: false  # RTX 3060 não possui NVLink
+  enable_nvlink: true  # Habilitado para GPUs que suportam NVLink
 
 # Feature Engineering Configuration
 # Parameters for all feature engineering engines
@@ -97,8 +97,8 @@ features:
     low_freq: 6  # Frequência baixa (período longo) - remove tendências
     high_freq: 32  # Frequência alta (período curto) - remove ruído
     k: 12  # Tamanho do kernel do filtro
-  # Batch sizes for graph checkpointing (smaller = more frequent persists)
-  feature_engineering_batch_size: 8
+  # Batch sizes for graph checkpointing (RTX 5090 optimized)
+  feature_engineering_batch_size: 32
   # Stage 0: Feature Engineering (generalized) - Engine 2 do pipeline
   feature_engineering:
     baxter_king:
@@ -119,20 +119,20 @@ features:
         - 'y_low'                   # Mínima (nível)
         - 'y_spread_lvl'            # Nível do spread (se usado como série de nível)
   
-  # GARCH model configuration
+  # GARCH model configuration (RTX 5090 conservative)
   garch:
     p: 1
     q: 1
     max_iter: 1000
     tolerance: 1e-6
-    max_samples: 10000          # Limite de linhas usadas no ajuste GARCH
+    max_samples: 50000          # RTX 5090 optimized (32GB VRAM)
     min_price_rows: 200         # Mínimo de pontos de preço após limpeza
     min_return_rows: 100        # Mínimo de retornos após diff(log)
     log_price: true             # Usa log para calcular retornos (robusto para escala)
   
-  # Distance correlation configuration
+  # Distance correlation configuration (RTX 5090 conservative)
   distance_corr:
-    max_samples: 20000
+    max_samples: 150000
   
   # Empirical Mode Decomposition configuration
   emd:
@@ -140,8 +140,8 @@ features:
     tolerance: 1e-8
     max_iterations: 100
   
-  # Statistical tests parameters
-  distance_corr_max_samples: 20000
+  # Statistical tests parameters (RTX 5090 conservative)
+  distance_corr_max_samples: 500000        # dCor: 500k samples (RTX 5090 optimized)
   distance_corr_tile_size: 2048
   selection_target_column: y_ret_fwd_60m    # Mudado de 15m para 60m para melhor signal-to-noise
   # Optional list to run multi-target sweep (per run, per pair)
@@ -149,7 +149,7 @@ features:
   dcor_top_k: 50
   dcor_include_permutation: true
   dcor_permutations: 100
-  selection_max_rows: 100000
+  selection_max_rows: 500000
   vif_threshold: 5.0
   mi_threshold: 0.3
   stage3_top_n: 50
@@ -184,7 +184,7 @@ features:
   stage3_cv_min_train: 200                  # Minimum rows in each training fold
   stage3_catboost_early_stopping_rounds: 100 # Aumentado para não cortar prematuramente
   # Data usage control for embedded stage
-  stage3_catboost_use_full_dataset: true    # Use full dataset (disable selection_max_rows sampling)
+  stage3_catboost_use_full_dataset: true    # Use full dataset for CatBoost selection
   
   # Vol-scaling target configuration
   enable_vol_scaling: true                  # Enable volatility-adjusted targets
@@ -227,7 +227,7 @@ features:
   dcor_permutations: 100
   dcor_pvalue_alpha: 0.05
   # Stage 1 batching for progress visibility
-  dcor_batch_size: 64
+  dcor_batch_size: 128
   # Stage 1 rolling dCor (exposed)
   stage1_rolling_enabled: true
   stage1_rolling_window: 1200     # diagnóstico: janela menor para aumentar janelas válidas
@@ -235,7 +235,7 @@ features:
   stage1_rolling_min_periods: 200
   # Minimum pairwise valid observations per rolling window (handles sparse/off-hours data)
   stage1_rolling_min_valid_pairs: 400   # diagnóstico: ~33% de 1200
-  stage1_rolling_max_rows: 20000
+  stage1_rolling_max_rows: 50000
   stage1_rolling_max_windows: 20
   stage1_agg: median  # diagnóstico: usar mediana para robustez
   # Session masks (UTC) for external drivers (applied in Stage 1 dCor/permutation)
@@ -390,7 +390,7 @@ features:
     # Not a feature: internal fracdiff parameter broadcast
     "y_fracdiff_d"
   ]  # exclude raw volume features, session offset, selected FVG metrics, bad inputs, and non-features
-  feature_deny_prefixes: ["y_ret_fwd_", "is_", "y_is_", "bk_filter_", "adf_stat_"]  # exclude forward labels, flags (is_*), BK outputs, and raw rolling ADF
+  feature_deny_prefixes: ["y_ret_fwd_", "is_", "y_is_", "bk_filter_"]  # exclude forward labels, flags (is_*), BK outputs
   feature_deny_regex: ["_mask$", "_flag$"]  # generic masks/flags (optional)
   # Stage 1 only: skip from dCor candidates (do not drop from dataset)
   stage1_feature_denylist: ["y_ls_strength_pips"]
@@ -420,7 +420,7 @@ features:
   # MI GPU redundancy (Stage 2) - GPU only
   mi_threshold: 0.1              # Lower threshold for more aggressive redundancy removal
   mi_bins: 32                    # Number of bins for MI histogram (default: 64, try 32 for more sensitivity)
-  mi_chunk_size: 32              # Chunk size for MI computation (default: 64, try 32 for better memory usage)
+  mi_chunk_size: 128              # Chunk size for MI computation (RTX 5090 optimized)
   mi_min_samples: 5              # Minimum samples required for MI computation (default: 10)
   cpcv_enabled: true
   cpcv_n_groups: 10
@@ -435,7 +435,7 @@ features:
   stage4_plot: true
   stage4_random_state: 42
   stage4_bootstrap_method: block   # block|tssplit
-  adf_alpha: 0.05
+  # ADF removed from project
   # Stage 1 explicit candidates (no regex)
   station_candidates_include:
     # OHLC níveis e derivados de nível
@@ -527,13 +527,13 @@ features:
   # If true, drops features that didn't pass Stage 1 retention gates
   drop_nonretained_after_stage1: true
 
-# Processing Pipeline Configuration
+# Processing Pipeline Configuration (RTX 5090 optimized)
 # Settings for data processing and pipeline execution
 processing:
-  batch_size: 1000
-  chunk_size: "100MB"
-  max_workers: 4
-  timeout: 1800  # 30 minutes
+  batch_size: 5000  # Aumentado para RTX 5090
+  chunk_size: "500MB"  # Aumentado para RTX 5090
+  max_workers: 8  # Aumentado para RTX 5090
+  timeout: 3600  # 60 minutes - RTX 5090 pode processar mais dados
   continue_on_error: false
   fail_fast: true
 
@@ -585,25 +585,25 @@ pipeline:
       enabled: true
       order: 2
       description: "Stationarization techniques including fractional differentiation"
-      timeout: 300
+      timeout: 900  # Aumentado para RTX 5090
       retry_count: 3
     feature_engineering:
       enabled: true
       order: 3
       description: "Early feature engineering (e.g., Baxter–King over multiple sources)"
-      timeout: 300
+      timeout: 900  # Aumentado para RTX 5090
       retry_count: 3
     garch_models:
       enabled: true
       order: 4
       description: "GARCH volatility modeling"
-      timeout: 300
+      timeout: 1200  # Aumentado para RTX 5090 (GARCH pode ser mais lento)
       retry_count: 3
     statistical_tests:
       enabled: true
       order: 5
       description: "Statistical tests and analysis"
-      timeout: 300
+      timeout: 1800  # Aumentado para RTX 5090 (statistical tests podem ser mais lentos)
       retry_count: 3
 
 # Error Handling Configuration
@@ -617,17 +617,17 @@ error_handling:
 # Memory Management Configuration
 # Advanced memory management settings
 memory:
-  # RMM Configuration
-  rmm_pool_size_gb: 8.0
-  rmm_initial_pool_size_gb: 4.0
-  rmm_maximum_pool_size_gb: 16.0
-  rmm_memory_target_fraction: 0.8
-  rmm_memory_spill_threshold: 0.9
+  # RMM Configuration (RTX 5090 conservative)
+  rmm_pool_size_gb: 20.0  # RTX 5090 optimized (62.5% of 32GB)
+  rmm_initial_pool_size_gb: 8.0  # RTX 5090 conservative
+  rmm_maximum_pool_size_gb: 19.2  # RTX 5090 conservative (60% of 32GB)
+  rmm_memory_target_fraction: 0.80  # RTX 5090 conservative
+  rmm_memory_spill_threshold: 0.85  # RTX 5090 conservative
   
-  # Chunked processing settings
-  chunk_size: 10000
-  chunk_overlap: 1000
-  max_memory_gb: 8.0
+  # Chunked processing settings (RTX 5090 conservative)
+  chunk_size: 50000
+  chunk_overlap: 2000
+  max_memory_gb: 20.0  # RTX 5090 optimized
   
   # Spilling configuration
   enable_spilling: true
@@ -647,18 +647,18 @@ optimization:
   optimize_column_order: true
   avoid_cpu_transfers: true
   
-  # Kernel optimization
+  # Kernel optimization (RTX 5090 optimized)
   enable_custom_kernels: true
-  kernel_compilation_timeout: 60
+  kernel_compilation_timeout: 180  # Aumentado para RTX 5090
   
-  # Memory optimization
+  # Memory optimization (RTX 5090 optimized)
   batch_processing: true
-  batch_size: 1000
+  batch_size: 25000  # Aumentado para RTX 5090
   cleanup_after_batch: true
   
-  # Convolution optimization
+  # Convolution optimization (RTX 5090 optimized)
   use_fft_for_large_kernels: true
-  fft_threshold: 129
+  fft_threshold: 128  # Aumentado para RTX 5090
 
 # Data Validation Configuration
 # Data quality and validation settings

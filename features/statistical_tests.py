@@ -6,7 +6,7 @@ statistical tests components. The main functionality has been refactored
 into separate modules for better organization and maintainability.
 
 For new code, prefer importing directly from the specific modules:
-- statistical_tests.adf_tests for ADF stationarity tests
+- ADF tests removed from project
 - statistical_tests.distance_correlation for distance correlation analysis
 - statistical_tests.feature_selection for feature selection operations
 - statistical_tests.statistical_analysis for general statistical analysis

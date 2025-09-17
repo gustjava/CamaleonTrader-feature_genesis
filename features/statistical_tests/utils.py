@@ -117,58 +117,7 @@ def _tail_k_to_pandas(pdf, k: int):
     return out.to_pandas() if hasattr(out, 'to_pandas') else out
 
 
-def _adf_tstat_window_host(vals: np.ndarray) -> float:
-    """Compute ADF t-statistic for a time series window on CPU."""
-    # Drop NaN/inf inside the window to avoid poisoning the statistic
-    try:
-        x = np.asarray(vals, dtype=np.float64)
-    except Exception:
-        return np.nan
-    x = x[np.isfinite(x)]
-    n = len(x)
-    if n < 3:  # Need at least 3 points for ADF test
-        return np.nan
-    prev = float(x[0])  # Previous value for differencing
-    sum_z = sum_y = sum_zz = sum_yy = sum_zy = 0.0  # Initialize sums for regression
-    m = n - 1  # Number of differences
-    for i in range(1, n):
-        z = prev  # Lagged value (x_t-1)
-        y = float(x[i]) - prev  # First difference (Δx_t)
-        prev = float(x[i])  # Update previous value
-        sum_z += z  # Sum of lagged values
-        sum_y += y  # Sum of differences
-        sum_zz += z * z  # Sum of squared lagged values
-        sum_yy += y * y  # Sum of squared differences
-        sum_zy += z * y  # Sum of cross products
-    mz = sum_z / m  # Mean of lagged values
-    my = sum_y / m  # Mean of differences
-    Sxx = sum_zz - m * mz * mz  # Sum of squares for x (lagged values)
-    Sxy = sum_zy - m * mz * my  # Sum of cross products
-    if Sxx <= 0.0 or m <= 2:  # Check for valid regression
-        return np.nan
-    beta = Sxy / Sxx  # Regression coefficient (AR(1) coefficient)
-    alpha = my - beta * mz  # Intercept
-    # Sum of squared errors calculation
-    SSE = (sum_yy + m * alpha * alpha + beta * beta * sum_zz - 2.0 * alpha * sum_y - 2.0 * beta * sum_zy + 2.0 * alpha * beta * sum_z)
-    dof = m - 2  # Degrees of freedom
-    if dof <= 0:
-        return np.nan
-    sigma2 = SSE / dof  # Error variance
-    if sigma2 <= 0.0:
-        return np.nan
-    se_beta = (sigma2 / Sxx) ** 0.5  # Standard error of beta
-    if se_beta == 0.0:
-        return np.nan
-    return beta / se_beta  # t-statistic for unit root test
-
-
-def _adf_rolling_partition(series: cudf.Series, window: int, min_periods: int) -> cudf.Series:
-    """Apply ADF test to rolling windows of a time series."""
-    try:
-        # Host rolling apply with host function
-        return series.rolling(window=window, min_periods=min_periods).apply(lambda x: _adf_tstat_window_host(np.asarray(x)))
-    except Exception:
-        return cudf.Series(cp.full(len(series), cp.nan))  # Return NaN series if computation fails
+# ADF functions removed from project
 
 
 # JB removed from project: helpers deleted

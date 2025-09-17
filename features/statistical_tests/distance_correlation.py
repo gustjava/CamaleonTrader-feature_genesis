@@ -1,16 +1,22 @@
 """
 Distance Correlation Module
 
-This module contains functionality for computing distance correlation between variables,
-including batch processing, rolling windows, and permutation testing for significance.
+Este módulo implementa a correlação de distância ao quadrado (R^2) entre variáveis,
+incluindo:
+- caminho rápido O(n log n) 1D em CPU,
+- algoritmo em blocos (tiling) em GPU com centragem global (2 passes),
+- processamento em lote (batch),
+- janelas deslizantes (rolling),
+- e teste de permutação para significância.
+
+Todas as funções públicas retornam **R^2 ∈ [0, 1]**.
 """
 
 import logging
-import time
 import numpy as np
 import cupy as cp
 import cudf
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Tuple
 from .utils import _adaptive_tile
 from utils.logging_utils import get_logger
 
@@ -18,381 +24,505 @@ logger = get_logger(__name__, "features.statistical_tests.distance_correlation")
 
 
 class DistanceCorrelation:
-    """Class for computing distance correlation between variables."""
-    
-    def __init__(self, logger_instance=None, dcor_max_samples=10000, dcor_tile_size=2048):
-        """Initialize distance correlation with configuration parameters."""
+    """Computa correlação de distância ao quadrado (R^2) entre variáveis."""
+
+    def __init__(self, logger_instance=None, dcor_max_samples: int = 10000, dcor_tile_size: int = 2048):
+        """Parâmetros:
+        - dcor_max_samples: limite de amostras por par (controle de custo)
+        - dcor_tile_size: tamanho de bloco (tiling) no caminho GPU
+        """
         self.logger = logger_instance or logger
-        self.dcor_max_samples = dcor_max_samples
-        self.dcor_tile_size = dcor_tile_size
-    
+        self.dcor_max_samples = int(dcor_max_samples)
+        self.dcor_tile_size = int(dcor_tile_size)
+
+    # -------------------- Logging helpers --------------------
+
     def _log_info(self, message: str, **kwargs):
-        """Log info message with optional context."""
         if self.logger:
-            self.logger.info(f"dCor: {message}", extra=kwargs)
-    
+            self.logger.info(f"dCor: {message}", extra={k: (str(v) if not isinstance(v, (str, int, float, bool)) else v)
+                                                        for k, v in kwargs.items()})
+
     def _log_warn(self, message: str, **kwargs):
-        """Log warning message with optional context."""
         if self.logger:
-            self.logger.warning(f"dCor: {message}", extra=kwargs)
-    
+            self.logger.warning(f"dCor: {message}", extra={k: (str(v) if not isinstance(v, (str, int, float, bool)) else v)
+                                                           for k, v in kwargs.items()})
+
     def _log_error(self, message: str, **kwargs):
-        """Log error message with optional context."""
         if self.logger:
-            self.logger.error(f"dCor: {message}", extra=kwargs)
-    
+            self.logger.error(f"dCor: {message}", extra={k: (str(v) if not isinstance(v, (str, int, float, bool)) else v)
+                                                         for k, v in kwargs.items()})
+
     def _critical_error(self, message: str, **kwargs):
-        """Log critical error and raise exception."""
         self._log_error(message, **kwargs)
         raise RuntimeError(f"dCor Critical Error: {message}")
-    
-    def _distance_correlation_gpu(self, x: cp.ndarray, y: cp.ndarray, tile: int = 2048, max_n: int = None) -> float:
-        """Distance correlation for 1D arrays on GPU using chunked centering.
 
-        Implements a two-pass algorithm without forming full n×n matrices in memory.
+    # -------------------- Utils: NaN mask row-wise --------------------
+
+    def _rowwise_valid_mask(self, x: cp.ndarray, y: cp.ndarray) -> cp.ndarray:
+        """Retorna máscara booleana 1-D (len n) selecionando linhas sem NaN em x ou y."""
+        if x.ndim == 1 and y.ndim == 1:
+            return ~(cp.isnan(x) | cp.isnan(y))
+        if x.ndim == 1:
+            x = x[:, None]
+        if y.ndim == 1:
+            y = y[:, None]
+        return ~(cp.any(cp.isnan(x), axis=1) | cp.any(cp.isnan(y), axis=1))
+
+    # -------------------- 1D CPU Fast (R^2) --------------------
+
+    def _sum_abs_diffs(self, values: np.ndarray) -> np.ndarray:
+        order = np.argsort(values, kind='mergesort')
+        sorted_vals = values[order]
+        n = len(values)
+        prefix = np.cumsum(sorted_vals, dtype=np.float64)
+        total = prefix[-1]
+        idx = np.arange(n, dtype=np.float64)
+        left = idx * sorted_vals - np.concatenate(([0.0], prefix[:-1]))
+        right = (total - prefix) - (n - 1 - idx) * sorted_vals
+        sums_sorted = left + right
+        sums = np.empty_like(sums_sorted)
+        sums[order] = sums_sorted
+        return sums
+
+    def _pairwise_squared_diff_sum(self, values: np.ndarray) -> float:
+        order = np.argsort(values, kind='mergesort')
+        sorted_vals = values[order]
+        n = len(values)
+        idx = np.arange(n, dtype=np.float64)
+        prefix = np.cumsum(sorted_vals, dtype=np.float64)
+        prefix_sq = np.cumsum(sorted_vals * sorted_vals, dtype=np.float64)
+        prefix_prev = np.concatenate(([0.0], prefix[:-1]))
+        prefix_sq_prev = np.concatenate(([0.0], prefix_sq[:-1]))
+        term = idx * sorted_vals * sorted_vals - 2.0 * sorted_vals * prefix_prev + prefix_sq_prev
+        return term.sum()
+
+    @staticmethod
+    def _bit_query(tree: np.ndarray, idx: int) -> float:
+        idx += 1
+        res = 0.0
+        while idx > 0:
+            res += tree[idx]
+            idx -= idx & -idx
+        return res
+
+    @staticmethod
+    def _bit_update(tree: np.ndarray, idx: int, delta: float) -> None:
+        size = tree.size
+        idx += 1
+        while idx < size:
+            tree[idx] += delta
+            idx += idx & -idx
+
+    def _pairwise_abs_product_sum(self, x: np.ndarray, y: np.ndarray) -> float:
+        order = np.argsort(x, kind='mergesort')
+        x_sorted = x[order]
+        y_sorted = y[order]
+        _, ranks = np.unique(y_sorted, return_inverse=True)
+        size = int(ranks.max()) + 1
+
+        tree_count = np.zeros(size + 2, dtype=np.float64)
+        tree_sum_y = np.zeros(size + 2, dtype=np.float64)
+        tree_sum_x = np.zeros(size + 2, dtype=np.float64)
+        tree_sum_xy = np.zeros(size + 2, dtype=np.float64)
+
+        total_count = 0.0
+        total_y = 0.0
+        total_x = 0.0
+        total_xy = 0.0
+        S = 0.0
+
+        for x_val, y_val, rank in zip(x_sorted, y_sorted, ranks):
+            count_le = self._bit_query(tree_count, rank)
+            sum_y_le = self._bit_query(tree_sum_y, rank)
+            sum_x_le = self._bit_query(tree_sum_x, rank)
+            sum_xy_le = self._bit_query(tree_sum_xy, rank)
+
+            count_gt = total_count - count_le
+            sum_y_gt = total_y - sum_y_le
+            sum_x_gt = total_x - sum_x_le
+            sum_xy_gt = total_xy - sum_xy_le
+
+            term1 = x_val * (count_le * y_val - sum_y_le) - (y_val * sum_x_le - sum_xy_le)
+            term2 = x_val * (sum_y_gt - count_gt * y_val) - (sum_xy_gt - y_val * sum_x_gt)
+            S += term1 + term2
+
+            self._bit_update(tree_count, rank, 1.0)
+            self._bit_update(tree_sum_y, rank, y_val)
+            self._bit_update(tree_sum_x, rank, x_val)
+            self._bit_update(tree_sum_xy, rank, x_val * y_val)
+
+            total_count += 1.0
+            total_y += y_val
+            total_x += x_val
+            total_xy += x_val * y_val
+
+        return S
+
+    def _distance_correlation_1d_fast(self, x_np: np.ndarray, y_np: np.ndarray) -> float:
+        """
+        Algoritmo rápido 1D com complexidade O(n log n).
+        Retorna R^2 em [0, 1].
+        """
+        n = x_np.size
+        if n < 2:
+            return float('nan')
+
+        sum_abs_x = self._sum_abs_diffs(x_np)
+        sum_abs_y = self._sum_abs_diffs(y_np)
+
+        a_i = sum_abs_x / n
+        b_i = sum_abs_y / n
+        a_bar = sum_abs_x.sum() / (n * n)
+        b_bar = sum_abs_y.sum() / (n * n)
+
+        cross_sum = self._pairwise_abs_product_sum(x_np, y_np)  # soma i<j de |x_i-x_j||y_i-y_j|
+        m_xy = (2.0 * cross_sum) / (n * n)
+
+        dcov2 = m_xy + a_bar * b_bar - (2.0 / n) * np.dot(a_i, b_i)
+
+        Sxx = self._pairwise_squared_diff_sum(x_np)
+        Syy = self._pairwise_squared_diff_sum(y_np)
+        m_xx = (2.0 * Sxx) / (n * n)
+        m_yy = (2.0 * Syy) / (n * n)
+
+        dvar_x2 = m_xx + a_bar * a_bar - (2.0 / n) * np.dot(a_i, a_i)
+        dvar_y2 = m_yy + b_bar * b_bar - (2.0 / n) * np.dot(b_i, b_i)
+
+        dcov2 = max(dcov2, 0.0)
+        dvar_x2 = max(dvar_x2, 0.0)
+        dvar_y2 = max(dvar_y2, 0.0)
+
+        denom = np.sqrt(dvar_x2 * dvar_y2)
+        if denom <= 0.0:
+            return 0.0
+
+        r2 = dcov2 / denom
+        return float(np.clip(r2, 0.0, 1.0))
+
+    # -------------------- GPU tiled (global centering, R^2) --------------------
+
+    def _dcor_gpu_single(self, x: cp.ndarray, y: cp.ndarray, max_n: int = None, tile: int = None) -> float:
+        """
+        Correlação de distância ao quadrado (R^2) via tiling em GPU com centragem global (2 passes).
+        Aceita entradas 1D (n,) ou multi-D (n,d). Retorna R^2 em [0, 1].
         """
         try:
-            # Remove NaNs and invalid values
-            mask = ~(cp.isnan(x) | cp.isnan(y))
+            # Máscara row-wise de NaNs
+            mask = self._rowwise_valid_mask(x, y)
             x = x[mask]
             y = y[mask]
-            n = int(x.size)
-            if n < 2:  # Need at least 2 points for distance correlation
-                return float('nan')
-            if max_n is not None and n > int(max_n):  # Limit sample size for performance
-                x = x[-int(max_n):]  # Take last max_n points
-                y = y[-int(max_n):]
-                n = int(x.size)
-            tile = int(max(1, tile))  # Ensure tile size is at least 1
-
-            # pass 1: row sums and grand means for distance matrices
-            a_row_sums = cp.zeros(n, dtype=cp.float64)  # Row sums for x distance matrix
-            b_row_sums = cp.zeros(n, dtype=cp.float64)  # Row sums for y distance matrix
-            a_total_sum = cp.float64(0.0)  # Total sum for x distance matrix
-            b_total_sum = cp.float64(0.0)  # Total sum for y distance matrix
-            for i0 in range(0, n, tile):  # Process in tiles to manage memory
-                i1 = min(i0 + tile, n)
-                xi = x[i0:i1]  # Current tile of x
-                yi = y[i0:i1]  # Current tile of y
-                for j0 in range(0, n, tile):  # Compare with all other tiles
-                    j1 = min(j0 + tile, n)
-                    xj = x[j0:j1]  # Comparison tile of x
-                    yj = y[j0:j1]  # Comparison tile of y
-                    dx = cp.abs(xi[:, None] - xj[None, :])  # Distance matrix block for x
-                    dy = cp.abs(yi[:, None] - yj[None, :])  # Distance matrix block for y
-                    a_row_sums[i0:i1] += dx.sum(axis=1, dtype=cp.float64)  # Add row sums for current tile
-                    b_row_sums[i0:i1] += dy.sum(axis=1, dtype=cp.float64)  # Add row sums for current tile
-                    if j0 != i0:  # Avoid double counting diagonal blocks
-                        a_row_sums[j0:j1] += dx.sum(axis=0, dtype=cp.float64)  # Add column sums for comparison tile
-                        b_row_sums[j0:j1] += dy.sum(axis=0, dtype=cp.float64)  # Add column sums for comparison tile
-                    a_total_sum += cp.sum(dx, dtype=cp.float64)  # Add to total sum
-                    b_total_sum += cp.sum(dy, dtype=cp.float64)  # Add to total sum
-
-            n_f = float(n)
-            a_row_mean = a_row_sums / n_f  # Mean of each row in x distance matrix
-            b_row_mean = b_row_sums / n_f  # Mean of each row in y distance matrix
-            a_grand = float(a_total_sum / (n_f * n_f))  # Grand mean of x distance matrix
-            b_grand = float(b_total_sum / (n_f * n_f))  # Grand mean of y distance matrix
-
-            # pass 2: centered blocks and accumulations
-            num = cp.float64(0.0)  # Numerator for distance covariance
-            sumA2 = cp.float64(0.0)  # Sum of squared centered x distances
-            sumB2 = cp.float64(0.0)  # Sum of squared centered y distances
-            for i0 in range(0, n, tile):  # Process in tiles again
-                i1 = min(i0 + tile, n)
-                xi = x[i0:i1]  # Current tile of x
-                yi = y[i0:i1]  # Current tile of y
-                a_i_mean = a_row_mean[i0:i1]  # Row means for current tile
-                b_i_mean = b_row_mean[i0:i1]  # Row means for current tile
-                for j0 in range(0, n, tile):  # Compare with all other tiles
-                    j1 = min(j0 + tile, n)
-                    xj = x[j0:j1]  # Comparison tile of x
-                    yj = y[j0:j1]  # Comparison tile of y
-                    a_j_mean = a_row_mean[j0:j1]  # Row means for comparison tile
-                    b_j_mean = b_row_mean[j0:j1]  # Row means for comparison tile
-                    dx = cp.abs(xi[:, None] - xj[None, :])  # Distance matrix block for x
-                    dy = cp.abs(yi[:, None] - yj[None, :])  # Distance matrix block for y
-                    # Double centering: subtract row means, column means, and add grand mean
-                    A = dx - a_i_mean[:, None] - a_j_mean[None, :] + a_grand
-                    B = dy - b_i_mean[:, None] - b_j_mean[None, :] + b_grand
-                    num += cp.sum(A * B, dtype=cp.float64)  # Accumulate distance covariance
-                    sumA2 += cp.sum(A * A, dtype=cp.float64)  # Accumulate x distance variance
-                    sumB2 += cp.sum(B * B, dtype=cp.float64)  # Accumulate y distance variance
-            denom = cp.sqrt(sumA2 * sumB2)  # Denominator for distance correlation
-            if denom == 0:  # Check for zero denominator
-                return 0.0
-            return float(num / denom)  # Return distance correlation
-        except Exception:
-            return float('nan')  # Return NaN if computation fails
-
-    def _dcor_gpu_single(self, x: cp.ndarray, y: cp.ndarray, max_n: int = None) -> float:
-        """
-        Distance correlation (dCor) via bloco (chunked), estável em memória para séries 1D.
-        Implementa duas passagens: (1) médias por linha e média global; (2) centragem e acumulação.
-        """
-        try:
-            # Limpeza de NaNs
-            mask = ~(cp.isnan(x) | cp.isnan(y))
-            x = x[mask]
-            y = y[mask]
-            n = int(x.size)
-
+            n = int(x.shape[0])
             if n < 2:
                 return float("nan")
 
-            # Amostragem/decimação para limitar custo
-            if max_n is None:
-                max_n = self.dcor_max_samples
-            elif n > max_n:
-                # fallback: amostra cauda
+            # Limite de amostras
+            max_n = int(max_n) if max_n is not None else self.dcor_max_samples
+            if n > max_n:
                 x = x[-max_n:]
                 y = y[-max_n:]
                 n = max_n
 
-            # Garantir tipo consistente para performance/memória
-            if x.dtype != cp.float32:
-                x = x.astype(cp.float32, copy=False)
-            if y.dtype != cp.float32:
-                y = y.astype(cp.float32, copy=False)
+            # Formato (n,d)
+            x = x.astype(cp.float32, copy=False)
+            y = y.astype(cp.float32, copy=False)
+            if x.ndim == 1:
+                x = x[:, None]
+            if y.ndim == 1:
+                y = y[:, None]
 
-            # Tamanho do bloco (trade-off memória/tempo)
-            tile = _adaptive_tile(self.dcor_tile_size)
-            tile = min(tile, n) if n >= 2 * tile else min(max(1024, tile), n)
+            # Tamanho de bloco (adaptativo por memória + limitado por n)
+            try:
+                req = int(tile) if tile is not None else int(self.dcor_tile_size)
+            except Exception:
+                req = int(self.dcor_tile_size)
+            t = _adaptive_tile(req)
+            t = max(256, min(int(t), n))
 
-            t0 = time.time()
-
-            # Passo 1: somas por linha e somas globais (x e y)
+            # Passo 1: somas por linha e média global
             a_row_sums = cp.zeros(n, dtype=cp.float64)
             b_row_sums = cp.zeros(n, dtype=cp.float64)
             a_total_sum = cp.float64(0.0)
             b_total_sum = cp.float64(0.0)
 
-            for i0 in range(0, n, tile):
-                i1 = min(i0 + tile, n)
+            for i0 in range(0, n, t):
+                i1 = min(i0 + t, n)
                 xi = x[i0:i1]
                 yi = y[i0:i1]
-                for j0 in range(0, n, tile):
-                    j1 = min(j0 + tile, n)
+                for j0 in range(0, n, t):
+                    j1 = min(j0 + t, n)
                     xj = x[j0:j1]
                     yj = y[j0:j1]
 
-                    dx = cp.abs(xi[:, None] - xj[None, :])
-                    dy = cp.abs(yi[:, None] - yj[None, :])
+                    dx = cp.linalg.norm(xi[:, None, :] - xj[None, :, :], axis=-1)
+                    dy = cp.linalg.norm(yi[:, None, :] - yj[None, :, :], axis=-1)
 
-                    # acumula somas por linha para i-bloco
                     a_row_sums[i0:i1] += dx.sum(axis=1, dtype=cp.float64)
                     b_row_sums[i0:i1] += dy.sum(axis=1, dtype=cp.float64)
-
-                    # para j-bloco, somas por linha equivalem às somas por coluna do bloco i
-                    # acumular também para j quando blocos distintos (evita recomputar em outra iteração)
-                    if j0 != i0:
-                        a_row_sums[j0:j1] += dx.sum(axis=0, dtype=cp.float64)
-                        b_row_sums[j0:j1] += dy.sum(axis=0, dtype=cp.float64)
-
                     a_total_sum += cp.sum(dx, dtype=cp.float64)
                     b_total_sum += cp.sum(dy, dtype=cp.float64)
 
-            # médias
             n_f = float(n)
             a_row_mean = a_row_sums / n_f
             b_row_mean = b_row_sums / n_f
             a_grand = float(a_total_sum / (n_f * n_f))
             b_grand = float(b_total_sum / (n_f * n_f))
 
-            # Passo 2: centragem por blocos e acumulação de somas
-            num = cp.float64(0.0)
-            sumA2 = cp.float64(0.0)
-            sumB2 = cp.float64(0.0)
+            # Passo 2: centragem global por bloco + acumulação
+            num = cp.float64(0.0)   # sum A*B
+            sumA2 = cp.float64(0.0) # sum A^2
+            sumB2 = cp.float64(0.0) # sum B^2
 
-            for i0 in range(0, n, tile):
-                i1 = min(i0 + tile, n)
+            for i0 in range(0, n, t):
+                i1 = min(i0 + t, n)
                 xi = x[i0:i1]
                 yi = y[i0:i1]
-                a_i_mean = a_row_mean[i0:i1]
-                b_i_mean = b_row_mean[i0:i1]
-                for j0 in range(0, n, tile):
-                    j1 = min(j0 + tile, n)
+                a_i = a_row_mean[i0:i1]
+                b_i = b_row_mean[i0:i1]
+
+                for j0 in range(0, n, t):
+                    j1 = min(j0 + t, n)
                     xj = x[j0:j1]
                     yj = y[j0:j1]
-                    a_j_mean = a_row_mean[j0:j1]
-                    b_j_mean = b_row_mean[j0:j1]
+                    a_j = a_row_mean[j0:j1]
+                    b_j = b_row_mean[j0:j1]
 
-                    dx = cp.abs(xi[:, None] - xj[None, :])
-                    dy = cp.abs(yi[:, None] - yj[None, :])
+                    dx = cp.linalg.norm(xi[:, None, :] - xj[None, :, :], axis=-1)
+                    dy = cp.linalg.norm(yi[:, None, :] - yj[None, :, :], axis=-1)
 
-                    A = dx - a_i_mean[:, None] - a_j_mean[None, :] + a_grand
-                    B = dy - b_i_mean[:, None] - b_j_mean[None, :] + b_grand
+                    # Centragem global in-place para reduzir alocações temporárias
+                    dx -= a_i[:, None]
+                    dx -= a_j[None, :]
+                    dx += a_grand
+                    dy -= b_i[:, None]
+                    dy -= b_j[None, :]
+                    dy += b_grand
 
-                    num += cp.sum(A * B, dtype=cp.float64)
-                    sumA2 += cp.sum(A * A, dtype=cp.float64)
-                    sumB2 += cp.sum(B * B, dtype=cp.float64)
+                    num  += cp.sum(dx * dy, dtype=cp.float64)
+                    sumA2 += cp.sum(dx * dx, dtype=cp.float64)
+                    sumB2 += cp.sum(dy * dy, dtype=cp.float64)
 
             denom = cp.sqrt(sumA2 * sumB2)
-            if denom == 0:
+            if float(denom) <= 0.0:
                 return 0.0
-            dcor = float(num / denom)
-            self._log_info("dCor computed", n=n, tile=int(tile), dcor=round(dcor, 6), elapsed=round(time.time()-t0, 3))
-            return dcor
+
+            r2 = float(num / denom)
+            return float(min(1.0, max(0.0, r2)))
+
         except Exception as e:
-            self._log_error(f"Error in chunked dCor computation: {e}")
+            self._log_error("Error in tiled GPU dCor", traceback=str(e))
             return float("nan")
 
-    def _compute_distance_correlation_vectorized(self, x: cp.ndarray, y: cp.ndarray, max_samples: int = 10000) -> float:
+    def _distance_correlation_gpu(
+        self,
+        x: cp.ndarray,
+        y: cp.ndarray,
+        tile: int = 2048,
+        max_n: int = None,
+        async_execution: bool = False,  # mantido por compatibilidade; não assíncrono aqui
+    ) -> float:
         """
-        Cálculo de dCor usando abordagem em blocos (evita matrizes n×n completas).
-        """
-        try:
-            return self._dcor_gpu_single(x, y, max_n=max_samples)
-        except Exception as e:
-            self._critical_error(f"Error in distance correlation: {e}")
-
-    def distance_correlation_with_permutation(self, x: cp.ndarray, y: cp.ndarray, n_perm: int = 1000) -> Tuple[float, float]:
-        """
-        Distance correlation with permutation test to estimate p-value.
-        """
-        dcor_obs = self._compute_distance_correlation_vectorized(x, y)
-        
-        # inicializa contador de valores permutados >= observado
-        greater_count = 0
-        # use cupy.random.permutation para embaralhar y em GPU
-        for _ in range(n_perm):
-            y_perm = cp.random.permutation(y)
-            dcor_perm = self._compute_distance_correlation_vectorized(x, y_perm)
-            if dcor_perm >= dcor_obs:
-                greater_count += 1
-        
-        p_value = (greater_count + 1) / (n_perm + 1)  # correção de continuidade
-        return float(dcor_obs), float(p_value)
-    
-    def compute_distance_correlation_batch(self, data_pairs: List[Tuple[cp.ndarray, cp.ndarray]], 
-                                         max_samples: int = 10000, 
-                                         include_permutation: bool = False,
-                                         n_perm: int = 1000) -> List[Dict[str, float]]:
-        """
-        Compute distance correlation for multiple pairs of variables in batch.
-        
-        Args:
-            data_pairs: List of (x, y) pairs
-            max_samples: Maximum number of samples per pair
-            include_permutation: Whether to include permutation test
-            n_perm: Number of permutations for p-value calculation
-            
-        Returns:
-            List of dictionaries with dcor value and optionally p-value
+        Seleciona automaticamente o caminho:
+        - 1D: CPU rápido (R^2)
+        - multi-D: GPU em blocos com centragem global (R^2)
+        Retorna R^2 em [0, 1].
         """
         try:
-            results = []
-            
-            for i, (x, y) in enumerate(data_pairs):
+            if tile is not None:
                 try:
-                    # Remove NaN values
-                    valid_mask = ~(cp.isnan(x) | cp.isnan(y))
-                    if cp.sum(valid_mask) < 10:
-                        if include_permutation:
-                            results.append({'dcor_value': 0.0, 'dcor_pvalue': 1.0})
-                        else:
-                            results.append({'dcor_value': 0.0})
-                        continue
-                    
-                    x_clean = x[valid_mask]
-                    y_clean = y[valid_mask]
-                    
-                    if include_permutation:
-                        dcor_value, dcor_pvalue = self.distance_correlation_with_permutation(
-                            x_clean, y_clean, n_perm
-                        )
-                        results.append({
-                            'dcor_value': dcor_value,
-                            'dcor_pvalue': dcor_pvalue,
-                            'dcor_significant': dcor_pvalue < 0.05  # alpha = 0.05
-                        })
-                    else:
-                        dcor_value = self._compute_distance_correlation_vectorized(x_clean, y_clean, max_samples)
-                        results.append({'dcor_value': dcor_value})
-                    
-                except Exception as e:
-                    self._log_warn(f"Error computing dCor for pair {i}: {e}")
-                    if include_permutation:
-                        results.append({'dcor_value': 0.0, 'dcor_pvalue': 1.0, 'dcor_significant': False})
-                    else:
-                        results.append({'dcor_value': 0.0})
-            
-            return results
-            
-        except Exception as e:
-            self._critical_error(f"Error in batch distance correlation: {e}")
+                    self.dcor_tile_size = int(tile)
+                except (ValueError, TypeError):
+                    pass
 
-    def _dcor_partition_gpu(self, pdf: cudf.DataFrame, target: str, candidates: List[str], max_samples: int, tile: int) -> cudf.DataFrame:
-        """Compute distance correlation between target and candidate features using GPU for a partition."""
-        out = {}
-        results_log = []  # Store results for logging
-        
-        # Get GPU info
-        try:
-            import cupy as cp
-            import os as _os
-            current_gpu = cp.cuda.runtime.getDevice()
-            visible = _os.environ.get('CUDA_VISIBLE_DEVICES', '')
-            gpu_info = f"GPU {current_gpu} (VISIBLE={visible})"
-        except Exception:
-            gpu_info = "GPU unknown"
-        
-        try:
-            y = pdf[target].astype('f8').to_cupy()  # Convert target to CuPy array
-            # Only log once per partition, not for every feature
-            if len(candidates) > 0:
-                self._log_info(f"dCor partition processing {len(candidates)} features on {gpu_info}", 
-                              target=target, sample_size=len(pdf))
-        except Exception:
-            return cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])  # Return NaN if conversion fails
-        
-        for i, c in enumerate(candidates):  # Iterate through candidate features
+            mask = self._rowwise_valid_mask(x, y)
+            x = x[mask]
+            y = y[mask]
+            if x.shape[0] < 2:
+                return float('nan')
+
+            # amostragem
+            if max_n is not None and int(x.shape[0]) > int(max_n):
+                x = x[-int(max_n):]
+                y = y[-int(max_n):]
+
+            # 1D → CPU rápido
+            if x.ndim == 1 and y.ndim == 1:
+                self._log_info("CPU fast 1D (R^2)", samples=int(x.size))
+                return self._distance_correlation_1d_fast(cp.asnumpy(x), cp.asnumpy(y))
+
+            # multi-D → GPU em blocos
+            self._log_info("GPU tiled (R^2)", samples=int(x.shape[0]))
+            return self._dcor_gpu_single(x, y, max_n=max_n, tile=self.dcor_tile_size)
+
+        except cp.cuda.OutOfMemoryError as e:
+            self._log_warn("GPU OOM", traceback=str(e))
+            return float('nan')
+        except Exception as e:
+            self._log_error("dCor GPU path failed", traceback=str(e))
+            return float('nan')
+
+    # -------------------- Permutation test (R^2) --------------------
+
+    def distance_correlation_with_permutation(
+        self,
+        x: cp.ndarray,
+        y: cp.ndarray,
+        n_perm: int = 1000,
+        perm_max_samples: int = 4096
+    ) -> Tuple[float, float]:
+        """
+        Calcula R^2 observado e p-valor via teste de permutação:
+        - R^2 observado: com max_n = self.dcor_max_samples (ou o tamanho efetivo)
+        - Permutações: usam no máx. perm_max_samples para reduzir custo
+
+        Retorna: (r2_obs, p_value)
+        """
+        # Observado (pode usar mais amostras)
+        r2_obs = self._distance_correlation_gpu(x, y, max_n=self.dcor_max_samples)
+        if not np.isfinite(r2_obs):
+            return 0.0, 1.0
+
+        # Contador
+        ge = 0
+        # Permutar em GPU (embaralhando y)
+        # Usamos limite menor para acelerar
+        for _ in range(int(n_perm)):
+            # amostrar mesma porção final para consistência de custo
+            x_use = x
+            y_use = y
+            if int(x.shape[0]) > perm_max_samples:
+                x_use = x[-perm_max_samples:]
+                y_use = y[-perm_max_samples:]
+            # máscara row-wise
+            mask = self._rowwise_valid_mask(x_use, y_use)
+            if int(mask.sum().item()) < 2:
+                continue
+            xv = x_use[mask]
+            yv = y_use[mask]
+            # permuta apenas y
+            yp = cp.random.permutation(yv)
+            r2_perm = self._distance_correlation_gpu(xv, yp, max_n=perm_max_samples)
+            if np.isfinite(r2_perm) and (r2_perm >= r2_obs):
+                ge += 1
+
+        p_value = (ge + 1.0) / (n_perm + 1.0)
+        return float(r2_obs), float(p_value)
+
+    # -------------------- Batch (R^2) --------------------
+
+    def compute_distance_correlation_batch(
+        self,
+        data_pairs: List[Tuple[cp.ndarray, cp.ndarray]],
+        max_samples: int = 10000,
+        include_permutation: bool = False,
+        n_perm: int = 1000,
+        perm_max_samples: int = 4096
+    ) -> List[Dict[str, float]]:
+        """
+        Computa R^2 (e opcionalmente p-valor) para vários pares (x,y).
+
+        Retorna lista de dicts com chaves:
+        - 'dcor_r2' e opcionalmente 'dcor_pvalue', 'dcor_significant'
+        """
+        results = []
+        for i, (x, y) in enumerate(data_pairs):
             try:
-                x = pdf[c].astype('f8').to_cupy()  # Convert candidate to CuPy array
-                dcor_value = self._distance_correlation_gpu(x, y, tile=tile, max_n=max_samples)  # Compute GPU distance correlation
-                out[f"dcor_{c}"] = dcor_value
-                
-                # Store result for logging
-                results_log.append(f"{c}: {dcor_value:.6f}")
-                
-                # Log progress every 20 features to reduce spam
-                if (i + 1) % 20 == 0 or (i + 1) == len(candidates):
-                    self._log_info(f"dCor progress: {i + 1}/{len(candidates)} features processed", 
-                                  current_feature=c, last_dcor=dcor_value)
-                
-            except Exception:
-                out[f"dcor_{c}"] = float('nan')  # Return NaN if computation fails
-                results_log.append(f"{c}: NaN")
-        
-        # Store results in a way that can be accessed by the main process
+                mask = self._rowwise_valid_mask(x, y)
+                valid_count = int(mask.sum().item())
+                if valid_count < 10:
+                    if include_permutation:
+                        results.append({'dcor_r2': 0.0, 'dcor_pvalue': 1.0, 'dcor_significant': False})
+                    else:
+                        results.append({'dcor_r2': 0.0})
+                    continue
+
+                x_clean = x[mask]
+                y_clean = y[mask]
+
+                if include_permutation:
+                    r2, p = self.distance_correlation_with_permutation(
+                        x_clean, y_clean, n_perm=n_perm, perm_max_samples=perm_max_samples
+                    )
+                    results.append({
+                        'dcor_r2': float(r2),
+                        'dcor_pvalue': float(p),
+                        'dcor_significant': bool(p < 0.05)
+                    })
+                else:
+                    r2 = self._distance_correlation_gpu(x_clean, y_clean, max_n=max_samples)
+                    results.append({'dcor_r2': float(r2)})
+
+            except Exception as e:
+                self._log_warn(f"Batch pair {i} failed", error=str(e))
+                if include_permutation:
+                    results.append({'dcor_r2': 0.0, 'dcor_pvalue': 1.0, 'dcor_significant': False})
+                else:
+                    results.append({'dcor_r2': 0.0})
+        return results
+
+    def compute_distance_correlation_parallel_batch(
+        self,
+        data_pairs: List[Tuple[cp.ndarray, cp.ndarray]],
+        max_samples: int = 10000,
+        batch_size: int = 8
+    ) -> List[float]:
+        """
+        Processa pares em lotes (sem streams explícitos aqui) e retorna lista de R^2.
+        """
+        results: List[float] = []
+        for batch_start in range(0, len(data_pairs), batch_size):
+            batch_pairs = data_pairs[batch_start:batch_start + batch_size]
+            for x, y in batch_pairs:
+                try:
+                    mask = self._rowwise_valid_mask(x, y)
+                    if int(mask.sum().item()) < 10:
+                        results.append(0.0)
+                        continue
+                    r2 = self._distance_correlation_gpu(x[mask], y[mask], max_n=max_samples)
+                    results.append(float(r2))
+                except Exception as e:
+                    self._log_warn("Parallel batch item failed", error=str(e))
+                    results.append(0.0)
+        return results
+
+    # -------------------- Helpers para DataFrames cuDF --------------------
+
+    def _dcor_partition_gpu(self, pdf: cudf.DataFrame, target: str, candidates: List[str],
+                            max_samples: int, tile: int) -> cudf.DataFrame:
+        """Computa R^2 entre target e cada feature candidata numa partição (GPU)."""
+        out: Dict[str, float] = {}
         try:
-            # Add results as metadata to the DataFrame
-            result_df = cudf.DataFrame([out])
-            result_df.attrs['dcor_results'] = results_log
-            result_df.attrs['target'] = target
-            result_df.attrs['n_features'] = len(candidates)
-            result_df.attrs['gpu_info'] = gpu_info
-            self._log_info(f"Completed dCor computation for {len(candidates)} features", gpu_info=gpu_info)
-            return result_df
+            y = pdf[target].astype('f8').to_cupy()
         except Exception:
-            return cudf.DataFrame([out])  # Return results as DataFrame
+            return cudf.DataFrame([{f"dcor_{c}": float('nan') for c in candidates}])
+
+        for i, c in enumerate(candidates):
+            try:
+                x = pdf[c].astype('f8').to_cupy()
+                r2 = self._distance_correlation_gpu(x, y, tile=tile, max_n=max_samples)
+                out[f"dcor_{c}"] = float(r2)
+                if (i + 1) % 20 == 0 or (i + 1) == len(candidates):
+                    self._log_info("partition progress", processed=i + 1, total=len(candidates), last_feature=c)
+            except Exception as e:
+                self._log_warn("partition feature failed", feature=c, error=str(e))
+                out[f"dcor_{c}"] = float('nan')
+
+        return cudf.DataFrame([out])
 
     def _dcor_rolling_partition_gpu(
-        self, pdf: cudf.DataFrame, target: str, candidates: List[str], window: int, step: int, 
-        min_periods: int, min_valid_pairs: int, max_rows: int, max_windows: int, agg: str, 
+        self, pdf: cudf.DataFrame, target: str, candidates: List[str], window: int, step: int,
+        min_periods: int, min_valid_pairs: int, max_rows: int, max_windows: int, agg: str,
         max_samples: int, tile: int
     ) -> cudf.DataFrame:
-        """Compute rolling distance correlation for a partition."""
-        # Limit rows to control memory
+        """Computa R^2 rolling por feature e agrega (mean/median/min/max/p25/p75)."""
         if hasattr(pdf, 'head'):
             pdf = pdf.head(int(max_rows))
         try:
             y_all = pdf[target].astype('f8').to_cupy()
         except Exception:
-            # Return NaNs and zero counts
             base = {f"dcor_roll_{c}": float('nan') for c in candidates}
             cnts = {f"dcor_roll_cnt_{c}": np.int64(0) for c in candidates}
             return cudf.DataFrame([{**base, **cnts}])
+
         n = int(y_all.size)
         if n < max(3, int(min_periods)):
             base = {f"dcor_roll_{c}": float('nan') for c in candidates}
@@ -403,10 +533,7 @@ class DistanceCorrelation:
         if len(starts) > int(max_windows):
             starts = starts[-int(max_windows):]
 
-        score_map: Dict[str, float] = {}
-        cnt_map: Dict[str, int] = {}
-
-        # Pre-pull all candidate columns as CuPy
+        # Pré-carrega colunas
         X_cols: Dict[str, cp.ndarray] = {}
         for c in candidates:
             try:
@@ -414,15 +541,16 @@ class DistanceCorrelation:
             except Exception:
                 X_cols[c] = None
 
-        self._log_info(f"Processing {len(candidates)} features with window={window}")
-        for i, c in enumerate(candidates):
-            if i % 50 == 0:  # Log every 50 features to avoid spam
-                self._log_info(f"Processing feature {i+1}/{len(candidates)}: {c}")
+        score_map: Dict[str, float] = {}
+        cnt_map: Dict[str, int] = {}
+
+        for c in candidates:
             x_all = X_cols.get(c, None)
             if x_all is None:
                 score_map[f"dcor_roll_{c}"] = float('nan')
                 cnt_map[f"dcor_roll_cnt_{c}"] = np.int64(0)
                 continue
+
             vals: List[float] = []
             for s in starts:
                 e = min(n, s + int(window))
@@ -430,33 +558,33 @@ class DistanceCorrelation:
                     continue
                 xv = x_all[s:e]
                 yv = y_all[s:e]
-                m = ~(cp.isnan(xv) | cp.isnan(yv))
-                if int(m.sum().item()) < int(min_valid_pairs):
+                # máscara row-wise
+                mask = self._rowwise_valid_mask(xv, yv)
+                valid_cnt = int(mask.sum().item())
+                if valid_cnt < int(min_valid_pairs):
                     continue
-                xv2 = xv[m]
-                yv2 = yv[m]
-                vals.append(self._distance_correlation_gpu(xv2, yv2, tile=tile, max_n=max_samples))
+                r2 = self._distance_correlation_gpu(xv[mask], yv[mask], tile=tile, max_n=max_samples)
+                if np.isfinite(r2):
+                    vals.append(float(r2))
+
             if not vals:
                 score_map[f"dcor_roll_{c}"] = float('nan')
                 cnt_map[f"dcor_roll_cnt_{c}"] = np.int64(0)
             else:
-                arr = np.array([v for v in vals if np.isfinite(v)], dtype=float)
+                arr = np.asarray(vals, dtype=float)
                 cnt_map[f"dcor_roll_cnt_{c}"] = np.int64(arr.size)
-                if arr.size == 0:
-                    score_map[f"dcor_roll_{c}"] = float('nan')
+                if agg == 'mean':
+                    score_map[f"dcor_roll_{c}"] = float(np.mean(arr))
+                elif agg == 'min':
+                    score_map[f"dcor_roll_{c}"] = float(np.min(arr))
+                elif agg == 'max':
+                    score_map[f"dcor_roll_{c}"] = float(np.max(arr))
+                elif agg == 'p25':
+                    score_map[f"dcor_roll_{c}"] = float(np.percentile(arr, 25))
+                elif agg == 'p75':
+                    score_map[f"dcor_roll_{c}"] = float(np.percentile(arr, 75))
                 else:
-                    if agg == 'mean':
-                        score_map[f"dcor_roll_{c}"] = float(np.mean(arr))
-                    elif agg == 'min':
-                        score_map[f"dcor_roll_{c}"] = float(np.min(arr))
-                    elif agg == 'max':
-                        score_map[f"dcor_roll_{c}"] = float(np.max(arr))
-                    elif agg == 'p25':
-                        score_map[f"dcor_roll_{c}"] = float(np.percentile(arr, 25))
-                    elif agg == 'p75':
-                        score_map[f"dcor_roll_{c}"] = float(np.percentile(arr, 75))
-                    else:
-                        score_map[f"dcor_roll_{c}"] = float(np.median(arr))
+                    score_map[f"dcor_roll_{c}"] = float(np.median(arr))
 
         ordered = {}
         for c in candidates:
@@ -465,116 +593,88 @@ class DistanceCorrelation:
             ordered[f"dcor_roll_cnt_{c}"] = cnt_map.get(f"dcor_roll_cnt_{c}", np.int64(0))
         return cudf.DataFrame([ordered])
 
+    # -------------------- (Opcional) Aplicação em DataFrame amplo --------------------
+
     def _apply_comprehensive_distance_correlation(self, df: cudf.DataFrame) -> cudf.DataFrame:
         """
-        Apply comprehensive distance correlation analysis.
-        
-        Generates:
-        - dcor_* for each feature vs target
-        - dcor_roll_* for rolling distance correlation
-        - dcor_pvalue_* for significance testing
+        Exemplo de aplicação por features 'frac_diff_*' vs coluna alvo ('y_ret' ou 'target').
+        Cria colunas dcor_* com **R^2** e, se habilitado, dcor_roll_* (mediana rolling).
         """
         try:
             self._log_info("Applying comprehensive distance correlation analysis...")
-            
-            # Find target column
+            # encontra alvo
             target_col = None
             for col in df.columns:
                 if 'y_ret' in col or 'target' in col.lower():
                     target_col = col
                     break
-            
             if target_col is None:
-                self._log_warn("No target column found for distance correlation analysis")
+                self._log_warn("No target column found")
                 return df
-            
-            # Find candidate features (exclude target and other metrics)
+
+            # features candidatas
             candidate_features = []
             for col in df.columns:
-                if (col != target_col and 
-                    not col.startswith(('dcor_', 'adf_', 'stage1_', 'cpcv_', 'y_ret_fwd_')) and
+                if (col != target_col and
+                    not col.startswith(('dcor_', 'stage1_', 'cpcv_', 'y_ret_fwd_')) and
                     'frac_diff' in col):
                     candidate_features.append(col)
-            
             if not candidate_features:
-                self._log_warn("No candidate features found for distance correlation analysis")
+                self._log_warn("No candidate features found")
                 return df
-            
-            self._log_info(f"Computing distance correlation for {len(candidate_features)} features vs {target_col}")
-            
-            # Compute distance correlation for each feature
+
+            # computa por feature
             for feature in candidate_features:
                 try:
                     x = df[feature].to_cupy()
                     y = df[target_col].to_cupy()
-                    
-                    # Remove NaN values
-                    valid_mask = ~(cp.isnan(x) | cp.isnan(y))
-                    if cp.sum(valid_mask) > 50:  # Minimum sample size
-                        x_clean = x[valid_mask]
-                        y_clean = y[valid_mask]
-                        
-                        # Compute distance correlation
-                        dcor_value = self._compute_distance_correlation_vectorized(x_clean, y_clean)
-                        
-                        # Add to DataFrame
+                    mask = self._rowwise_valid_mask(x, y)
+                    if int(mask.sum().item()) > 50:
+                        r2 = self._distance_correlation_gpu(x[mask], y[mask], max_n=self.dcor_max_samples)
                         base_name = feature.replace('frac_diff_', '')
-                        df[f'dcor_{base_name}'] = float(dcor_value)
-                        
-                        # Compute rolling distance correlation if enabled
+                        df[f'dcor_{base_name}'] = float(r2)
+
+                        # rolling opcional
                         if hasattr(self, 'stage1_rolling_enabled') and self.stage1_rolling_enabled:
-                            rolling_dcor = self._compute_rolling_distance_correlation(
-                                df, target_col, feature, 
+                            roll = self._compute_rolling_distance_correlation(
+                                df, target_col, feature,
                                 window=getattr(self, 'stage1_rolling_window', 2000),
                                 step=getattr(self, 'stage1_rolling_step', 500)
                             )
-                            if rolling_dcor is not None:
-                                df[f'dcor_roll_{base_name}'] = rolling_dcor
-                        
+                            if roll is not None:
+                                df[f'dcor_roll_{base_name}'] = float(roll)
                 except Exception as e:
-                    self._log_warn(f"Error computing distance correlation for {feature}: {e}")
+                    self._log_warn("feature dCor failed", feature=feature, error=str(e))
                     continue
-            
-            self._log_info("Comprehensive distance correlation analysis completed")
+            self._log_info("Comprehensive distance correlation completed")
             return df
-            
         except Exception as e:
-            self._log_error(f"Error in comprehensive distance correlation: {e}")
+            self._log_error("Error in comprehensive analysis", error=str(e))
             return df
 
-    def _compute_rolling_distance_correlation(self, df: cudf.DataFrame, target: str, feature: str, 
-                                            window: int = 2000, step: int = 500) -> float:
-        """Compute rolling distance correlation for a single feature."""
+    def _compute_rolling_distance_correlation(self, df: cudf.DataFrame, target: str, feature: str,
+                                              window: int = 2000, step: int = 500) -> float:
+        """Mediana de R^2 em janelas deslizantes (retorna escalar ou None)."""
         try:
             x = df[feature].to_cupy()
             y = df[target].to_cupy()
-            
-            n = len(x)
+            n = int(x.size)
             if n < window:
                 return None
-            
-            # Compute rolling windows
-            dcor_values = []
+
+            vals: List[float] = []
             for start in range(0, n - window + 1, step):
                 end = start + window
-                x_window = x[start:end]
-                y_window = y[start:end]
-                
-                # Remove NaN values
-                valid_mask = ~(cp.isnan(x_window) | cp.isnan(y_window))
-                if cp.sum(valid_mask) > 100:  # Minimum valid pairs
-                    x_clean = x_window[valid_mask]
-                    y_clean = y_window[valid_mask]
-                    
-                    dcor_val = self._compute_distance_correlation_vectorized(x_clean, y_clean)
-                    if not cp.isnan(dcor_val):
-                        dcor_values.append(float(dcor_val))
-            
-            if dcor_values:
-                return float(np.median(dcor_values))  # Return median of rolling values
-            else:
-                return None
-                
+                xv = x[start:end]
+                yv = y[start:end]
+                mask = self._rowwise_valid_mask(xv, yv)
+                if int(mask.sum().item()) > 100:
+                    r2 = self._distance_correlation_gpu(xv[mask], yv[mask], max_n=self.dcor_max_samples)
+                    if np.isfinite(r2):
+                        vals.append(float(r2))
+            if vals:
+                return float(np.median(np.asarray(vals, dtype=float)))
+            return None
         except Exception as e:
-            self._log_warn(f"Error in rolling distance correlation: {e}")
+            self._log_warn("Rolling dCor failed", error=str(e))
             return None

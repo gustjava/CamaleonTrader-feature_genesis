@@ -12,7 +12,7 @@ import traceback
 from typing import Optional, Dict, Any
 from pathlib import Path
 
-import cudf
+# import cudf  # Moved to function scope to avoid CUDA context issues
 import cupy as cp
 import dask
 
@@ -26,7 +26,7 @@ from features import (
     GARCHModels,
     FeatureEngineeringEngine,
 )
-from features.signal_processing import apply_emd_to_series
+# from features.signal_processing import apply_emd_to_series  # Moved to function scope
 from features.base_engine import CriticalPipelineError
 from features.final_model import FinalModelTrainer
 from utils.logging_utils import get_logger, set_currency_pair_context
@@ -47,7 +47,12 @@ class DataProcessor:
     - Error handling and recovery
     """
     
-    def __init__(self, client: Optional[Client] = None, run_id: Optional[int] = None):
+    def __init__(
+        self,
+        client: Optional[Client] = None,
+        run_id: Optional[int] = None,
+        worker_address: Optional[str] = None,
+    ):
         """Initialize the data processor."""
         self.settings = get_settings()
         self.loader = LocalDataLoader()
@@ -55,6 +60,7 @@ class DataProcessor:
         self.db_connected = False
         self.client = client
         self.run_id = run_id
+        self.worker_address = worker_address
         
         # Initialize feature engines (pass client for Dask usage when available)
         self.station = StationarizationEngine(self.settings, client)  # Engine 1: Estacionarização
@@ -78,7 +84,12 @@ class DataProcessor:
         try:
             # Set currency pair context for all subsequent logs
             set_currency_pair_context(currency_pair)
-            logger.info(f"Starting processing for {currency_pair}")
+            if self.worker_address:
+                logger.info(
+                    f"Starting processing for {currency_pair} on worker {self.worker_address}"
+                )
+            else:
+                logger.info(f"Starting processing for {currency_pair}")
             
             # Connect to database for task tracking (non-fatal)
             if not self.db_connected:
@@ -128,7 +139,7 @@ class DataProcessor:
                 except Exception:
                     pass
     
-    def _load_currency_pair_data(self, r2_path: str) -> Optional[cudf.DataFrame]:
+    def _load_currency_pair_data(self, r2_path: str) -> Optional["cudf.DataFrame"]:
         """
         Load currency pair data from the specified path.
         
@@ -164,7 +175,7 @@ class DataProcessor:
             logger.error(f"Error loading data from {r2_path}: {e}", exc_info=True)
             return None
     
-    def _validate_initial_data(self, gdf: cudf.DataFrame, currency_pair: str) -> bool:
+    def _validate_initial_data(self, gdf: "cudf.DataFrame", currency_pair: str) -> bool:
         """
         Validate the initial data before processing.
         
@@ -269,7 +280,7 @@ class DataProcessor:
             logger.warning(f"Could not drop denied columns: {e}")
         return df
     
-    def _apply_feature_engines(self, gdf: cudf.DataFrame, currency_pair: str) -> Optional[cudf.DataFrame]:
+    def _apply_feature_engines(self, gdf: "cudf.DataFrame", currency_pair: str) -> Optional["cudf.DataFrame"]:
         """
         Apply all feature engineering engines in the correct order.
         
@@ -395,7 +406,7 @@ class DataProcessor:
             logger.error(f"Error applying feature engines for {currency_pair}: {e}", exc_info=True)
             return None
     
-    def _execute_engine(self, engine_name: str, gdf: cudf.DataFrame) -> Optional[cudf.DataFrame]:
+    def _execute_engine(self, engine_name: str, gdf: "cudf.DataFrame") -> Optional["cudf.DataFrame"]:
         """
         Execute a specific feature engineering engine.
         
@@ -429,19 +440,36 @@ class DataProcessor:
                     step_size = getattr(self.settings.features, 'emd_rolling_step', 50)
                     embargo = getattr(self.settings.features, 'emd_rolling_embargo', 0)
 
-                if 'close' not in gdf.columns:
-                    logger.warning("Coluna 'close' ausente; pulando EMD (signal_processing)")
+                # Find the best close column using the same logic as other engines
+                cols = list(gdf.columns)
+                close_col = None
+                for pref in ("y_close", "log_stabilized_y_close", "close"):
+                    if pref in cols:
+                        close_col = pref
+                        break
+                if close_col is None:
+                    for c in cols:
+                        if 'close' in str(c).lower():
+                            close_col = str(c)
+                            break
+                
+                if close_col is None:
+                    logger.warning("Nenhuma coluna de preço de fechamento encontrada; pulando EMD (signal_processing)")
                     return gdf
+                
+                logger.info(f"Usando coluna '{close_col}' para EMD (signal_processing)")
                 try:
                     if rolling_enable:
                         from features.signal_processing import apply_rolling_emd
-                        imfs = apply_rolling_emd(gdf['close'], max_imfs=max_imfs,
+                        imfs = apply_rolling_emd(gdf[close_col], max_imfs=max_imfs,
                                                  window_size=window_size, step_size=step_size,
                                                  embargo=embargo)
                     else:
-                        imfs = apply_emd_to_series(gdf['close'], max_imfs=max_imfs)
+                        from features.signal_processing import apply_emd_to_series
+                        imfs = apply_emd_to_series(gdf[close_col], max_imfs=max_imfs)
                     # Prefix with 'emd_' to namespace features
                     imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
+                    import cudf
                     gdf = cudf.concat([gdf, imfs], axis=1)
                     logger.info(f"EMD gerou {imfs.shape[1]} IMFs; novas colunas adicionadas")
                     return gdf
@@ -458,7 +486,7 @@ class DataProcessor:
             logger.error(f"Error executing engine {engine_name}: {e}", exc_info=True)
             return None
 
-    def _execute_engine_dask(self, engine_name: str, ddf) -> Optional["dask_cudf.DataFrame"]:
+    def _execute_engine_dask(self, engine_name: str, ddf, currency_pair: str = "unknown") -> Optional["dask_cudf.DataFrame"]:
         """Execute a specific feature engineering engine on a dask_cudf DataFrame."""
         try:
             if engine_name == 'stationarization':
@@ -476,8 +504,21 @@ class DataProcessor:
                     logger.info("dask_cudf indisponível; mantendo pass-through")
                     return ddf
 
-                if 'close' not in ddf.columns or 'timestamp' not in ddf.columns:
-                    logger.warning("Colunas necessárias ('timestamp','close') ausentes; pulando EMD (Dask)")
+                # Find the best close column using the same logic as other engines
+                cols = list(ddf.columns)
+                close_col = None
+                for pref in ("y_close", "log_stabilized_y_close", "close"):
+                    if pref in cols:
+                        close_col = pref
+                        break
+                if close_col is None:
+                    for c in cols:
+                        if 'close' in str(c).lower():
+                            close_col = str(c)
+                            break
+                
+                if close_col is None or 'timestamp' not in ddf.columns:
+                    logger.warning(f"Colunas necessárias ('timestamp','{close_col or 'close'}') ausentes; pulando EMD (Dask)")
                     return ddf
 
                 try:
@@ -494,26 +535,82 @@ class DataProcessor:
                     step_size = getattr(self.settings.features, 'emd_rolling_step', 50)
                     embargo = getattr(self.settings.features, 'emd_rolling_embargo', 0)
 
-                # Materialize minimal columns on this worker
+                # Optimized EMD processing with delayed computation to reduce graph size
                 try:
-                    subset = ddf[['timestamp', 'close']].compute()
-                    subset = subset.sort_values('timestamp')
-                    if rolling_enable:
-                        from features.signal_processing import apply_rolling_emd
-                        imfs = apply_rolling_emd(subset['close'], max_imfs=max_imfs,
-                                                 window_size=window_size, step_size=step_size,
-                                                 embargo=embargo)
+                    # Use delayed computation to avoid large graph creation
+                    from dask import delayed
+                    import dask_cudf as _dask_cudf
+                    
+                    logger.info(f"Usando coluna '{close_col}' para EMD (Dask) - modo otimizado")
+                    
+                    # GPU-ONLY EMD: Use map_partitions to execute directly on GPU without CPU materialization
+                    try:
+                        logger.info(f"🚀 EMD GPU processing for {currency_pair} using map_partitions")
+                        
+                        # Define partition function for EMD
+                        def _emd_partition_function(partition_df):
+                            """Apply EMD to a single partition on GPU."""
+                            try:
+                                import cudf
+                                import cupy as cp
+                                
+                                # Ensure we have the required column
+                                if close_col not in partition_df.columns:
+                                    return partition_df
+                                
+                                # Sort by timestamp
+                                partition_df = partition_df.sort_values('timestamp')
+                                
+                                # Apply EMD directly on GPU
+                                if rolling_enable:
+                                    from features.signal_processing import apply_rolling_emd
+                                    imfs = apply_rolling_emd(partition_df[close_col], max_imfs=max_imfs,
+                                                           window_size=window_size, step_size=step_size,
+                                                           embargo=embargo)
+                                else:
+                                    from features.signal_processing import apply_emd_to_series
+                                    imfs = apply_emd_to_series(partition_df[close_col], max_imfs=max_imfs)
+                                
+                                # Rename columns with emd_ prefix
+                                imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
+                                
+                                # Combine with original data
+                                result = cudf.concat([partition_df, imfs], axis=1)
+                                return result
+                                
+                            except Exception as e:
+                                logger.error(f"EMD partition function failed: {e}")
+                                # Return original partition if EMD fails
+                                return partition_df
+                        
+                        # Create updated metadata that includes EMD columns
+                        import cudf
+                        # Create a sample DataFrame with EMD columns for metadata
+                        sample_meta = ddf._meta.copy()
+                        # Add EMD columns to metadata without specifying length
+                        for i in range(1, max_imfs + 1):
+                            sample_meta[f'emd_imf_{i}'] = cudf.Series(dtype='float32')
+                        
+                        # Apply EMD using map_partitions with updated metadata
+                        ddf = ddf.map_partitions(_emd_partition_function, meta=sample_meta)
+                        
+                        logger.info(f"✅ EMD GPU completed for {currency_pair} using map_partitions")
+                        
+                    except Exception as e:
+                        logger.error(f"EMD GPU processing failed for {currency_pair}: {e}")
+                        raise RuntimeError(f"EMD GPU failed: {e}")
+                    
+                    # EMD columns are now directly added to the DataFrame via map_partitions
+                    # No merge needed - EMD is applied in-place to each partition
+                    
+                    # ⭐ PERSIST: After EMD merge to reduce graph size (only for dask_cudf)
+                    if hasattr(ddf, 'persist'):
+                        logger.info("Persist start: signal_processing:emd_merge_optimized")
+                        ddf = ddf.persist()
+                        logger.info("Persist returned: signal_processing:emd_merge_optimized")
                     else:
-                        imfs = apply_emd_to_series(subset['close'], max_imfs=max_imfs)
-                    # Prefix and add key for merge
-                    imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
-                    imfs = imfs.reset_index(drop=True)
-                    subset = subset.reset_index(drop=True)
-                    imf_gdf = cudf.concat([subset[['timestamp']], imfs], axis=1)
-                    imf_ddf = _dask_cudf.from_cudf(imf_gdf, npartitions=max(1, ddf.npartitions))
-                    # Merge by timestamp to align back to the distributed frame
-                    ddf = ddf.merge(imf_ddf, on='timestamp', how='left')
-                    logger.info(f"EMD (Dask) gerou {imfs.shape[1]} IMFs; colunas adicionadas via merge")
+                        logger.info("Skipping persist for non-dask DataFrame in EMD")
+                    
                     return ddf
                 except Exception as e:
                     logger.warning(f"Falha ao aplicar EMD (Dask): {e}; mantendo pass-through")
@@ -536,25 +633,7 @@ class DataProcessor:
             dask = None
             _wait = None
 
-        # Stage: ADF
-        try:
-            logger.info("[StatTests] Stage start: ADF rolling")
-            from features.statistical_tests.stage_adf import run as run_adf
-            with dask.annotate(task_key_name="stat_adf") if dask else _noop_ctx():
-                ddf = run_adf(self.stats, ddf, window=252, min_periods=200)
-            logger.info("Persist start: statistical_tests:adf")
-            ddf = ddf.persist()
-            logger.info("Persist returned: statistical_tests:adf")
-            try:
-                if _wait:
-                    logger.info("Waiting for statistical_tests:adf to complete (timeout: 600s)...")
-                    _wait(ddf, timeout=600)
-                    logger.info("statistical_tests:adf completed successfully")
-            except Exception as e:
-                logger.warning(f"Wait timeout or error for statistical_tests:adf: {e}")
-                logger.info("Continuing without waiting - data is still persisted for statistical_tests:adf")
-        except Exception as e:
-            logger.error(f"[StatTests] ADF stage failed: {e}")
+        # ADF stage removed from project
 
         # Stage: dCor
         try:
@@ -565,6 +644,12 @@ class DataProcessor:
                 candidates = self.stats._find_candidate_features(ddf)
                 with dask.annotate(task_key_name="stat_dcor") if dask else _noop_ctx():
                     ddf = run_dcor(self.stats, ddf, target, candidates)
+                
+                # ⭐ PERSIST 3: After dCor stage
+                logger.info("Persist start: statistical_tests:dcor")
+                ddf = ddf.persist()
+                logger.info("Persist returned: statistical_tests:dcor")
+                
                 # Orchestration-level summary for dCor
                 try:
                     dsum = getattr(self.stats, '_last_dcor_summary', {}) or {}
@@ -595,6 +680,12 @@ class DataProcessor:
                 logger.info("[StatTests] Stage start: Selection/VIF")
                 from features.statistical_tests.stage_selection_vif import run as run_vif
                 vif_res = run_vif(self.stats, ddf, target)
+                
+                # ⭐ PERSIST 4: After VIF stage
+                logger.info("Persist start: statistical_tests:vif")
+                ddf = ddf.persist()
+                logger.info("Persist returned: statistical_tests:vif")
+                
                 try:
                     v_in = vif_res.get('stage2_vif_input', [])
                     v_out = vif_res.get('stage2_vif_selected', [])
@@ -606,6 +697,12 @@ class DataProcessor:
                 logger.info("[StatTests] Stage start: Selection/MI")
                 from features.statistical_tests.stage_selection_mi import run as run_mi
                 mi_res = run_mi(self.stats, ddf, target, vif_selected=vif_res.get('stage2_vif_selected', []))
+                
+                # ⭐ PERSIST 5: After MI stage
+                logger.info("Persist start: statistical_tests:mi")
+                ddf = ddf.persist()
+                logger.info("Persist returned: statistical_tests:mi")
+                
                 try:
                     m_in = mi_res.get('stage2_vif_selected', [])
                     m_out = mi_res.get('stage2_mi_selected', [])
@@ -731,58 +828,55 @@ class DataProcessor:
                             importance = combined.get('importances', {}).get(feature, 0.0)
                             logger.info(f"[StatTests]   {i:2d}. {feature} (importance: {importance:.6f})")
                         
-                        # Build and evaluate final model with selected features
+                        # Build and evaluate final model with selected features using FinalModelTrainer
                         try:
                             logger.info("[FinalModel] 🚀 Building final CatBoost model with selected features...")
                             
-                            from catboost import CatBoostRegressor, Pool
-                            from sklearn.model_selection import train_test_split
-                            from sklearn.metrics import mean_squared_error
+                            # Convert to cudf if necessary
+                            if hasattr(ddf, 'compute'):
+                                full_gdf = ddf.compute()
+                            else:
+                                full_gdf = ddf
                             
-    # Convert to cudf if necessary
-    if hasattr(ddf, 'compute'):
-        full_gdf = ddf.compute()
-    else:
-        full_gdf = ddf
-    
-    X = full_gdf[final_features]
-    y = full_gdf[target]
-    
-    # Clean data - remove NaN values
-    logger.info(f"[FinalModel] Data shape before cleaning: X={X.shape}, y={y.shape}")
-    logger.info(f"[FinalModel] NaN count in X: {X.isnull().sum().sum()}, NaN count in y: {y.isnull().sum()}")
-    
-    # Remove rows with NaN values
-    mask = ~(X.isnull().any(axis=1) | y.isnull())
-    X_clean = X[mask]
-    y_clean = y[mask]
-    
-    logger.info(f"[FinalModel] Data shape after cleaning: X={X_clean.shape}, y={y_clean.shape}")
-    
-    if len(X_clean) == 0:
-        logger.error("[FinalModel] No valid data after cleaning NaN values!")
-        return
-    
-    # Simple CatBoost training based on test_catboost_simple.py
-    X_train, X_test, y_train, y_test = train_test_split(X_clean.to_pandas(), y_clean.to_pandas(), test_size=0.2)
-                            train_pool = Pool(X_train, y_train)
-                            model = CatBoostRegressor(
-                                iterations=1000,
-                                learning_rate=0.03,
-                                depth=6,
-                                task_type='GPU',
-                                verbose=200
+                            # Extract symbol and timeframe from currency_pair
+                            symbol = getattr(self, 'current_currency_pair', 'UNKNOWN')
+                            timeframe = getattr(self.settings, 'timeframe', '1h')
+                            
+                            # Prepare feature importances and selection metadata
+                            feature_importances = combined.get('importances', {})
+                            selection_metadata = {
+                                'selection_method': 'catboost_embedded',
+                                'total_features_considered': len(combined.get('stage2_mi_selected', [])),
+                                'final_features_selected': len(final_features),
+                                'selection_stats': combined.get('selection_stats', {}),
+                            }
+                            
+                            # Extract fracdiff parameters from stationarization engine
+                            fracdiff_optimal_d = {}
+                            try:
+                                if hasattr(self, 'stationarization') and hasattr(self.stationarization, '_last_metrics'):
+                                    station_metrics = getattr(self.stationarization, '_last_metrics', {})
+                                    fracdiff_optimal_d = station_metrics.get('fracdiff_optimal_d', {})
+                                    if fracdiff_optimal_d:
+                                        logger.info(f"[FinalModel] Found fracdiff parameters: {fracdiff_optimal_d}")
+                                    else:
+                                        logger.info("[FinalModel] No fracdiff parameters found in stationarization metrics")
+                                else:
+                                    logger.info("[FinalModel] Stationarization engine metrics not available")
+                            except Exception as e:
+                                logger.warning(f"[FinalModel] Could not extract fracdiff parameters: {e}")
+                            
+                            # Use the proper FinalModelTrainer
+                            self._build_final_model(
+                                full_gdf=full_gdf,
+                                target_col=target,
+                                selected_features=final_features,
+                                feature_importances=feature_importances,
+                                selection_metadata=selection_metadata,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                fracdiff_optimal_d=fracdiff_optimal_d
                             )
-                            model.fit(train_pool)
-                            y_pred = model.predict(X_test)
-                            mse = mean_squared_error(y_test, y_pred)
-                            importances = model.get_feature_importance(train_pool)
-                            
-                            logger.info(f"[FinalModel] Model trained successfully! MSE: {mse}")
-                            logger.info(f"[FinalModel] Feature importances: {importances}")
-                            
-                            # Save or upload model as needed
-                            model.save_model(f"{symbol}_{timeframe}_model.cbm")
                             
                         except Exception as e:
                             logger.error(f"[FinalModel] Failed to build final model: {e}")
@@ -820,6 +914,102 @@ class DataProcessor:
 
         return ddf
 
+    def _build_final_model(self, 
+                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
+                          target_col: str,
+                          selected_features: list,
+                          feature_importances: dict,
+                          selection_metadata: dict,
+                          symbol: str,
+                          timeframe: str,
+                          fracdiff_optimal_d: dict = None):
+        """Build and evaluate the final CatBoost model with selected features."""
+        
+        import traceback
+        
+        try:
+            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
+            
+            # Initialize the final model trainer
+            final_model_trainer = FinalModelTrainer(
+                config=self.settings,
+                logger_instance=logger
+            )
+            
+            # Verify target column exists
+            if target_col not in full_gdf.columns:
+                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
+                return
+            
+            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
+            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
+            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
+            
+            # Build and evaluate the final model
+            final_results = final_model_trainer.build_and_evaluate_final_model(
+                X_df=full_gdf,
+                y_series=full_gdf[target_col],
+                selected_features=selected_features,
+                feature_importances=feature_importances,
+                selection_metadata=selection_metadata,
+                symbol=symbol,
+                timeframe=timeframe,
+                fracdiff_optimal_d=fracdiff_optimal_d
+            )
+            
+            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
+            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
+            
+            # Log R2 upload status
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 cloud storage successfully!")
+                model_name = f"catboost_{symbol.lower()}_{timeframe}"
+                logger.info(f"[FinalModel] 🌐 R2 Path: models/{symbol}/{model_name}_v*.cbm")
+                logger.info(f"[FinalModel] 📤 Upload includes model file and JSON metadata")
+                logger.info(f"[FinalModel] 🧹 Local temporary files cleaned up automatically")
+            else:
+                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped - model only in database")
+            
+            logger.info(f"[FinalModel] 🏷️  Model Name: catboost_{symbol.lower()}_{timeframe}")
+            logger.info(f"[FinalModel] 📊 Task Type: {final_results['task_type']}")
+            logger.info(f"[FinalModel] 🎯 Features Used: {final_results['feature_count']}")
+            logger.info(f"[FinalModel] 📈 Training Score: {final_results['evaluation_results']['train_primary_metric']:.6f}")
+            logger.info(f"[FinalModel] 🎖️  Test Score: {final_results['evaluation_results']['test_primary_metric']:.6f}")
+            
+            # Log database connection info
+            db_config = self.settings.database
+            logger.info(f"[FinalModel] 🗄️  Database: {db_config.host}:{db_config.port}/{db_config.database}")
+            
+            # Log top features from final model
+            final_importances = final_results['model_results']['feature_importances']
+            top_features = sorted(final_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+            
+            logger.info(f"[FinalModel] 🏆 Top 10 most important features in final model:")
+            for i, (feature, importance) in enumerate(top_features, 1):
+                logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
+            
+            # Log query commands for easy access
+            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
+            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
+            
+            # Log R2 management commands
+            if final_results.get('r2_upload_success', False):
+                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
+                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
+            
+            # Store results for potential later use
+            self._last_final_model_results = final_results
+            
+        except Exception as e:
+            logger.error(f"[FinalModel] Failed to build final model: {e}")
+            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
+            raise
+
+    def process_currency_pair_dask(self, currency_pair: str, r2_path: str, client: Client) -> bool:
+        """Process a single currency pair using dask_cudf (delegates to module impl)."""
+        return _process_currency_pair_dask_impl(self, currency_pair, r2_path, client)
+
+
 def _noop_ctx():
     from contextlib import contextmanager
     @contextmanager
@@ -827,7 +1017,7 @@ def _noop_ctx():
         yield
     return _noop()
 
-    def _log_statistical_tests_plan_cudf(self, gdf: cudf.DataFrame) -> None:
+    def _log_statistical_tests_plan_cudf(self, gdf: "cudf.DataFrame") -> None:
         """Emit a step-by-step plan for the statistical_tests engine when using cuDF.
 
         The plan is inferred from settings.features and current DataFrame columns.
@@ -850,11 +1040,7 @@ def _noop_ctx():
             stage3_top_n = int(getattr(feats, 'stage3_top_n', 50) or 50) if feats else 50
 
             steps = []
-            # Step 1: ADF
-            if has_frac_diff:
-                steps.append(f"1) ADF rolling over frac_diff* features (found={sum(1 for c in cols if 'frac_diff' in str(c))})")
-            else:
-                steps.append("1) ADF rolling: skipped (no frac_diff* columns found)")
+            # ADF stage removed from project
             # JB removed from project
             # Step 2: dCor
             if target and (target in cols or 'y_close' in cols):
@@ -896,11 +1082,7 @@ def _noop_ctx():
             stage3_top_n = int(getattr(feats, 'stage3_top_n', 50) or 50) if feats else 50
 
             steps = []
-            if has_frac_diff:
-                cnt = sum(1 for c in cols if 'frac_diff' in str(c))
-                steps.append(f"1) ADF rolling on frac_diff* (distributed) [~{cnt} features]")
-            else:
-                steps.append("1) ADF rolling: skipped (no frac_diff* columns in schema)")
+            # ADF stage removed from project
             # JB removed from project
             if target and (target in cols or 'y_close' in cols):
                 steps.append(f"2) dCor ranking vs target='{target}' on sampled tail/head (topK={dcor_top_k})")
@@ -1030,107 +1212,84 @@ def _noop_ctx():
         Uses a minimal head() to avoid large materializations that could exhaust GPU memory.
         """
         try:
+            logger.info(f"🔍 Validating data after {engine_name} for {currency_pair}")
+            
+            # Check if DataFrame is None
+            if ddf is None:
+                logger.error(f"DataFrame is None after {engine_name} for {currency_pair}")
+                return False
+            
+            # Get sample for validation
             sample = ddf.head(1)
+            logger.info(f"📊 Sample shape after {engine_name}: {sample.shape}")
+            logger.info(f"📊 Sample columns: {list(sample.columns)}")
+            
             if sample.shape[0] == 0:
                 logger.error(f"Empty Dask DataFrame after {engine_name} for {currency_pair}")
                 return False
+            
+            # Check for excessive NaN values in sample
+            try:
+                nan_counts = sample.isna().sum()
+                high_nan_cols = nan_counts[nan_counts > 0]
+                if len(high_nan_cols) > 0:
+                    logger.warning(f"NaN values in sample after {engine_name} for {currency_pair}: {dict(high_nan_cols)}")
+            except Exception as e:
+                logger.warning(f"Could not check NaN values in sample: {e}")
+            
+            logger.info(f"✅ Validation passed for {engine_name} on {currency_pair}")
             return True
         except Exception as e:
-            logger.error(f"Error validating Dask data for {currency_pair} after {engine_name}: {e}")
+            logger.error(f"Error validating Dask data for {currency_pair} after {engine_name}: {e}", exc_info=True)
             return False
 
-    def _build_final_model(self, 
-                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
-                          target_col: str,
-                          selected_features: list,
-                          feature_importances: dict,
-                          selection_metadata: dict,
-                          symbol: str,
-                          timeframe: str):
-        """Build and evaluate the final CatBoost model with selected features."""
+def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
+    """
+    Worker-side function for processing a single currency pair using Dask-CUDA.
+    
+    This function is designed to be called by Dask workers and handles the complete
+    processing pipeline for a single currency pair.
+    
+    Args:
+        currency_pair: The currency pair symbol (e.g., 'EURUSD')
+        r2_path: Path to the data file in R2 storage
         
-        import traceback
-        
-        try:
-            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
-            
-            # Initialize the final model trainer
-            final_model_trainer = FinalModelTrainer(
-                config=self.settings,
-                logger_instance=logger
-            )
-            
-            # Verify target column exists
-            if target_col not in full_gdf.columns:
-                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
-                return
-            
-            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
-            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
-            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
-            
-            # Build and evaluate the final model
-            final_results = final_model_trainer.build_and_evaluate_final_model(
-                X_df=full_gdf,
-                y_series=full_gdf[target_col],
-                selected_features=selected_features,
-                feature_importances=feature_importances,
-                selection_metadata=selection_metadata,
-                symbol=symbol,
-                timeframe=timeframe
-            )
-            
-            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
-            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
-            
-            # Log R2 upload status
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 cloud storage successfully!")
-                model_name = f"catboost_{symbol.lower()}_{timeframe}"
-                logger.info(f"[FinalModel] 🌐 R2 Path: models/{symbol}/{model_name}_v*.cbm")
-                logger.info(f"[FinalModel] 📤 Upload includes model file and JSON metadata")
-                logger.info(f"[FinalModel] 🧹 Local temporary files cleaned up automatically")
-            else:
-                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped - model only in database")
-            
-            logger.info(f"[FinalModel] 🏷️  Model Name: catboost_{symbol.lower()}_{timeframe}")
-            logger.info(f"[FinalModel] 📊 Task Type: {final_results['task_type']}")
-            logger.info(f"[FinalModel] 🎯 Features Used: {final_results['feature_count']}")
-            logger.info(f"[FinalModel] 📈 Training Score: {final_results['evaluation_results']['train_primary_metric']:.6f}")
-            logger.info(f"[FinalModel] 🎖️  Test Score: {final_results['evaluation_results']['test_primary_metric']:.6f}")
-            
-            # Log database connection info
-            db_config = self.settings.database
-            logger.info(f"[FinalModel] 🗄️  Database: {db_config.host}:{db_config.port}/{db_config.database}")
-            
-            # Log top features from final model
-            final_importances = final_results['model_results']['feature_importances']
-            top_features = sorted(final_importances.items(), key=lambda x: x[1], reverse=True)[:10]
-            
-            logger.info(f"[FinalModel] 🏆 Top 10 most important features in final model:")
-            for i, (feature, importance) in enumerate(top_features, 1):
-                logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
-            
-            # Log query commands for easy access
-            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
-            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
-            
-            # Log R2 management commands
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
-                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
-            
-            # Store results for potential later use
-            self._last_final_model_results = final_results
-            
-        except Exception as e:
-            logger.error(f"[FinalModel] Failed to build final model: {e}")
-            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
-            raise
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
+    try:
+        # Get the current Dask client and worker from the worker context
+        from dask.distributed import get_client, get_worker
+        import dask
 
-    def process_currency_pair_dask(self, currency_pair: str, r2_path: str, client: Client) -> bool:
-        """Process a single currency pair using dask_cudf (delegates to module impl)."""
-        return _process_currency_pair_dask_impl(self, currency_pair, r2_path, client)
+        client = get_client()
+        worker = get_worker()
+        worker_address = getattr(worker, "address", None)
+
+        logger.info(
+            f"Worker {worker_address or '<unknown>'} starting processing for {currency_pair}"
+        )
+
+        annotations = {
+            "workers": (worker_address,) if worker_address else None,
+            "allow_other_workers": False,
+        }
+        # Remove None values (dask.annotate requires truthy values only)
+        annotate_kwargs = {
+            k: v for k, v in annotations.items() if v is not None
+        }
+
+        # Create a new DataProcessor instance for this worker
+        processor = DataProcessor(client=client, worker_address=worker_address)
+
+        # Ensure every downstream Dask task stays on this worker/GPU
+        with dask.config.set({"annotations": annotate_kwargs}):
+            with dask.annotate(**annotate_kwargs):
+                return processor.process_currency_pair_dask(currency_pair, r2_path, client)
+        
+    except Exception as e:
+        logger.error(f"Error in worker processing for {currency_pair}: {e}", exc_info=True)
+        return False
 
 
 def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, r2_path: str, client: Client) -> bool:
@@ -1305,7 +1464,8 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             r2_lower = str(r2_path).lower()
             ddf = None
             try:
-                with dask.annotate(task_key_name=f"load-{currency_pair}"):
+                import dask as _dask
+                with _dask.annotate(task_key_name=f"load-{currency_pair}"):
                     if r2_lower.endswith('.parquet'):
                         ddf = self.loader.load_currency_pair_data(r2_path, client)
                     elif r2_lower.endswith('.feather'):
@@ -1318,11 +1478,17 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             except Exception as _e:
                 logger.warning(f"Primary load path failed: {_e}; trying fallbacks")
                 if ddf is None:
-                    with dask.annotate(task_key_name=f"load-{currency_pair}"):
+                    import dask as _dask
+                    with _dask.annotate(task_key_name=f"load-{currency_pair}"):
                         ddf = self.loader.load_currency_pair_data(r2_path, client)
             if ddf is None:
                 self._register_task_failure(currency_pair, r2_path, "Failed to load Dask data")
                 return False
+
+            # ⭐ PERSIST 1: After initial data loading
+            logger.info("Persist start: initial_data_load")
+            ddf = ddf.persist()
+            logger.info("Persist returned: initial_data_load")
 
             # Attach context column for downstream engines (e.g., CPCV persistence)
             try:
@@ -1350,6 +1516,12 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                     with _dask.annotate(task_key_name=f"repartition-{currency_pair}"):
                         logger.info(f"Repartitioning from {ddf.npartitions} to {target_parts} to utilize {n_workers} workers")
                         ddf = ddf.repartition(npartitions=target_parts)
+                    
+                    # ⭐ PERSIST 2: After repartitioning
+                    logger.info("Persist start: after_repartitioning")
+                    ddf = ddf.persist()
+                    logger.info("Persist returned: after_repartitioning")
+                
                 try:
                     logger.info(f"Post-load overview: cols={len(ddf.columns)}, npartitions={ddf.npartitions}")
                 except Exception:
@@ -1429,37 +1601,83 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                         except Exception:
                             logger.info(f"ERROR Engine start: {engine_name} | npartitions={ddf.npartitions}")
                             pass
-                        ctx = _dask_config.set({"optimization.fuse.active": False}) if debug_dash else _dask_config.set({})
+                        
+                        # Configure Dask optimization settings to reduce graph complexity
+                        optimization_config = {
+                            "optimization.fuse.active": False,  # Disable fusion to reduce graph size
+                            "optimization.fuse.ave-width": 1,   # Minimal fusion width
+                            "optimization.fuse.subgraphs": False,  # Disable subgraph fusion
+                            "array.slicing.split_large_chunks": True,  # Split large chunks
+                            "array.chunk-size": "128MB",  # Reasonable chunk size
+                            "dataframe.query-planning": True,  # Enable query planning
+                        }
+                        
+                        # Add debug-specific settings
+                        if debug_dash:
+                            optimization_config.update({
+                                "optimization.fuse.active": False,
+                                "array.slicing.split_large_chunks": True,
+                            })
+                        
+                        ctx = _dask_config.set(optimization_config)
                         with ctx:
-                            ddf = self._execute_engine_dask(engine_name, ddf)
+                            ddf = self._execute_engine_dask(engine_name, ddf, currency_pair)
                     if ddf is None:
                         raise RuntimeError(f"Engine {engine_name} returned None")
 
-                    # Stabilize graph/memory between engines
-                    logger.info(f"Persist start: {engine_name}")
-                    try:
-                        from dask import persist as _persist
-                        debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
-                        if debug_dash:
-                            ddf, = _persist(ddf, optimize_graph=False)
-                        else:
+                    # Only persist for engines that don't already do internal persist
+                    engines_with_internal_persist = {'feature_engineering', 'stationarization'}
+                    
+                    if engine_name not in engines_with_internal_persist:
+                        # Stabilize graph/memory between engines with size monitoring
+                        logger.info(f"Persist start: {engine_name}")
+                        
+                        # Monitor graph size before persisting
+                        try:
+                            import dask
+                            graph_size_mb = ddf.__sizeof__() / (1024 * 1024)
+                            if graph_size_mb > 50:  # 50MB threshold
+                                logger.warning(f"Large Dask graph detected: {graph_size_mb:.2f}MB for {engine_name}")
+                                logger.info("Applying aggressive graph optimization...")
+                                
+                                # Force graph optimization before persist
+                                ddf = ddf.optimize_graph()
+                                
+                                # Use explicit persist with optimization disabled for large graphs
+                                from dask import persist as _persist
+                                debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                                if debug_dash or graph_size_mb > 100:  # Force optimization off for very large graphs
+                                    ddf, = _persist(ddf, optimize_graph=False)
+                                else:
+                                    ddf = ddf.persist()
+                            else:
+                                # Standard persist for smaller graphs
+                                from dask import persist as _persist
+                                debug_dash = bool(getattr(self.settings.development, 'debug_dashboard', False))
+                                if debug_dash:
+                                    ddf, = _persist(ddf, optimize_graph=False)
+                                else:
+                                    ddf = ddf.persist()
+                        except Exception as e:
+                            logger.warning(f"Graph size monitoring failed: {e}, using standard persist")
                             ddf = ddf.persist()
-                    except Exception:
-                        ddf = ddf.persist()
-                    logger.info(f"Persist returned: {engine_name}")
-                    # Longer timeout for heavy engines (statistical_tests and garch_models)
-                    if engine_name == 'statistical_tests':
-                        timeout_s = 600
-                    elif engine_name == 'garch_models':
-                        timeout_s = 180
+                        
+                        logger.info(f"Persist returned: {engine_name}")
+                        # Longer timeout for heavy engines (statistical_tests and garch_models)
+                        if engine_name == 'statistical_tests':
+                            timeout_s = 600
+                        elif engine_name == 'garch_models':
+                            timeout_s = 180
+                        else:
+                            timeout_s = 60
+                        logger.info(f"Waiting for {engine_name} computation to complete (timeout: {timeout_s}s)...")
+                        try:
+                            wait(ddf, timeout=timeout_s)
+                            logger.info(f"{engine_name} computation completed successfully")
+                        except Exception as wait_err:
+                            logger.warning(f"Wait timeout or error for {engine_name}: {wait_err}")
                     else:
-                        timeout_s = 60
-                    logger.info(f"Waiting for {engine_name} computation to complete (timeout: {timeout_s}s)...")
-                    try:
-                        wait(ddf, timeout=timeout_s)
-                        logger.info(f"{engine_name} computation completed successfully")
-                    except Exception as wait_err:
-                        logger.warning(f"Wait timeout or error for {engine_name}: {wait_err}")
+                        logger.info(f"Skipping persist for {engine_name} (engine handles internal persist)")
                         logger.info(f"Continuing without waiting - data is still persisted for {engine_name}")
                         # Continue without waiting - data is still persisted
 
@@ -1471,7 +1689,9 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                         pass
 
                     if not self._validate_intermediate_data_dask(ddf, currency_pair, engine_name):
-                        raise RuntimeError(f"Validation failed after {engine_name}")
+                        logger.critical(f"🚨 CRITICAL VALIDATION FAILURE after {engine_name} for {currency_pair}")
+                        logger.critical("🛑 Stopping pipeline immediately due to validation failure")
+                        raise CriticalPipelineError(f"Validation failed after {engine_name} for {currency_pair}")
                     try:
                         logger.info(f"Engine end: {engine_name} | npartitions={ddf.npartitions}")
                     except Exception:
@@ -1524,6 +1744,11 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             # Save directly from Dask without materializing everything on one GPU
             # Nota: Seleção final com CatBoost é parte do statistical_tests; não duplicar no caminho Dask.
 
+            # ⭐ PERSIST 6: Before final save
+            logger.info("Persist start: before_final_save")
+            ddf = ddf.persist()
+            logger.info("Persist returned: before_final_save")
+
             # Save diretamente do Dask sem materializar tudo em uma única GPU
             with dask.annotate(task_key_name=f"save-{currency_pair}"):
                 try:
@@ -1574,7 +1799,7 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
         self._register_task_failure(currency_pair, r2_path, str(e))
         return False
     
-    def _validate_intermediate_data(self, gdf: cudf.DataFrame, currency_pair: str, engine_name: str) -> bool:
+    def _validate_intermediate_data(self, gdf: "cudf.DataFrame", currency_pair: str, engine_name: str) -> bool:
         """
         Validate data after each engine execution.
         
@@ -1610,7 +1835,7 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             logger.error(f"Error validating intermediate data for {currency_pair} after {engine_name}: {e}")
             return False
     
-    def _save_processed_data(self, gdf: cudf.DataFrame, currency_pair: str) -> bool:
+    def _save_processed_data(self, gdf: "cudf.DataFrame", currency_pair: str) -> bool:
         """
         Save the processed data to the output directory.
         
@@ -1785,344 +2010,3 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                 logger.warning(f"Failed to register task failure in database for {currency_pair}")
         except Exception as e:
             logger.error(f"Error registering task failure for {currency_pair}: {e}")
-
-    def _build_final_model(self, 
-                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
-                          target_col: str,
-                          selected_features: list,
-                          feature_importances: dict,
-                          selection_metadata: dict,
-                          symbol: str,
-                          timeframe: str):
-        """Build and evaluate the final CatBoost model with selected features."""
-        import traceback
-        try:
-            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
-
-            # Initialize the final model trainer
-            final_model_trainer = FinalModelTrainer(
-                config=self.settings,
-                logger_instance=logger
-            )
-
-            # Verify target column exists
-            if target_col not in full_gdf.columns:
-                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
-                return
-
-            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
-            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
-            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
-
-            # Build and evaluate the final model
-            final_results = final_model_trainer.build_and_evaluate_final_model(
-                X_df=full_gdf,
-                y_series=full_gdf[target_col],
-                selected_features=selected_features,
-                feature_importances=feature_importances,
-                selection_metadata=selection_metadata,
-                symbol=symbol,
-                timeframe=timeframe
-            )
-
-            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
-            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
-
-            # Log R2 upload status
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 successfully")
-            else:
-                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped")
-
-            # Log feature importances summary
-            if feature_importances:
-                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
-                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
-                for i, (feature, importance) in enumerate(sorted_features, 1):
-                    logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
-
-            # Log query commands for easy access
-            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
-            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
-
-            # Log R2 management commands
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
-                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
-
-            # Store results for potential later use
-            self._last_final_model_results = final_results
-
-        except Exception as e:
-            logger.error(f"[FinalModel] Failed to build final model: {e}")
-            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
-            raise
-
-    def _build_final_model(self, 
-                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
-                          target_col: str,
-                          selected_features: list,
-                          feature_importances: dict,
-                          selection_metadata: dict,
-                          symbol: str,
-                          timeframe: str):
-        """Build and evaluate the final CatBoost model with selected features."""
-        import traceback
-        try:
-            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
-
-            # Initialize the final model trainer
-            final_model_trainer = FinalModelTrainer(
-                config=self.settings,
-                logger_instance=logger
-            )
-
-            # Verify target column exists
-            if target_col not in full_gdf.columns:
-                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
-                return
-
-            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
-            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
-            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
-
-            # Build and evaluate the final model
-            final_results = final_model_trainer.build_and_evaluate_final_model(
-                X_df=full_gdf,
-                y_series=full_gdf[target_col],
-                selected_features=selected_features,
-                feature_importances=feature_importances,
-                selection_metadata=selection_metadata,
-                symbol=symbol,
-                timeframe=timeframe
-            )
-
-            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
-            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
-
-            # Log R2 upload status
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 successfully")
-            else:
-                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped")
-
-            # Log feature importances summary
-            if feature_importances:
-                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
-                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
-                for i, (feature, importance) in enumerate(sorted_features, 1):
-                    logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
-
-            # Log query commands for easy access
-            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
-            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
-
-            # Log R2 management commands
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
-                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
-
-            # Store results for potential later use
-            self._last_final_model_results = final_results
-
-        except Exception as e:
-            logger.error(f"[FinalModel] Failed to build final model: {e}")
-            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
-            raise
-
-
-def process_currency_pair_worker(currency_pair: str, r2_path: str) -> bool:
-    """
-    Worker function to process a single currency pair.
-    This function is designed to be serializable for Dask workers.
-    
-    Args:
-        currency_pair: Currency pair symbol (e.g., 'EURUSD')
-        r2_path: Path to the data file in R2 storage
-        
-    Returns:
-        bool: True if processing was successful, False otherwise
-    """
-    # Set up logging for the worker
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    try:
-        # Set currency pair context for all subsequent logs
-        set_currency_pair_context(currency_pair)
-        processor = DataProcessor()
-        return processor.process_currency_pair(currency_pair, r2_path)
-    except Exception as e:
-        logger.error(f"Error in worker processing {currency_pair}: {e}", exc_info=True)
-        return False
-
-
-def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
-    """
-    Worker function that processes a single currency pair using the Dask path (dask_cudf),
-    constraining all inner tasks to the current worker (one GPU per pair).
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    try:
-        # Set currency pair context for all subsequent logs
-        set_currency_pair_context(currency_pair)
-        # Emit GPU/worker context to verify non-sharing and pinning
-        try:
-            import os as _os
-            import cupy as _cp
-            from dask.distributed import get_worker as _gw
-            _w = _gw()
-            _addr = getattr(_w, 'address', 'unknown')
-            _gpu = int(_cp.cuda.runtime.getDevice())
-            _vis = _os.environ.get('CUDA_VISIBLE_DEVICES', '')
-            logger.info(f"Worker context: pair={currency_pair}, worker={_addr}, gpu_device={_gpu}, VISIBLE={_vis}")
-        except Exception:
-            pass
-        # Resolve current worker and use a worker_client to schedule sub-tasks
-        from dask.distributed import get_worker, worker_client
-        import dask
-        w = get_worker()
-        addr = getattr(w, 'address', None)
-        with worker_client() as wc:
-            # Hot-reload this module on the worker to ensure latest class definitions
-            try:
-                import importlib, sys as _sys
-                _mod = importlib.reload(_sys.modules[__name__])
-            except Exception:
-                try:
-                    import importlib as _importlib
-                    import orchestration.data_processor as _dp_mod
-                    _mod = _importlib.reload(_dp_mod)
-                except Exception:
-                    _mod = None
-            processor = (_mod.DataProcessor if _mod and hasattr(_mod, 'DataProcessor') else DataProcessor)(client=wc)
-            # Ensure required helper methods exist on the instance (bind from latest class if missing)
-            import types as _types
-            try:
-                # Prefer the freshly reloaded class as source
-                _src_cls = _mod.DataProcessor if (_mod and hasattr(_mod, 'DataProcessor')) else DataProcessor
-            except Exception:
-                _src_cls = DataProcessor
-            _need = [
-                '_validate_initial_data_dask',
-                '_validate_intermediate_data_dask',
-                '_register_task_failure',
-                '_register_task_success',
-                '_save_intermediate_data',
-                '_save_processed_data_dask',
-                '_drop_denied_columns',
-                '_execute_engine_dask',
-                '_log_statistical_tests_plan_dask',
-                '_build_final_model',
-                '_run_statistical_tests_stages',
-            ]
-            _bound = []
-            _missing_after = []
-            for _name in _need:
-                if not hasattr(processor, _name) and hasattr(_src_cls, _name):
-                    try:
-                        setattr(processor, _name, _types.MethodType(getattr(_src_cls, _name), processor))
-                        _bound.append(_name)
-                    except Exception as _e:
-                        logger.warning(f"Failed to bind helper '{_name}' on worker: {_e}")
-            for _name in _need:
-                if not hasattr(processor, _name):
-                    _missing_after.append(_name)
-            if _bound:
-                logger.info(f"Worker bound helpers: {_bound}")
-            if _missing_after:
-                logger.warning(f"Helpers still missing on worker after bind: {_missing_after}")
-            # Annotate all tasks to stay on this worker
-            with dask.annotate(workers=[addr] if addr else None, allow_other_workers=False, task_key_name=f"pair-{currency_pair}"):
-                # Enforce Dask path only; if missing on class, bind module implementation dynamically
-                if not hasattr(processor, 'process_currency_pair_dask'):
-                    try:
-                        import types as _types
-                        from orchestration.data_processor import _process_currency_pair_dask_impl as _impl
-                        processor.process_currency_pair_dask = _types.MethodType(_impl, processor)
-                    except Exception as _bind_err:
-                        raise RuntimeError("Dask path required but missing on worker and dynamic bind failed: " + str(_bind_err))
-                return processor.process_currency_pair_dask(currency_pair, r2_path, wc)
-    except Exception as e:
-        logger.error(f"Error in Dask worker processing {currency_pair}: {e}", exc_info=True)
-        return False
-
-
-    def _build_final_model(self, 
-                          full_gdf,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
-                          target_col: str,
-                          selected_features: list,
-                          feature_importances: dict,
-                          selection_metadata: dict,
-                          symbol: str,
-                          timeframe: str):
-        """Build and evaluate the final CatBoost model with selected features."""
-        
-        import traceback
-        
-        try:
-            logger.info(f"[FinalModel] Initializing final model trainer for {symbol} {timeframe}")
-            
-            # Initialize the final model trainer
-            final_model_trainer = FinalModelTrainer(
-                config=self.settings,
-                logger_instance=logger
-            )
-            
-            # Verify target column exists
-            if target_col not in full_gdf.columns:
-                logger.error(f"[FinalModel] Target column '{target_col}' not found in DataFrame")
-                return
-            
-            logger.info(f"[FinalModel] DataFrame columns: {list(full_gdf.columns)}")
-            logger.info(f"[FinalModel] DataFrame shape: {full_gdf.shape}")
-            logger.info(f"[FinalModel] Building final model with {len(selected_features)} features and {len(full_gdf)} samples")
-            
-            # Build and evaluate the final model
-            final_results = final_model_trainer.build_and_evaluate_final_model(
-                X_df=full_gdf,
-                y_series=full_gdf[target_col],
-                selected_features=selected_features,
-                feature_importances=feature_importances,
-                selection_metadata=selection_metadata,
-                symbol=symbol,
-                timeframe=timeframe
-            )
-            
-            logger.info(f"[FinalModel] ✅ Final model completed successfully!")
-            logger.info(f"[FinalModel] 💾 Model saved to database - ID: {final_results['database_record_id']}")
-            
-            # Log R2 upload status
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] ☁️  Model uploaded to R2 successfully")
-            else:
-                logger.warning(f"[FinalModel] ⚠️  R2 upload failed or was skipped")
-            
-            # Log feature importances summary
-            if feature_importances:
-                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
-                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
-                for i, (feature, importance) in enumerate(sorted_features, 1):
-                    logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
-            
-            # Log query commands for easy access
-            logger.info(f"[FinalModel] 💡 To query this model: python query_models.py --details {final_results['database_record_id']}")
-            logger.info(f"[FinalModel] 💡 To list all {symbol} models: python query_models.py --symbol {symbol}")
-            
-            # Log R2 management commands
-            if final_results.get('r2_upload_success', False):
-                logger.info(f"[FinalModel] 🔧 To manage R2 models: python r2_models.py list-models --symbol {symbol}")
-                logger.info(f"[FinalModel] 🔍 To view R2 metadata: python r2_models.py get-metadata {symbol} <model_name>")
-            
-            # Store results for potential later use
-            self._last_final_model_results = final_results
-            
-        except Exception as e:
-            logger.error(f"[FinalModel] Failed to build final model: {e}")
-            logger.error(f"[FinalModel] Traceback: {traceback.format_exc()}")
-            raise

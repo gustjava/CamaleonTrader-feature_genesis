@@ -41,32 +41,49 @@ class TradingMetrics:
             Dictionary with comprehensive metrics
         """
         
-        # Convert to numpy arrays
-        if isinstance(y_true, pd.Series):
-            y_true = y_true.values
-        if isinstance(y_pred, pd.Series):
-            y_pred = y_pred.values
-        if volatility is not None and isinstance(volatility, pd.Series):
-            volatility = volatility.values
-            
+        # Normalize inputs to preferred array module
+        xp = cp if self.use_gpu else np
+        gpu_enabled = self.use_gpu and cp is not None
+
+        def _ensure_array(arr, allow_gpu: bool) -> np.ndarray:
+            if isinstance(arr, pd.Series):
+                arr = arr.values
+            if allow_gpu and arr is not None:
+                try:
+                    return xp.asarray(arr)
+                except Exception:
+                    return np.asarray(arr)
+            return np.asarray(arr) if arr is not None else None
+
+        y_true_arr = _ensure_array(y_true, gpu_enabled)
+        y_pred_arr = _ensure_array(y_pred, gpu_enabled)
+        volatility_arr = _ensure_array(volatility, gpu_enabled) if volatility is not None else None
+
+        if gpu_enabled and (not isinstance(y_true_arr, cp.ndarray) or not isinstance(y_pred_arr, cp.ndarray)):
+            xp = np
+            gpu_enabled = False
+            y_true_arr = np.asarray(y_true)
+            y_pred_arr = np.asarray(y_pred)
+            volatility_arr = np.asarray(volatility) if volatility is not None else None
+
         # Remove NaN values
-        mask = ~(np.isnan(y_true) | np.isnan(y_pred))
-        y_true_clean = y_true[mask]
-        y_pred_clean = y_pred[mask]
-        
-        if volatility is not None:
-            volatility_clean = volatility[mask]
+        mask = ~(xp.isnan(y_true_arr) | xp.isnan(y_pred_arr))
+        y_true_clean = y_true_arr[mask]
+        y_pred_clean = y_pred_arr[mask]
+
+        if volatility_arr is not None:
+            volatility_clean = volatility_arr[mask]
         else:
             volatility_clean = None
-            
-        # Basic statistics
-        y_std = np.std(y_true_clean)
-        y_mean = np.mean(y_true_clean)
-        
+
+        # Basic statistics (GPU when available)
+        y_std = float(xp.std(y_true_clean))
+        y_mean = float(xp.mean(y_true_clean))
+
         # MSE calculations
-        mse_model = np.mean((y_true_clean - y_pred_clean) ** 2)
-        mse_naive = np.mean(y_true_clean ** 2)  # Baseline: predict 0
-        mse_mean = np.mean((y_true_clean - y_mean) ** 2)  # Baseline: predict mean
+        mse_model = float(xp.mean((y_true_clean - y_pred_clean) ** 2))
+        mse_naive = float(xp.mean(y_true_clean ** 2))  # Baseline: predict 0
+        mse_mean = float(xp.mean((y_true_clean - y_mean) ** 2))  # Baseline: predict mean
         
         # Skill scores
         skill_vs_naive = 1 - (mse_model / mse_naive) if mse_naive > 0 else 0
@@ -146,14 +163,18 @@ class TradingMetrics:
     
     def _compute_ic_with_bootstrap(
         self, 
-        y_true: np.ndarray, 
-        y_pred: np.ndarray,
+        y_true: Union[np.ndarray, cp.ndarray], 
+        y_pred: Union[np.ndarray, cp.ndarray],
         n_bootstrap: int = 1000,
         block_size: int = 50
     ) -> Dict[str, float]:
         """
         Compute Information Coefficient with block bootstrap confidence intervals
         """
+        if isinstance(y_true, cp.ndarray):
+            y_true = cp.asnumpy(y_true)
+        if isinstance(y_pred, cp.ndarray):
+            y_pred = cp.asnumpy(y_pred)
         
         # Original IC
         ic_original = stats.spearmanr(y_true, y_pred)[0]
@@ -227,44 +248,54 @@ class TradingMetrics:
     
     def _compute_directional_accuracy(
         self, 
-        y_true: np.ndarray, 
-        y_pred: np.ndarray
+        y_true: Union[np.ndarray, cp.ndarray], 
+        y_pred: Union[np.ndarray, cp.ndarray]
     ) -> float:
         """Compute directional accuracy (sign prediction)"""
-        
-        # Remove zeros to avoid ambiguity
+
+        if isinstance(y_true, cp.ndarray):
+            mask = (y_true != 0) & (y_pred != 0)
+            if int(cp.sum(mask)) == 0:
+                return 0.5
+            y_true_sign = cp.sign(y_true[mask])
+            y_pred_sign = cp.sign(y_pred[mask])
+            return float(cp.mean(y_true_sign == y_pred_sign))
+
         mask = (y_true != 0) & (y_pred != 0)
         if mask.sum() == 0:
             return 0.5
-            
+
         y_true_sign = np.sign(y_true[mask])
         y_pred_sign = np.sign(y_pred[mask])
-        
-        return np.mean(y_true_sign == y_pred_sign)
-    
+
+        return float(np.mean(y_true_sign == y_pred_sign))
+
     def _diebold_mariano_test(
         self, 
-        y_true: np.ndarray, 
-        y_pred: np.ndarray,
+        y_true: Union[np.ndarray, cp.ndarray], 
+        y_pred: Union[np.ndarray, cp.ndarray],
         mse_baseline: float
     ) -> Dict[str, float]:
         """
         Diebold-Mariano test comparing model vs naive baseline
         """
         
-        # Loss differences
-        loss_model = (y_true - y_pred) ** 2
-        loss_baseline = y_true ** 2  # Naive baseline
-        
-        loss_diff = loss_model - loss_baseline
-        
+        if isinstance(y_true, cp.ndarray):
+            loss_model = (y_true - y_pred) ** 2
+            loss_baseline = y_true ** 2
+            loss_diff = cp.asnumpy(loss_model - loss_baseline)
+        else:
+            loss_model = (y_true - y_pred) ** 2
+            loss_baseline = y_true ** 2
+            loss_diff = loss_model - loss_baseline
+
         # DM statistic
-        d_mean = np.mean(loss_diff)
-        
+        d_mean = float(np.mean(loss_diff))
+
         # Newey-West HAC standard error (simple version)
         n = len(loss_diff)
         h = int(np.floor(4 * (n / 100) ** (2/9)))  # Bandwidth
-        
+
         # Auto-covariances
         gamma_0 = np.var(loss_diff)
         gamma_sum = 0
@@ -293,36 +324,39 @@ class TradingMetrics:
     
     def _compute_vol_adjusted_metrics(
         self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray,
-        volatility: np.ndarray
+        y_true: Union[np.ndarray, cp.ndarray],
+        y_pred: Union[np.ndarray, cp.ndarray],
+        volatility: Union[np.ndarray, cp.ndarray]
     ) -> Dict[str, float]:
         """
         Compute vol-adjusted metrics: ỹ = y/σ̂_t
         """
-        
-        # Avoid division by zero
-        vol_safe = np.maximum(volatility, 1e-6)
-        
-        # Vol-adjusted targets and predictions
-        y_true_adj = y_true / vol_safe
-        y_pred_adj = y_pred / vol_safe
-        
-        # Vol-adjusted metrics
-        mse_vol_adj = np.mean((y_true_adj - y_pred_adj) ** 2)
-        mse_naive_vol_adj = np.mean(y_true_adj ** 2)
-        
-        skill_vol_adj = 1 - (mse_vol_adj / mse_naive_vol_adj) if mse_naive_vol_adj > 0 else 0
-        
-        rmse_vol_adj = np.sqrt(mse_vol_adj)
-        y_std_vol_adj = np.std(y_true_adj)
-        nrmse_vol_adj = rmse_vol_adj / y_std_vol_adj if y_std_vol_adj > 0 else np.inf
-        
-        # Vol-adjusted IC
-        ic_vol_adj = stats.spearmanr(y_true_adj, y_pred_adj)[0]
+        if isinstance(volatility, cp.ndarray):
+            vol_safe = cp.maximum(volatility, 1e-6)
+            y_true_adj = y_true / vol_safe
+            y_pred_adj = y_pred / vol_safe
+            mse_vol_adj = float(cp.mean((y_true_adj - y_pred_adj) ** 2))
+            mse_naive_vol_adj = float(cp.mean(y_true_adj ** 2))
+            skill_vol_adj = 1 - (mse_vol_adj / mse_naive_vol_adj) if mse_naive_vol_adj > 0 else 0
+            rmse_vol_adj = float(cp.sqrt(mse_vol_adj))
+            y_std_vol_adj = float(cp.std(y_true_adj))
+            nrmse_vol_adj = rmse_vol_adj / y_std_vol_adj if y_std_vol_adj > 0 else np.inf
+            ic_vol_adj = stats.spearmanr(cp.asnumpy(y_true_adj), cp.asnumpy(y_pred_adj))[0]
+        else:
+            vol_safe = np.maximum(volatility, 1e-6)
+            y_true_adj = np.asarray(y_true) / vol_safe
+            y_pred_adj = np.asarray(y_pred) / vol_safe
+            mse_vol_adj = float(np.mean((y_true_adj - y_pred_adj) ** 2))
+            mse_naive_vol_adj = float(np.mean(y_true_adj ** 2))
+            skill_vol_adj = 1 - (mse_vol_adj / mse_naive_vol_adj) if mse_naive_vol_adj > 0 else 0
+            rmse_vol_adj = float(np.sqrt(mse_vol_adj))
+            y_std_vol_adj = float(np.std(y_true_adj))
+            nrmse_vol_adj = rmse_vol_adj / y_std_vol_adj if y_std_vol_adj > 0 else np.inf
+            ic_vol_adj = stats.spearmanr(y_true_adj, y_pred_adj)[0]
+
         if np.isnan(ic_vol_adj):
             ic_vol_adj = 0.0
-        
+
         return {
             'mse_vol_adj': mse_vol_adj,
             'skill_vol_adj': skill_vol_adj,

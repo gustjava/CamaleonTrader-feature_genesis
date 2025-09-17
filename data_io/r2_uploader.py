@@ -35,19 +35,19 @@ class R2ModelUploader:
             
             self.s3_client = boto3.client(
                 's3',
-                endpoint_url=r2_config['endpoint_url'],
-                aws_access_key_id=r2_config['access_key'],
-                aws_secret_access_key=r2_config['secret_key'],
-                region_name=r2_config['region']
+                endpoint_url=r2_config.endpoint_url,
+                aws_access_key_id=r2_config.access_key,
+                aws_secret_access_key=r2_config.secret_key,
+                region_name=r2_config.region
             )
             
             # Test connection
             self.s3_client.list_objects_v2(
-                Bucket=r2_config['bucket_name'],
+                Bucket=r2_config.bucket_name,
                 MaxKeys=1
             )
             
-            logger.info(f"R2 S3 client initialized successfully for bucket: {r2_config['bucket_name']}")
+            logger.info(f"R2 S3 client initialized successfully for bucket: {r2_config.bucket_name}")
             
         except Exception as e:
             logger.error(f"Failed to initialize R2 S3 client: {e}")
@@ -68,7 +68,7 @@ class R2ModelUploader:
         required_fields = ['account_id', 'access_key', 'secret_key', 'bucket_name']
         
         for field in required_fields:
-            if not self.config.r2.get(field):
+            if not hasattr(self.config.r2, field) or not getattr(self.config.r2, field):
                 logger.error(f"Missing R2 configuration field: {field}")
                 return False
         
@@ -173,7 +173,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return False
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.config.r2.bucket_name
             
             # Prepare upload arguments
             upload_args = {}
@@ -255,8 +255,13 @@ class R2ModelUploader:
             
             # Create temporary metadata file
             metadata_file_path = f"{model_file_path}_metadata.json"
-            with open(metadata_file_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
+            try:
+                with open(metadata_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+                logger.info(f"Metadata JSON file created successfully: {metadata_file_path}")
+            except Exception as e:
+                logger.error(f"Failed to create metadata JSON file: {e}")
+                return False
             
             # Upload model file
             logger.info(f"Uploading model file: {model_file_path}")
@@ -292,7 +297,7 @@ class R2ModelUploader:
                 return False
             
             # Update metadata with file size information
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.config.r2.bucket_name
             try:
                 model_response = self.s3_client.head_object(
                     Bucket=bucket_name,
@@ -301,10 +306,19 @@ class R2ModelUploader:
                 metadata['file_info']['size_bytes'] = model_response['ContentLength']
                 
                 # Re-upload updated metadata
-                with open(metadata_file_path, 'w') as f:
-                    json.dump(metadata, f, indent=2)
+                try:
+                    with open(metadata_file_path, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, indent=2, ensure_ascii=False)
+                    logger.info(f"Updated metadata JSON file: {metadata_file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to update metadata JSON file: {e}")
+                    return False
                 
-                self._upload_file_to_r2(metadata_file_path, metadata_r2_key)
+                # Re-upload the updated metadata
+                metadata_upload_success = self._upload_file_to_r2(metadata_file_path, metadata_r2_key)
+                if not metadata_upload_success:
+                    logger.error(f"Failed to re-upload updated metadata file: {metadata_file_path}")
+                    return False
                 
             except Exception as e:
                 logger.warning(f"Could not update metadata with file size: {e}")
@@ -312,9 +326,12 @@ class R2ModelUploader:
             # Cleanup local files if requested
             if cleanup_local:
                 try:
-                    os.remove(model_file_path)
-                    os.remove(metadata_file_path)
-                    logger.info(f"Local files cleaned up: {model_file_path}, {metadata_file_path}")
+                    if os.path.exists(model_file_path):
+                        os.remove(model_file_path)
+                        logger.info(f"Cleaned up model file: {model_file_path}")
+                    if os.path.exists(metadata_file_path):
+                        os.remove(metadata_file_path)
+                        logger.info(f"Cleaned up metadata file: {metadata_file_path}")
                 except Exception as e:
                     logger.warning(f"Failed to cleanup local files: {e}")
             
@@ -339,7 +356,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return []
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.config.r2.bucket_name
             prefix = f"models/{symbol}/" if symbol else "models/"
             
             response = self.s3_client.list_objects_v2(
@@ -390,7 +407,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return None
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.config.r2.bucket_name
             metadata_key = f"models/{symbol}/{model_name}_metadata.json"
             
             response = self.s3_client.get_object(
@@ -423,7 +440,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return False
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.config.r2.bucket_name
             model_key = f"models/{symbol}/{model_name}.cbm"
             metadata_key = f"models/{symbol}/{model_name}_metadata.json"
             

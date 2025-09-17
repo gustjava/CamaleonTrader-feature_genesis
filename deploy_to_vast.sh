@@ -232,6 +232,24 @@ echo \"Memória disponível: \$(free -h | grep Mem | awk '{print \$7}')\"
 echo \"Espaço em disco: \$(df -h / | tail -1 | awk '{print \$4}')\"
 echo \"GPUs disponíveis: \$(nvidia-smi --list-gpus | wc -l 2>/dev/null || echo '0')\"
 
+# Verificar dependências RAPIDS críticas
+echo '--- [REMOTO] Verificando dependências RAPIDS...'
+python -c \"import cudf; print('✅ cudf disponível')\" 2>/dev/null || echo \"❌ cudf não disponível\"
+python -c \"import cupy; print('✅ cupy disponível')\" 2>/dev/null || echo \"❌ cupy não disponível\"
+python -c \"import cusignal; print('✅ cusignal disponível')\" 2>/dev/null || echo \"❌ cusignal não disponível\"
+
+# Verificar se o ambiente RAPIDS está funcionando
+echo '--- [REMOTO] Testando funcionalidade RAPIDS...'
+python -c \"
+import cupy as cp
+import cudf
+print('✅ RAPIDS básico funcionando')
+# Teste básico de GPU
+test_array = cp.array([1.0, 2.0, 3.0])
+result = cp.sum(test_array)
+print(f'✅ GPU test: {result}')
+\" 2>/dev/null || echo \"❌ RAPIDS básico não funcionando\"
+
 # Verificar e ativar ambiente (já criado pelo onstart.sh)
 echo '--- [REMOTO] Verificando ambiente conda...'
 
@@ -264,6 +282,19 @@ pip install --no-cache-dir boto3 || true
 
 echo '--- [REMOTO] Garantindo instalação da biblioteca EMD (signal processing)...'
 pip install --no-cache-dir emd || true
+
+echo '--- [REMOTO] Garantindo instalação do cusignal (GPU signal processing)...'
+# cusignal deve ser instalado via rapidsai conda channel
+conda install -c rapidsai -c conda-forge -c nvidia -y cusignal || {
+    echo 'Falha na instalação via rapidsai, tentando conda-forge...'
+    conda install -c conda-forge -y cusignal || {
+        echo 'Falha na instalação via conda-forge, tentando pip...'
+        pip install --no-cache-dir cusignal || {
+            echo 'Falha na instalação via pip, tentando cusignal-cu12...'
+            pip install --no-cache-dir cusignal-cu12 || true
+        }
+    }
+}
 
 echo '--- [REMOTO] Verificando se rclone está instalado...'
 if ! command -v rclone &> /dev/null; then

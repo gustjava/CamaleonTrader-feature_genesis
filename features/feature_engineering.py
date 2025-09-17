@@ -19,15 +19,8 @@ import numpy as _np  # For numerical computations on CPU
 import cupy as _cp  # For GPU array operations
 from functools import lru_cache as _lru_cache  # For caching BK weights computation
 
-try:
-    from cusignal import fftconvolve as _fftconv  # Try GPU-accelerated FFT convolution
-except Exception:
-    try:
-        from cusignal.filtering import fftconvolve as _fftconv  # Try alternative GPU FFT convolution import
-    except Exception:
-        from scipy.signal import fftconvolve as _scipy_fft  # Fallback to CPU FFT convolution
-        def _fftconv(x, w, mode="same"):  # Wrapper to convert between CPU and GPU arrays
-            return _cp.asarray(_scipy_fft(_cp.asnumpy(x), _cp.asnumpy(w), mode=mode))
+# GPU-only: No CPU fallback - fail fast if GPU unavailable
+# cusignal import moved to function level to avoid import-time failures
 
 
 @_lru_cache(maxsize=16)  # Cache up to 16 different BK weight configurations
@@ -81,7 +74,32 @@ def _apply_bk_filter_gpu_partition(series: cudf.Series, k: int, low_period: floa
     if n_kernel <= 129:  # Use direct convolution for small kernels
         y = _cp.convolve(x, w, mode="same")
     else:  # Use FFT convolution for large kernels (more efficient)
-        y = _fftconv(x, w, mode="same")
+        # Import cusignal at function level to fail fast if unavailable
+        try:
+            from cusignal import fftconvolve as _fftconv
+            y = _fftconv(x, w, mode="same")
+        except ImportError as e:
+            # Fallback: use cupy's FFT convolution (slower but works)
+            logger.warning(f"cusignal unavailable ({e}), using cupy FFT fallback")
+            try:
+                # Use cupy's FFT convolution as fallback
+                import cupy.fft as cp_fft
+                # Pad arrays for FFT convolution
+                n = len(x)
+                m = len(w)
+                fft_size = 2 ** int(_cp.ceil(_cp.log2(n + m - 1)))
+                x_padded = _cp.zeros(fft_size, dtype=x.dtype)
+                w_padded = _cp.zeros(fft_size, dtype=w.dtype)
+                x_padded[:n] = x
+                w_padded[:m] = w
+                # FFT convolution
+                y_fft = cp_fft.ifft(cp_fft.fft(x_padded) * cp_fft.fft(w_padded))
+                y = _cp.real(y_fft[:n])
+                # Apply mode="same" by shifting
+                shift = (m - 1) // 2
+                y = _cp.roll(y, -shift)
+            except Exception as fallback_error:
+                raise RuntimeError(f"FeatureEngineering requires cusignal for large kernels but it's unavailable: {e}. Fallback also failed: {fallback_error}")
     k = int(k)
     # Restore NaNs where input had nulls
     try:
@@ -276,6 +294,25 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
     def process_cudf(self, gdf: cudf.DataFrame) -> cudf.DataFrame:
         self._log_info("🚀 Starting FeatureEngineering (cuDF)…")
         self._log_info(f"📊 Input DataFrame: {len(gdf)} rows, {len(gdf.columns)} columns")
+        
+        # GPU availability check - fail fast if GPU unavailable
+        try:
+            import cupy as cp
+            # Test GPU availability
+            test_array = cp.array([1.0, 2.0, 3.0])
+            cp.asnumpy(test_array)  # Test GPU->CPU transfer
+            self._log_info("✅ GPU availability confirmed")
+        except Exception as e:
+            self._log_error(f"❌ GPU unavailable: {e}")
+            raise RuntimeError(f"FeatureEngineering requires GPU but GPU is unavailable: {e}")
+        
+        # Test cusignal availability
+        try:
+            import cusignal
+            self._log_info("✅ cuSignal availability confirmed")
+        except Exception as e:
+            self._log_error(f"❌ cuSignal unavailable: {e}")
+            raise RuntimeError(f"FeatureEngineering requires cuSignal but it's unavailable: {e}")
         params = self._bk_params()  # Get BK filter parameters
         apply_all = bool(params.get('apply_to_all', False))  # Check if apply to all numeric columns
         if apply_all:
@@ -343,6 +380,25 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
     def process(self, df: dask_cudf.DataFrame) -> dask_cudf.DataFrame:
         self._log_info("🚀 Starting FeatureEngineering (Dask)…")
         self._log_info(f"📊 Input DataFrame: {len(df)} rows, {len(df.columns)} columns, {df.npartitions} partitions")
+        
+        # GPU availability check - fail fast if GPU unavailable
+        try:
+            import cupy as cp
+            # Test GPU availability
+            test_array = cp.array([1.0, 2.0, 3.0])
+            cp.asnumpy(test_array)  # Test GPU->CPU transfer
+            self._log_info("✅ GPU availability confirmed")
+        except Exception as e:
+            self._log_error(f"❌ GPU unavailable: {e}")
+            raise RuntimeError(f"FeatureEngineering requires GPU but GPU is unavailable: {e}")
+        
+        # Test cusignal availability
+        try:
+            import cusignal
+            self._log_info("✅ cuSignal availability confirmed")
+        except Exception as e:
+            self._log_error(f"❌ cuSignal unavailable: {e}")
+            raise RuntimeError(f"FeatureEngineering requires cuSignal but it's unavailable: {e}")
         params = self._bk_params()  # Get BK filter parameters
         try:
             cols = list(df.columns)  # Get column names
@@ -368,40 +424,102 @@ class FeatureEngineeringEngine(BaseFeatureEngine):
         except Exception:
             batch_size = 16
         since_last = 0
-        for i, col in enumerate(src, 1):  # Apply BK filter to each source column
-            out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
+        
+        # PARALLEL BK filter processing
+        try:
+            # Process columns in batches for better GPU utilization
+            batch_size = min(8, len(src))  # Process up to 8 columns in parallel
+            self._log_info("BK filter parallel processing", total_columns=len(src), batch_size=batch_size)
             
-            # Log progress every 10 columns or for the first/last column
-            if i == 1 or i == len(src) or i % 10 == 0:
-                self._log_info(f"🔄 Processing BK filter (Dask) {i}/{len(src)}: {col} → {out}")
-            
-            try:
-                # Apply BK filter on GPU using Dask
-                df[out] = df[col].map_partitions(  # Apply BK filter to each partition
-                    _apply_bk_filter_gpu_partition, k, low, high, bool(causal), bool(fill_borders), meta=(out, 'f4')  # GPU partition function with metadata
-                )
+            for batch_start in range(0, len(src), batch_size):
+                batch_end = min(batch_start + batch_size, len(src))
+                batch_cols = src[batch_start:batch_end]
                 
-                # Log completion every 10 columns or for the first/last column
+                # Process batch in parallel using CuPy streams
+                try:
+                    import cupy.cuda.stream as stream
+                    with stream.Stream():
+                        batch_results = []
+                        for col in batch_cols:
+                            out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
+                            
+                            # Apply BK filter using map_partitions for parallel processing
+                            df[out] = df[col].map_partitions(
+                                _apply_bk_filter_gpu_partition,
+                                k, low, high, causal, fill_borders,
+                                meta=cudf.Series([], dtype='float32')
+                            )
+                            batch_results.append((col, out))
+                        
+                        # Synchronize GPU operations
+                        cp.cuda.Stream.null.synchronize()
+                        
+                        # Log progress for batch
+                        for i, (col, out) in enumerate(batch_results):
+                            global_idx = batch_start + i + 1
+                            if global_idx == 1 or global_idx == len(src) or global_idx % 10 == 0:
+                                self._log_info(f"🔄 Processing BK filter (Dask) {global_idx}/{len(src)}: {col} → {out}")
+                
+                except Exception as e:
+                    # Fallback to sequential processing for this batch
+                    self._log_warn(f"BK filter parallel batch failed, using sequential: {e}")
+                    for i, col in enumerate(batch_cols):
+                        out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
+                        global_idx = batch_start + i + 1
+                        
+                        # Log progress every 10 columns or for the first/last column
+                        if global_idx == 1 or global_idx == len(src) or global_idx % 10 == 0:
+                            self._log_info(f"🔄 Processing BK filter (Dask) {global_idx}/{len(src)}: {col} → {out}")
+                        
+                        try:
+                            # Apply BK filter using map_partitions
+                            df[out] = df[col].map_partitions(
+                                _apply_bk_filter_gpu_partition,
+                                k, low, high, causal, fill_borders,
+                                meta=cudf.Series([], dtype='float32')
+                            )
+                        except Exception as e:
+                            self._log_warn(f"BK filter failed for column {col}: {e}")
+                            # Create NaN column as fallback
+                            df[out] = df[col].astype('float32') * cp.nan
+        
+        except Exception as e:
+            # Complete fallback to original sequential processing
+            self._log_warn(f"BK filter parallel processing failed, using sequential fallback: {e}")
+            for i, col in enumerate(src, 1):  # Apply BK filter to each source column
+                out = f"bk_filter_{col}"  # New column name with 'bk_filter_' prefix
+                
+                # Log progress every 10 columns or for the first/last column
                 if i == 1 or i == len(src) or i % 10 == 0:
-                    result_data = df[out]
-                    self._log_info(f"✅ BK filter completed (Dask) for {col}: dtype={result_data.dtype}, npartitions={result_data.npartitions}")
+                    self._log_info(f"🔄 Processing BK filter (Dask) {i}/{len(src)}: {col} → {out}")
                 
-                new_cols.append(out)  # Add to list of created columns
-                since_last += 1
-                if since_last >= max(1, batch_size):
-                    try:
-                        import dask as _dask
-                        # In debug mode, avoid graph optimization to keep task names visible
-                        debug_dash = bool(getattr(self.settings, 'development', {}).get('debug_dashboard', False)) if hasattr(self, 'settings') else False
-                        if debug_dash:
-                            df, = _dask.persist(df, optimize_graph=False)
-                        else:
-                            df = df.persist()
-                        since_last = 0
-                    except Exception:
-                        pass
-            except Exception as e:
-                self._log_warn(f"❌ BK application failed (Dask) for {col}", source=col, error=str(e), exc_info=True)
+                try:
+                    # Apply BK filter on GPU using Dask
+                    df[out] = df[col].map_partitions(  # Apply BK filter to each partition
+                        _apply_bk_filter_gpu_partition, k, low, high, bool(causal), bool(fill_borders), meta=(out, 'f4')  # GPU partition function with metadata
+                    )
+                    
+                    # Log completion every 10 columns or for the first/last column
+                    if i == 1 or i == len(src) or i % 10 == 0:
+                        result_data = df[out]
+                        self._log_info(f"✅ BK filter completed (Dask) for {col}: dtype={result_data.dtype}, npartitions={result_data.npartitions}")
+                    
+                    new_cols.append(out)  # Add to list of created columns
+                    since_last += 1
+                    if since_last >= max(1, batch_size):
+                        try:
+                            import dask as _dask
+                            # In debug mode, avoid graph optimization to keep task names visible
+                            debug_dash = bool(getattr(self.settings, 'development', {}).get('debug_dashboard', False)) if hasattr(self, 'settings') else False
+                            if debug_dash:
+                                df, = _dask.persist(df, optimize_graph=False)
+                            else:
+                                df = df.persist()
+                            since_last = 0
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self._log_warn(f"❌ BK application failed (Dask) for {col}", source=col, error=str(e), exc_info=True)
 
         # Record metrics/artifact (Dask)
         try:

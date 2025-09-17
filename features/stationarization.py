@@ -30,22 +30,27 @@ def _fracdiff_series_partition(series: cudf.Series, d: float, max_lag: int, tol:
     """Deterministic partition function: fractional diff of a single series."""
     try:
         x = series.to_cupy()  # Converte para CuPy array (GPU)
+        logger.debug(f"✅ Fractional diff: converted to GPU array, shape={x.shape}, dtype={x.dtype}")
         if len(x) < 3:  # Mínimo de 3 pontos para diferenciação
+            logger.warning(f"⚠️ Fractional diff: insufficient data ({len(x)} < 3)")
             return cudf.Series(cp.full(len(series), cp.nan), index=series.index)  # Retorna NaN se insuficiente
         max_lag = max(1, min(int(max_lag), len(x) - 1))  # Ajusta lag máximo para não exceder dados
         w = StationarizationEngine._fracdiff_weights_gpu(float(d), max_lag, float(tol))  # Gera pesos da diferenciação fracionária
+        logger.debug(f"✅ Fractional diff: GPU weights generated, shape={w.shape}, dtype={w.dtype}")
         if w.size <= 129:  # Para kernels pequenos, usa convolução direta
             y = cp.convolve(x, w, mode="full")[: len(x)]  # Convolução direta para eficiência
         else:  # Para kernels grandes, usa FFT
             try:
-                from cusignal import fftconvolve  # Tenta GPU FFT primeiro
+                from cusignal import fftconvolve  # GPU FFT
                 y = fftconvolve(x, w, mode="full")[: len(x)]  # FFT convolução GPU
-            except Exception:
-                from scipy.signal import fftconvolve as scipy_fftconvolve  # Fallback para CPU FFT
-                y = cp.asarray(scipy_fftconvolve(cp.asnumpy(x), cp.asnumpy(w), mode="full")[: len(x)])  # FFT convolução CPU
+                logger.debug(f"✅ Fractional diff: GPU FFT convolution completed")
+            except Exception as e:
+                logger.error(f"GPU FFT convolution failed: {e}")
+                raise RuntimeError(f"GPU FFT convolution failed and CPU fallback disabled: {e}")
         return cudf.Series(y.astype(cp.float32), index=series.index)  # Retorna série estacionarizada
-    except Exception:
-        return cudf.Series(cp.full(len(series), cp.nan), index=series.index)  # Retorna NaN em caso de erro
+    except Exception as e:
+        logger.error(f"Fractional differentiation GPU failed: {e}")
+        raise RuntimeError(f"Fractional differentiation GPU failed and CPU fallback disabled: {e}")
 
 
 def _rolling_zscore_partition(series: cudf.Series, window: int, min_periods: int) -> cudf.Series:
@@ -117,13 +122,8 @@ class StationarizationEngine(BaseFeatureEngine):
             threshold=self.settings.features.frac_diff_threshold,  # Limiar para estacionariedade
             max_lag=self.settings.features.frac_diff_max_lag  # Lag máximo para computação
         )
-        # ADF significance level for selecting optimal d
-        try:
-            from config.unified_config import get_unified_config
-            uc = get_unified_config()
-            self.adf_alpha = float(getattr(uc.features, 'adf_alpha', 0.05))  # Nível de significância ADF
-        except Exception:
-            self.adf_alpha = 0.05  # Fallback para 5%
+        # ADF removed from project - using fixed alpha
+        self.adf_alpha = 0.05  # Fixed significance level
 
         # Cache de pesos da FFD (para evitar recomputo ao varrer d_grid)
         # chave: (round(d,6), max_lag, round(tol,8)) -> cp.ndarray (GPU)
@@ -405,8 +405,8 @@ class StationarizationEngine(BaseFeatureEngine):
             if not d_grid:
                 self._critical_error("No d_values configured for optimal d search")
             
-            # Helper: compute simple ADF(0) p-value (GPU) on a series
-            def _adf_pvalue(series: cp.ndarray) -> float:
+            # Helper: compute simple stationarity test (GPU) on a series
+            def _stationarity_pvalue(series: cp.ndarray) -> float:
                 try:
                     z = series
                     # remove NaNs
@@ -448,8 +448,8 @@ class StationarizationEngine(BaseFeatureEngine):
             fallback = None  # (d, y, stats)
             for d in d_grid:
                 y = self._compute_fractional_diff(data, d)
-                # Compute ADF p-value
-                pval = _adf_pvalue(y)
+                # Compute stationarity p-value
+                pval = _stationarity_pvalue(y)
                 if pval <= adf_alpha and chosen is None:
                     chosen = (d, y, pval)
                 # Track fallback by variance ratio criterion
@@ -496,7 +496,7 @@ class StationarizationEngine(BaseFeatureEngine):
                                          'kurtosis': _mom(y_opt, mu_y, sd_y, 4)},
                 'sample_size': int(data.size),
                 'all_d_values': d_grid,
-                'adf_alpha': adf_alpha
+                'stationarity_alpha': adf_alpha
             }
         except Exception as e:
             self._critical_error(f"Error finding optimal d for {column_name}: {e}")
@@ -563,7 +563,15 @@ class StationarizationEngine(BaseFeatureEngine):
             DataFrame with additional stationarized features
         """
         try:
-            self._log_info("Starting stationarization pipeline...")  # Log de início do pipeline
+            # Check GPU availability and log device info
+            try:
+                import os
+                worker_id = os.environ.get('DASK_WORKER_NAME', 'unknown')
+                gpu_count = cp.cuda.runtime.getDeviceCount()
+                current_gpu = cp.cuda.Device().id
+                self._log_info(f"🚀 Starting stationarization pipeline on GPU {current_gpu}/{gpu_count} [Worker: {worker_id}]")
+            except Exception as e:
+                self._log_info(f"Starting stationarization pipeline... (GPU info unavailable: {e})")
             # Track schema before to derive new columns list
             try:
                 cols_before = set(list(df.columns))  # Colunas antes do processamento
@@ -2033,25 +2041,85 @@ class StationarizationEngine(BaseFeatureEngine):
             autocorr = cp.empty(max_lag + 1, dtype=cp.float32)
             autocorr[0] = 1.0  # Autocorrelation at lag 0 is always 1
             
-            # Vectorized autocorrelation for different lags
-            for lag in range(1, max_lag + 1):
-                if lag < len(data):
-                    # Vectorized autocorrelation calculation
-                    data_lagged = data[lag:]
-                    data_original = data[:-lag]
+            # PARALLEL autocorrelation for different lags
+            try:
+                # Process lags in batches for better GPU utilization
+                batch_size = min(8, max_lag)  # Process up to 8 lags in parallel
+                self._log_info("Autocorrelation parallel processing", max_lag=max_lag, batch_size=batch_size)
+                
+                for batch_start in range(1, max_lag + 1, batch_size):
+                    batch_end = min(batch_start + batch_size, max_lag + 1)
+                    batch_lags = range(batch_start, batch_end)
                     
-                    mean_original = cp.mean(data_original)
-                    mean_lagged = cp.mean(data_lagged)
+                    # Process batch in parallel using CuPy streams
+                    try:
+                        import cupy.cuda.stream as stream
+                        with stream.Stream():
+                            for lag in batch_lags:
+                                if lag < len(data):
+                                    # Vectorized autocorrelation calculation
+                                    data_lagged = data[lag:]
+                                    data_original = data[:-lag]
+                                    
+                                    mean_original = cp.mean(data_original)
+                                    mean_lagged = cp.mean(data_lagged)
+                                    
+                                    numerator = cp.sum((data_original - mean_original) * (data_lagged - mean_lagged))
+                                    denominator = cp.sqrt(cp.sum((data_original - mean_original)**2) * cp.sum((data_lagged - mean_lagged)**2))
+                                    
+                                    if denominator > 1e-9:
+                                        autocorr[lag] = float(numerator / denominator)
+                                    else:
+                                        autocorr[lag] = 0.0
+                                else:
+                                    autocorr[lag] = 0.0
+                            
+                            # Synchronize GPU operations
+                            cp.cuda.Stream.null.synchronize()
                     
-                    numerator = cp.sum((data_original - mean_original) * (data_lagged - mean_lagged))
-                    denominator = cp.sqrt(cp.sum((data_original - mean_original)**2) * cp.sum((data_lagged - mean_lagged)**2))
-                    
-                    if denominator > 1e-9:
-                        autocorr[lag] = float(numerator / denominator)
+                    except Exception as e:
+                        # Fallback to sequential processing for this batch
+                        self._log_warn(f"Autocorrelation parallel batch failed, using sequential: {e}")
+                        for lag in batch_lags:
+                            if lag < len(data):
+                                # Vectorized autocorrelation calculation
+                                data_lagged = data[lag:]
+                                data_original = data[:-lag]
+                                
+                                mean_original = cp.mean(data_original)
+                                mean_lagged = cp.mean(data_lagged)
+                                
+                                numerator = cp.sum((data_original - mean_original) * (data_lagged - mean_lagged))
+                                denominator = cp.sqrt(cp.sum((data_original - mean_original)**2) * cp.sum((data_lagged - mean_lagged)**2))
+                                
+                                if denominator > 1e-9:
+                                    autocorr[lag] = float(numerator / denominator)
+                                else:
+                                    autocorr[lag] = 0.0
+                            else:
+                                autocorr[lag] = 0.0
+            
+            except Exception as e:
+                # Complete fallback to original sequential processing
+                self._log_warn(f"Autocorrelation parallel processing failed, using sequential fallback: {e}")
+                for lag in range(1, max_lag + 1):
+                    if lag < len(data):
+                        # Vectorized autocorrelation calculation
+                        data_lagged = data[lag:]
+                        data_original = data[:-lag]
+                        
+                        mean_original = cp.mean(data_original)
+                        mean_lagged = cp.mean(data_lagged)
+                        
+                        numerator = cp.sum((data_original - mean_original) * (data_lagged - mean_lagged))
+                        denominator = cp.sqrt(cp.sum((data_original - mean_original)**2) * cp.sum((data_lagged - mean_lagged)**2))
+                        
+                        if denominator > 1e-9:
+                            autocorr[lag] = float(numerator / denominator)
+                        else:
+                            autocorr[lag] = 0.0
                     else:
                         autocorr[lag] = 0.0
-                else:
-                    autocorr[lag] = 0.0
             
             return autocorr
             
@@ -2249,12 +2317,32 @@ class StationarizationEngine(BaseFeatureEngine):
             # Vectorized correlation matrix
             corr_matrix = self._compute_correlation_matrix_vectorized(data_matrix)
             
-            # Extract correlation features
-            for i, name1 in enumerate(series_names):
-                for j, name2 in enumerate(series_names):
-                    if i < j:  # Avoid duplicates and diagonal
-                        corr_value = float(corr_matrix[i, j])
+            # Extract correlation features - PARALLEL PROCESSING
+            try:
+                # Use vectorized operations to extract upper triangular correlations
+                n_series = len(series_names)
+                if n_series > 1:
+                    # Create mask for upper triangular matrix (excluding diagonal)
+                    mask = cp.triu(cp.ones((n_series, n_series), dtype=bool), k=1)
+                    upper_tri_indices = cp.where(mask)
+                    
+                    # Extract correlation values in parallel
+                    corr_values = corr_matrix[upper_tri_indices]
+                    
+                    # Create feature names and values in parallel
+                    for idx, (i, j) in enumerate(zip(upper_tri_indices[0], upper_tri_indices[1])):
+                        name1, name2 = series_names[int(i)], series_names[int(j)]
+                        corr_value = float(corr_values[idx])
                         correlation_features[f'corr_{name1}_{name2}'] = corr_value
+                
+            except Exception as e:
+                # Fallback to original sequential processing
+                self._log_warn(f"Parallel correlation extraction failed, using sequential: {e}")
+                for i, name1 in enumerate(series_names):
+                    for j, name2 in enumerate(series_names):
+                        if i < j:  # Avoid duplicates and diagonal
+                            corr_value = float(corr_matrix[i, j])
+                            correlation_features[f'corr_{name1}_{name2}'] = corr_value
             
             # Maximum correlation
             if len(corr_matrix) > 1:

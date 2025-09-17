@@ -118,7 +118,7 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, candidates: Optiona
         # Continue with original valid_candidates on error
 
     # 4) Leakage check
-    forbidden = [c for c in valid_candidates if (c.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')))]
+    forbidden = [c for c in valid_candidates if (c.startswith(('y_ret_fwd_', 'dcor_', 'stage1_', 'cpcv_')))]
     if forbidden:
         stats_engine._log_error("[VIF] DATA LEAKAGE DETECTED in candidates", count=len(forbidden), examples=forbidden[:10])
         # Remove forbidden features even if present

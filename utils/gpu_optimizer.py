@@ -47,16 +47,16 @@ class GPUOptimizer:
         self._configure_memory_pools()
     
     def _configure_memory_pools(self):
-        """Configure memory pools for optimal performance."""
+        """Configure memory pools for optimal performance (RTX 5090 conservative)."""
         try:
-            # Set memory pool size (8GB)
-            pool_size = 8 * 1024**3
+            # Set memory pool size (16GB - RTX 5090 conservative)
+            pool_size = 16 * 1024**3
             self.memory_pool.set_limit(size=pool_size)
             
-            # Enable memory spilling
-            self.memory_pool.set_limit(size=pool_size, fraction=0.9)
+            # Enable memory spilling (RTX 5090 conservative)
+            self.memory_pool.set_limit(size=pool_size, fraction=0.80)
             
-            logger.info(f"GPU memory pool configured with {pool_size / (1024**3):.1f} GB limit")
+            logger.info(f"GPU memory pool configured (RTX 5090 conservative) with {pool_size / (1024**3):.1f} GB limit")
             
         except Exception as e:
             logger.warning(f"Could not configure memory pools: {e}")

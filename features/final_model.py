@@ -52,6 +52,70 @@ class FinalModelTrainer:
         """Log critical error and raise exception."""
         self._log_error(message, **kwargs)
         raise RuntimeError(f"FinalModel Critical Error: {message}")
+    
+    def _extract_fracdiff_parameters(self, selected_features: List[str], fracdiff_optimal_d: Dict[str, float] = None, X_df=None) -> Dict[str, float]:
+        """Extract frac_diff optimal d parameters from stationarization metrics or DataFrame columns."""
+        try:
+            # Use provided parameters if available
+            if fracdiff_optimal_d:
+                self._log_info(f"Using provided fracdiff parameters: {fracdiff_optimal_d}")
+                return fracdiff_optimal_d
+            
+            # Try to extract from DataFrame columns if available
+            if X_df is not None:
+                fracdiff_params = {}
+                frac_diff_d_columns = [f for f in X_df.columns if f.startswith('frac_diff_') and f.endswith('_d')]
+                
+                if frac_diff_d_columns:
+                    self._log_info(f"Found {len(frac_diff_d_columns)} frac_diff_d columns in DataFrame")
+                    
+                    for d_col in frac_diff_d_columns:
+                        try:
+                            # Extract the base column name
+                            base_col = d_col.replace('frac_diff_', '').replace('_d', '')
+                            
+                            # Get the d value from the DataFrame
+                            if hasattr(X_df, 'compute'):  # dask_cudf
+                                d_value = X_df[d_col].compute().iloc[0]
+                            else:  # cudf
+                                d_value = X_df[d_col].iloc[0]
+                            
+                            # Convert to float if needed
+                            if hasattr(d_value, 'item'):
+                                d_value = d_value.item()
+                            
+                            fracdiff_params[base_col] = float(d_value)
+                            self._log_info(f"Extracted d parameter for {base_col}: {d_value}")
+                            
+                        except Exception as e:
+                            self._log_warn(f"Could not extract d parameter from {d_col}: {e}")
+                            continue
+                    
+                    if fracdiff_params:
+                        self._log_info(f"Successfully extracted fracdiff parameters from DataFrame: {fracdiff_params}")
+                        return fracdiff_params
+            
+            # Fallback: extract from selected features
+            fracdiff_params = {}
+            frac_diff_features = [f for f in selected_features if f.startswith('frac_diff_') and not f.endswith('_d')]
+            
+            if frac_diff_features:
+                self._log_info(f"Found {len(frac_diff_features)} frac_diff features in selected features")
+                
+                # Use default values for all frac_diff features
+                for feature in frac_diff_features:
+                    base_col = feature.replace('frac_diff_', '')
+                    fracdiff_params[base_col] = 0.5  # Default value
+                    
+                self._log_info(f"Using default fracdiff parameters: {fracdiff_params}")
+            else:
+                self._log_info("No frac_diff features found in selected features")
+                
+            return fracdiff_params
+            
+        except Exception as e:
+            self._log_error(f"Error extracting fracdiff parameters: {e}")
+            return {}
 
     def build_and_evaluate_final_model(self, 
                                      X_df,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
@@ -60,7 +124,8 @@ class FinalModelTrainer:
                                      feature_importances: Dict[str, float],
                                      selection_metadata: Dict[str, Any],
                                      symbol: str,
-                                     timeframe: str) -> Dict[str, Any]:
+                                     timeframe: str,
+                                     fracdiff_optimal_d: Dict[str, float] = None) -> Dict[str, Any]:
         """
         Build, train and evaluate the final CatBoost model with selected features.
         
@@ -86,6 +151,16 @@ class FinalModelTrainer:
             self._log_info('Conversion completed', 
                           samples=len(X_df),
                           features=len(X_df.columns))
+
+        try:
+            import cudf
+            if not hasattr(X_df, 'to_cupy'):
+                X_df = cudf.DataFrame.from_pandas(X_df)
+            if not hasattr(y_series, 'to_cupy'):
+                y_series = cudf.Series(y_series)
+        except Exception:
+            # If cudf unavailable (unexpected), proceed with existing types
+            pass
         
         self._log_info('Starting final model training', 
                        symbol=symbol, 
@@ -205,13 +280,28 @@ class FinalModelTrainer:
     def _determine_task_type(self, y_series) -> str:
         """Determine if this is a regression or classification task."""
         try:
-            y_vals = y_series.values if hasattr(y_series, 'values') else np.asarray(y_series)
-            unique_values = len(np.unique(y_vals[np.isfinite(y_vals)]))
-            
-            # Use configuration or heuristic
+            if hasattr(y_series, 'to_cupy'):
+                import cupy as cp
+                y_gpu = y_series.to_cupy()
+                finite_mask = cp.isfinite(y_gpu)
+                y_gpu_finite = y_gpu[finite_mask]
+                uniq_gpu = cp.unique(y_gpu_finite)
+                unique_values = int(uniq_gpu.shape[0])
+                uniq_cpu = cp.asnumpy(uniq_gpu)
+                y_std_val = float(cp.std(y_gpu_finite)) if y_gpu_finite.size > 0 else 0.0
+                total_samples = int(y_gpu_finite.size)
+            else:
+                y_vals = np.asarray(y_series)
+                finite_mask = np.isfinite(y_vals)
+                y_vals_finite = y_vals[finite_mask]
+                uniq_cpu = np.unique(y_vals_finite)
+                unique_values = len(uniq_cpu)
+                y_std_val = float(np.std(y_vals_finite)) if y_vals_finite.size > 0 else 0.0
+                total_samples = int(y_vals_finite.size)
+
             max_classes = int(getattr(self.config.features, 'stage3_classification_max_classes', 10))
-            
-            if unique_values <= max_classes and unique_values <= len(y_vals) * 0.1:
+
+            if unique_values <= max_classes and (total_samples > 0 and unique_values <= max(2, int(total_samples * 0.1))):
                 task_type = 'classification'
                 self._log_info('Task determined as classification', 
                               unique_values=unique_values, 
@@ -220,7 +310,7 @@ class FinalModelTrainer:
                 task_type = 'regression'
                 self._log_info('Task determined as regression', 
                               unique_values=unique_values,
-                              y_std=float(np.std(y_vals)))
+                              y_std=y_std_val)
             
             return task_type
             
@@ -233,13 +323,27 @@ class FinalModelTrainer:
         n_samples = len(X_df)
         split_idx = int(n_samples * (1 - test_ratio))
         
-        # Convert to numpy for CatBoost
-        X_train = X_df.iloc[:split_idx].to_numpy(dtype=np.float32)
-        X_test = X_df.iloc[split_idx:].to_numpy(dtype=np.float32)
-        y_train = y_series.iloc[:split_idx].to_numpy(dtype=np.float32)
-        y_test = y_series.iloc[split_idx:].to_numpy(dtype=np.float32)
-        
-        feature_names = list(X_df.columns)
+        feature_names = list(X_df.columns) if hasattr(X_df, 'columns') else list(range(X_df.shape[1]))
+
+        if hasattr(X_df, 'to_cupy') and hasattr(y_series, 'to_cupy'):
+            import cupy as cp
+            X_gpu = X_df.to_cupy()
+            y_gpu = y_series.to_cupy()
+
+            X_train_gpu = X_gpu[:split_idx]
+            X_test_gpu = X_gpu[split_idx:]
+            y_train_gpu = y_gpu[:split_idx]
+            y_test_gpu = y_gpu[split_idx:]
+
+            X_train = cp.asnumpy(X_train_gpu)
+            X_test = cp.asnumpy(X_test_gpu)
+            y_train = cp.asnumpy(y_train_gpu)
+            y_test = cp.asnumpy(y_test_gpu)
+        else:
+            X_train = X_df.iloc[:split_idx].to_numpy(dtype=np.float32)
+            X_test = X_df.iloc[split_idx:].to_numpy(dtype=np.float32)
+            y_train = y_series.iloc[:split_idx].to_numpy(dtype=np.float32)
+            y_test = y_series.iloc[split_idx:].to_numpy(dtype=np.float32)
         
         self._log_info('Time series split created', 
                        train_samples=len(X_train),
@@ -415,9 +519,9 @@ class FinalModelTrainer:
             y_test = train_test_split['y_test']
             train_pred = model_results['train_predictions']
             test_pred = model_results['test_predictions']
-            
+
             evaluation_results = {}
-            
+
             if task_type == 'classification':
                 # Classification metrics
                 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
@@ -451,46 +555,99 @@ class FinalModelTrainer:
                 evaluation_results['test_primary_metric'] = evaluation_results['test_f1']
                 
             else:
-                # Regression metrics - Standard
-                from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-                
-                # Training metrics
+                xp = np
+                use_gpu_metrics = False
+                try:
+                    import cupy as cp
+                    y_train_gpu = cp.asarray(y_train)
+                    y_test_gpu = cp.asarray(y_test)
+                    train_pred_gpu = cp.asarray(train_pred)
+                    test_pred_gpu = cp.asarray(test_pred)
+                    xp = cp
+                    use_gpu_metrics = True
+                except Exception:
+                    y_train_gpu = y_train
+                    y_test_gpu = y_test
+                    train_pred_gpu = train_pred
+                    test_pred_gpu = test_pred
+
+                def _mse(target, pred):
+                    diff = target - pred
+                    return float(xp.mean(diff * diff))
+
+                def _mae(target, pred):
+                    return float(xp.mean(xp.abs(target - pred)))
+
+                def _r2(target, pred):
+                    ss_res = xp.sum((target - pred) ** 2)
+                    ss_tot = xp.sum((target - xp.mean(target)) ** 2)
+                    if float(ss_tot) <= 0.0:
+                        return 0.0
+                    return float(1.0 - (ss_res / ss_tot))
+
+                def _rmse(target, pred):
+                    return float(xp.sqrt(xp.mean((target - pred) ** 2)))
+
+                if use_gpu_metrics:
+                    train_r2 = _r2(y_train_gpu, train_pred_gpu)
+                    test_r2 = _r2(y_test_gpu, test_pred_gpu)
+                    train_mse = _mse(y_train_gpu, train_pred_gpu)
+                    test_mse = _mse(y_test_gpu, test_pred_gpu)
+                    train_mae = _mae(y_train_gpu, train_pred_gpu)
+                    test_mae = _mae(y_test_gpu, test_pred_gpu)
+                    train_rmse = _rmse(y_train_gpu, train_pred_gpu)
+                    test_rmse = _rmse(y_test_gpu, test_pred_gpu)
+                else:
+                    from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+                    train_r2 = float(r2_score(y_train, train_pred))
+                    test_r2 = float(r2_score(y_test, test_pred))
+                    train_mse = float(mean_squared_error(y_train, train_pred))
+                    test_mse = float(mean_squared_error(y_test, test_pred))
+                    train_mae = float(mean_absolute_error(y_train, train_pred))
+                    test_mae = float(mean_absolute_error(y_test, test_pred))
+                    train_rmse = float(np.sqrt(mean_squared_error(y_train, train_pred)))
+                    test_rmse = float(np.sqrt(mean_squared_error(y_test, test_pred)))
+
                 evaluation_results.update({
-                    'train_r2': float(r2_score(y_train, train_pred)),
-                    'train_mse': float(mean_squared_error(y_train, train_pred)),
-                    'train_mae': float(mean_absolute_error(y_train, train_pred)),
-                    'train_rmse': float(np.sqrt(mean_squared_error(y_train, train_pred)))
+                    'train_r2': train_r2,
+                    'train_mse': train_mse,
+                    'train_mae': train_mae,
+                    'train_rmse': train_rmse,
                 })
-                
-                # Test metrics
+
                 evaluation_results.update({
-                    'test_r2': float(r2_score(y_test, test_pred)),
-                    'test_mse': float(mean_squared_error(y_test, test_pred)),
-                    'test_mae': float(mean_absolute_error(y_test, test_pred)),
-                    'test_rmse': float(np.sqrt(mean_squared_error(y_test, test_pred)))
+                    'test_r2': test_r2,
+                    'test_mse': test_mse,
+                    'test_mae': test_mae,
+                    'test_rmse': test_rmse,
                 })
                 
                 # Advanced trading metrics for regression
                 try:
                     # Training advanced metrics
                     train_advanced = self.trading_metrics.compute_comprehensive_metrics(
-                        predictions=train_pred,
-                        targets=y_train,
-                        prefix="train"
+                        y_true=y_train,
+                        y_pred=train_pred,
+                        fold_id="train"
                     )
+                    # Add prefix to all keys
+                    train_advanced = {f"train_{k}": v for k, v in train_advanced.items()}
                     evaluation_results.update(train_advanced)
                     
                     # Test advanced metrics
                     test_advanced = self.trading_metrics.compute_comprehensive_metrics(
-                        predictions=test_pred,
-                        targets=y_test,
-                        prefix="test"
+                        y_true=y_test,
+                        y_pred=test_pred,
+                        fold_id="test"
                     )
+                    # Add prefix to all keys
+                    test_advanced = {f"test_{k}": v for k, v in test_advanced.items()}
                     evaluation_results.update(test_advanced)
                     
                     # Log advanced metrics
-                    self.trading_metrics.log_comprehensive_metrics(train_advanced, "Final Model Training")
-                    self.trading_metrics.log_comprehensive_metrics(test_advanced, "Final Model Testing")
+                    from utils.trading_metrics import log_comprehensive_metrics
+                    log_comprehensive_metrics(train_advanced, self.logger, "Final Model Training")
+                    log_comprehensive_metrics(test_advanced, self.logger, "Final Model Testing")
                     
                     # Primary metric: use Skill Score or Information Coefficient if available
                     if 'test_skill_score' in test_advanced:
@@ -874,6 +1031,18 @@ class FinalModelTrainer:
                 model_results['model'].save_model(model_file_path)
                 self._log_info('Model saved to temporary file', file_path=model_file_path)
                 
+                # Verify model file was created and has content
+                if not os.path.exists(model_file_path):
+                    self._log_error('Model file was not created', file_path=model_file_path)
+                    return False
+                
+                file_size = os.path.getsize(model_file_path)
+                if file_size == 0:
+                    self._log_error('Model file is empty', file_path=model_file_path, file_size=file_size)
+                    return False
+                
+                self._log_info('Model file verified', file_path=model_file_path, file_size_bytes=file_size)
+                
             except Exception as e:
                 self._log_error('Failed to save model to file', 
                                file_path=model_file_path, 
@@ -902,10 +1071,41 @@ class FinalModelTrainer:
                 # Data information
                 'train_samples': evaluation_results.get('train_samples'),
                 'test_samples': evaluation_results.get('test_samples'),
-                'vol_scaling_enabled': getattr(self.config.features, 'enable_vol_scaling', False)
+                'vol_scaling_enabled': getattr(self.config.features, 'enable_vol_scaling', False),
+                
+                # Feature engineering parameters
+                'fracdiff_optimal_d': self._extract_fracdiff_parameters(selected_features, fracdiff_optimal_d, X_df)
             }
             
-            # 4. Upload to R2
+            # Log fracdiff parameters specifically
+            fracdiff_params = model_info.get('fracdiff_optimal_d', {})
+            if fracdiff_params:
+                self._log_info(f"🔧 FracDiff parameters included in R2 JSON:")
+                for col, d_value in fracdiff_params.items():
+                    self._log_info(f"  - {col}: d={d_value}")
+            else:
+                self._log_info("⚠️  No FracDiff parameters found for R2 JSON")
+            
+            # 4. Log complete JSON metadata before upload
+            self._log_info("📋 Complete R2 JSON metadata:")
+            try:
+                import json as _json
+                json_str = _json.dumps(model_info, indent=2, ensure_ascii=False)
+                # Log in chunks to avoid truncation
+                lines = json_str.split('\n')
+                for i, line in enumerate(lines):
+                    self._log_info(f"JSON[{i+1:3d}]: {line}")
+                
+                # Verify JSON is valid
+                _json.loads(json_str)
+                self._log_info("✅ JSON metadata validation passed")
+                
+            except Exception as e:
+                self._log_warn(f"Could not log JSON metadata: {e}")
+                # Fallback: log as string
+                self._log_info(f"JSON metadata: {model_info}")
+            
+            # 5. Upload to R2
             upload_success = self.r2_uploader.upload_model(
                 model_file_path=model_file_path,
                 model_info=model_info,

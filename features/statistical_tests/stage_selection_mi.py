@@ -27,7 +27,8 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, vif_selected: Optio
 
     # Build sample - convert dask_cudf to cudf for MI computation
     try:
-        sample_df = ddf.head(stats_engine.selection_max_rows).compute()
+        # Use the safe sampling method to avoid Dask warnings
+        sample_df = stats_engine._sample_head_across_partitions(ddf, stats_engine.selection_max_rows, max_parts=16)
         stats_engine._log_info("[MI] Sample created", sample_rows=len(sample_df), sample_cols=len(sample_df.columns))
     except Exception as e:
         stats_engine._log_error("[MI] Failed to create sample", error=str(e))
@@ -38,7 +39,7 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, vif_selected: Optio
         }
 
     # Leakage check
-    forbidden = [c for c in vif_selected if (c.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')))]
+    forbidden = [c for c in vif_selected if (c.startswith(('y_ret_fwd_', 'dcor_', 'stage1_', 'cpcv_')))]
     if forbidden:
         stats_engine._log_error("[MI] DATA LEAKAGE DETECTED in MI input", count=len(forbidden), examples=forbidden[:10])
         vif_selected = [c for c in vif_selected if c not in forbidden]
@@ -65,18 +66,19 @@ def run(stats_engine, ddf: dask_cudf.DataFrame, target: str, vif_selected: Optio
                               mi_min_samples=mi_min_samples,
                               mi_threshold=stats_engine.mi_threshold)
         
-        # Convert cudf DataFrame to cupy array for MI computation
+        # Convert cudf DataFrame to CuPy array for MI computation (stay on GPU)
         try:
             import cupy as cp
-            # Select only the VIF-selected features
-            X_array = sample_df[vif_selected].values
-            if hasattr(X_array, 'get'):  # If it's a cudf array, get the cupy array
-                X_array = X_array.get()
-            
+            X_subset = sample_df[vif_selected]
+            if hasattr(X_subset, "to_cupy"):
+                X_array = X_subset.to_cupy()
+            else:
+                X_array = cp.asarray(X_subset.values)
+
             stats_engine._log_info("[MI] Data prepared for GPU MI", 
                                   array_shape=X_array.shape,
                                   array_dtype=str(X_array.dtype))
-            
+
             mi_selected = stats_engine.feature_selection._compute_mi_redundancy_gpu(
                 X_array, vif_selected, dcor_scores, 
                 float(stats_engine.mi_threshold),

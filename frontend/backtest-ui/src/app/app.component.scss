@@ -1,0 +1,22 @@
+.layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.layout__header {
+  padding: 1.5rem 2rem;
+  background: #171a2b;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.35);
+
+  h1 {
+    margin: 0;
+    font-size: 1.6rem;
+    letter-spacing: 0.05rem;
+  }
+}
+
+.layout__content {
+  flex: 1;
+  padding: 1.5rem 2rem 2rem;
+}

@@ -1,0 +1,103 @@
+<section class="dashboard">
+  <form [formGroup]="form" (ngSubmit)="startBacktest()" class="dashboard__controls">
+    <div class="control-group">
+      <label for="datasetPath">Dataset Parquet</label>
+      <input id="datasetPath" type="text" formControlName="datasetPath" placeholder="/path/to/symbol_backtest.parquet" />
+    </div>
+
+    <div class="control-group">
+      <label for="metadataPath">Metadata JSON</label>
+      <input id="metadataPath" type="text" formControlName="metadataPath" placeholder="/path/to/model_metadata.json" />
+    </div>
+
+    <div class="control-group">
+      <label for="modelPath">Modelo CatBoost</label>
+      <input id="modelPath" type="text" formControlName="modelPath" placeholder="/path/to/model.cbm" />
+    </div>
+
+    <div class="control-inline">
+      <div class="control-group">
+        <label for="batchSize">Batch size</label>
+        <input id="batchSize" type="number" min="1" formControlName="batchSize" />
+      </div>
+      <div class="control-group control-group--toggle">
+        <label for="autoStream">Transmitir em tempo real</label>
+        <input id="autoStream" type="checkbox" formControlName="autoStream" disabled />
+      </div>
+    </div>
+
+    <div class="control-actions">
+      <button type="submit" [disabled]="connecting">{{ connecting ? 'Transmitindo…' : 'Iniciar backtest' }}</button>
+      <button type="button" class="secondary" (click)="cancelBacktest()" [disabled]="!connecting">Cancelar</button>
+    </div>
+    <p class="helper" *ngIf="loadingModels">Carregando lista de modelos disponíveis…</p>
+  </form>
+
+  <section class="dashboard__content" *ngIf="events.length">
+    <article class="chart-card">
+      <h2>Evolução do preço</h2>
+      <ngx-charts-line-chart
+        [scheme]="colorScheme"
+        [results]="priceSeries"
+        [legend]="false"
+        [autoScale]="true"
+        [timeline]="false"
+        [curve]="'monotoneX'"
+      ></ngx-charts-line-chart>
+    </article>
+
+    <article class="metrics-card" *ngIf="summary">
+      <h2>Métricas do backtest</h2>
+      <div class="metrics-grid">
+        <div class="metric" *ngFor="let entry of (metrics | keyvalue)">
+          <span class="metric__label">{{ entry.key }}</span>
+          <span class="metric__value">{{ entry.value | number: '1.2-4' }}</span>
+        </div>
+      </div>
+    </article>
+
+    <article class="trades-card" *ngIf="trades.length">
+      <h2>Trades executados</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Direção</th>
+            <th>Entrada</th>
+            <th>Saída</th>
+            <th>P/L (%)</th>
+            <th>Motivo</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr *ngFor="let trade of trades; trackBy: trackByTrade">
+            <td>{{ trade.direction }}</td>
+            <td>{{ trade.entry_time | date: 'short' }}</td>
+            <td>{{ trade.exit_time | date: 'short' }}</td>
+            <td [class.positive]="trade.return_pct >= 0" [class.negative]="trade.return_pct < 0">
+              {{ trade.return_pct * 100 | number: '1.2-2' }}
+            </td>
+            <td>{{ trade.exit_reason }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </article>
+
+    <article class="features-card" *ngIf="events.length">
+      <h2>Último snapshot de features</h2>
+      <div class="feature-grid">
+        <div class="feature" *ngFor="let feature of (events[events.length - 1].features | keyvalue)">
+          <span class="feature__label">{{ feature.key }}</span>
+          <span class="feature__value">{{ feature.value | number: '1.3-3' }}</span>
+        </div>
+      </div>
+    </article>
+  </section>
+
+  <section class="empty-state" *ngIf="!events.length && !connecting && !error">
+    <p>Informe os caminhos do dataset, metadata e modelo para iniciar o streaming do backtest.</p>
+  </section>
+
+  <section class="error" *ngIf="error">
+    <p>Erro: {{ error }}</p>
+  </section>
+</section>

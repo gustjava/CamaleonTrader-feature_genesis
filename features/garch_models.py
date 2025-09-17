@@ -45,27 +45,31 @@ def _garch_fit_partition_np(part: cudf.DataFrame, price_col: str, max_samples: i
         if price_col not in part.columns:  # Verifica se coluna de preço existe
             return cudf.DataFrame([_garch_default_row()])
 
-        x = part[price_col].to_pandas().to_numpy()  # Converte para NumPy para processamento CPU
+        x = part[price_col].to_cupy().astype(cp.float64, copy=False)  # Converte para CuPy para processamento GPU
         if x.size < 100:  # Precisa de pelo menos 100 observações para GARCH
             return cudf.DataFrame([_garch_default_row()])
 
-        x = x.astype(np.float64, copy=False)  # Converte para float64 para precisão
-        if np.isnan(x).any() or np.isinf(x).any():  # Verifica valores inválidos
-            # Replace non-finite with NaN and apply causal (forward-only) fill, then small constant for any leading NaNs
-            x = np.where(np.isfinite(x), x, np.nan)
-            pd = __import__('pandas')  # Importa pandas para preenchimento
-            x = pd.Series(x).fillna(method='ffill').fillna(1e-8).to_numpy()  # Preenche apenas com forward fill e constante
+        if not cp.isfinite(x).all():  # Verifica valores inválidos
+            x = cp.where(cp.isfinite(x), x, cp.nan)
+            mask = cp.isnan(x)
+            if cp.any(mask):
+                valid_idx = cp.where(~mask)[0]
+                if valid_idx.size > 0:
+                    x = cp.interp(cp.arange(x.size), valid_idx, x[valid_idx])
+            x = cp.where(cp.isnan(x), 1e-8, x)
 
         # Truncate tail for bounded work
         if x.size > int(max_samples):  # Limita tamanho para controlar tempo de processamento
             x = x[-int(max_samples):]  # Pega apenas as últimas observações
 
         # Log returns
-        logx = np.log(np.maximum(x, 1e-8))  # Log dos preços (com proteção contra zero)
-        r = np.diff(logx)  # Calcula retornos logarítmicos
-        r = r[np.isfinite(r)]  # Remove valores inválidos
-        if r.size < 50:  # Precisa de pelo menos 50 retornos para GARCH
+        logx = cp.log(cp.maximum(x, 1e-8))  # Log dos preços (com proteção contra zero)
+        r_gpu = cp.diff(logx)  # Calcula retornos logarítmicos
+        r_gpu = r_gpu[cp.isfinite(r_gpu)]  # Remove valores inválidos
+        if r_gpu.size < 50:  # Precisa de pelo menos 50 retornos para GARCH
             return cudf.DataFrame([_garch_default_row()])
+
+        r = cp.asnumpy(r_gpu)
 
         # GARCH(1,1) negative log-likelihood (CPU)
         def nll(params):  # Função de log-likelihood negativa para otimização
@@ -175,8 +179,8 @@ class GARCHModels(BaseFeatureEngine):
             if tolerance is None:
                 tolerance = float(self.tolerance)
 
-            # Bring to CPU numpy for robust SciPy optimize
-            px = series.to_pandas()
+            # Keep on GPU for processing
+            px = series.to_cupy()
             # Basic cleaning: forward-fill, then drop leading NaNs
             px = px.ffill()
             px = px.dropna()
@@ -366,8 +370,8 @@ class GARCHModels(BaseFeatureEngine):
             Dictionary with GARCH parameters and fit statistics
         """
         try:
-            # Convert to numpy for optimization (only the optimization loop runs on CPU)
-            returns_np = cp.asnumpy(returns)  # Converte para NumPy para otimização CPU
+            # Keep on GPU for optimization
+            returns_gpu = returns  # Keep on GPU
             
             # Initial parameter guesses
             initial_params = np.array([0.01, 0.1, 0.8])  # omega, alpha, beta  # Valores iniciais típicos
@@ -595,26 +599,31 @@ class GARCHModels(BaseFeatureEngine):
             try:
                 import dask_cudf as _dask_cudf
                 self._log_info("GARCH rolling mode enabled (Dask)")
-                # Materialize minimal columns for deterministic processing
-                cols_needed = ['timestamp', price_col] if 'timestamp' in cols else [price_col]
-                subset = df[cols_needed].compute()
-                if 'timestamp' in subset.columns:
-                    subset = subset.sort_values('timestamp')
-                # Compute rolling GARCH on cuDF Series
-                roll_df = self.fit_rolling_garch(subset[price_col])
-                # Prefix columns
-                roll_df = roll_df.rename(columns={c: c for c in roll_df.columns})
-                # Build a frame to merge back by timestamp if available
-                if 'timestamp' in subset.columns:
-                    out_local = cudf.concat([subset[['timestamp']], roll_df.reset_index(drop=True)], axis=1)
-                    out_ddf = _dask_cudf.from_cudf(out_local, npartitions=max(1, df.npartitions))
-                    df = df.merge(out_ddf, on='timestamp', how='left')
-                else:
-                    # No timestamp; broadcast by index order (best-effort)
-                    out_ddf = _dask_cudf.from_cudf(roll_df.reset_index(drop=True), npartitions=max(1, df.npartitions))
-                    df = df.reset_index(drop=True)
-                    df = df.assign(**{c: out_ddf[c] for c in roll_df.columns})
-                self._log_info("GARCH rolling features attached.")
+                # Use map_partitions for GPU processing without materialization
+                def _garch_rolling_partition(partition_df):
+                    """Apply rolling GARCH to a single partition on GPU."""
+                    try:
+                        if price_col not in partition_df.columns:
+                            return partition_df
+                        
+                        # Sort by timestamp if available
+                        if 'timestamp' in partition_df.columns:
+                            partition_df = partition_df.sort_values('timestamp')
+                        
+                        # Apply rolling GARCH directly on GPU
+                        roll_df = _garch_rolling_partition_gpu(partition_df, price_col, window_size, step_size)
+                        
+                        # Combine with original data
+                        result = cudf.concat([partition_df, roll_df], axis=1)
+                        return result
+                        
+                    except Exception as e:
+                        logger.error(f"GARCH rolling partition failed: {e}")
+                        return partition_df
+                
+                # Apply rolling GARCH using map_partitions (executes on GPU)
+                df = df.map_partitions(_garch_rolling_partition, meta=df._meta)
+                self._log_info("GARCH rolling completed using map_partitions")
                 return df
             except Exception as e:
                 self._log_warn("GARCH rolling failed; falling back to scalar GARCH", error=str(e))
@@ -622,23 +631,25 @@ class GARCHModels(BaseFeatureEngine):
     # Bring series to single partition in one GPU worker (scalar/global fit)
         one = self._single_partition(df, cols=[price_col])  # Consolida em uma partição
 
-        # Diagnostics on a bounded head (same cap as fit)
+        # Diagnostics on a bounded tail (same cap as fit) - GPU-only
         try:
-            price_sample = one[price_col].head(self.max_samples)
-            price_series = price_sample.to_pandas()
-            n_total = int(len(price_series))
-            n_nonnull = int(price_series.notna().sum())
+            price_sample = one[price_col].tail(self.max_samples)
+            # Use GPU operations instead of CPU materialization
+            n_total = int(len(price_sample))
+            n_nonnull = int(price_sample.notna().sum())
             n_null = int(n_total - n_nonnull)
-            # Returns diagnostic
-            px = price_series.ffill().bfill()
+            # Returns diagnostic - use GPU operations
+            px = price_sample.ffill().bfill()
             if self.log_price:
-                px = np.log(np.maximum(px.to_numpy(dtype=float), 1e-8))
+                # Convert to CuPy for GPU log operations
+                px_cp = cp.asarray(px.to_cupy())
+                px = cp.log(cp.maximum(px_cp.astype(cp.float64), 1e-8))
             else:
                 px = px.to_numpy(dtype=float)
             r = np.diff(px)
             r = r[np.isfinite(r)]
             n_ret = int(r.size)
-            v_px = float(np.nanvar(price_series.to_numpy(dtype=float)))
+            v_px = float(cp.nanvar(px) if hasattr(px, 'dtype') and 'cupy' in str(type(px)) else np.nanvar(px))
             v_r = float(np.nanvar(r)) if n_ret > 0 else float('nan')
             self._log_info(
                 "GARCH diagnostics",
@@ -677,13 +688,17 @@ class GARCHModels(BaseFeatureEngine):
             meta=cudf.DataFrame({k: cudf.Series([], dtype=v) for k, v in meta.items()})  # Schema de metadados
         )
 
-        # Compute with defensive try/except; avoid hanging due to bad partitions
+        # Extract parameters without CPU materialization
         try:
-            params_pdf = params_ddf.compute().to_pandas()  # 1 row, cheap
+            # Get first partition directly without compute() to avoid CPU materialization
+            params_gdf = params_ddf.get_partition(0).compute()
+            if len(params_gdf) == 0:
+                # Fallback to default if no data
+                params_gdf = cudf.DataFrame([_garch_default_row()])
+            params = params_gdf.iloc[0].to_dict()  # Extract parameters as dictionary
         except Exception as e:
-            self._log_warn("GARCH compute failed; returning defaults", error=str(e))
-            params_pdf = cudf.DataFrame([_garch_default_row()]).to_pandas()
-        params = params_pdf.iloc[0].to_dict()  # Extrai parâmetros como dicionário
+            self._log_warn("GARCH parameter extraction failed; returning defaults", error=str(e))
+            params = _garch_default_row()  # Use default parameters directly
 
         self._log_info("GARCH fitted.", **{k: float(params[k]) if params[k] == params[k] else None for k in params})  # Log de parâmetros ajustados
         # Emit reason hint if NaNs returned

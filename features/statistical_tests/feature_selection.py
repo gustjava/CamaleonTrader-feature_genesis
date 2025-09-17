@@ -81,26 +81,27 @@ class FeatureSelection:
             if vol_method == 'garch':
                 try:
                     # Simple GARCH(1,1) approximation using rolling volatility
-                    # Convert to pandas if needed for rolling operations
-                    import pandas as pd
-                    if hasattr(y_series, 'to_pandas'):
-                        y_pd = y_series.to_pandas()
+                    # Keep on GPU for rolling operations
+                    import cupy as cp
+                    if hasattr(y_series, 'to_cupy'):
+                        y_gpu = y_series.to_cupy()
                     else:
-                        y_pd = pd.Series(y_np)
+                        y_gpu = cp.asarray(y_np)
                     
-                    # Compute rolling volatility (GARCH approximation)
+                    # Compute rolling volatility (GARCH approximation) on GPU
                     window = int(getattr(self, 'vol_scaling_window', 50))
-                    vol_est = y_pd.rolling(window=window, min_periods=10).std()
+                    # Use CuPy for rolling operations
+                    vol_est = cp.nanstd(cp.lib.stride_tricks.sliding_window_view(y_gpu, window), axis=1)
                     
-                    # Fill initial NAs with expanding std
-                    vol_est = vol_est.fillna(y_pd.expanding(min_periods=1).std())
+                    # Fill initial NAs with expanding std on GPU
+                    vol_est = cp.where(cp.isnan(vol_est), cp.nanstd(y_gpu), vol_est)
                     
                     # Ensure positive volatility with minimum threshold
                     min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
-                    vol_est = np.maximum(vol_est.values, min_vol)
+                    vol_est = cp.maximum(vol_est, min_vol)
                     
-                    # Apply vol-scaling: ỹ = y / σ̂_t
-                    y_scaled = y_np / vol_est
+                    # Apply vol-scaling: ỹ = y / σ̂_t on GPU
+                    y_scaled = y_gpu / vol_est
                     vol_weights = 1.0 / vol_est
                     
                     scaling_info.update({
@@ -120,21 +121,22 @@ class FeatureSelection:
             
             if vol_method == 'rolling' or vol_method == 'realized':
                 try:
-                    # Rolling realized volatility
-                    import pandas as pd
-                    if hasattr(y_series, 'to_pandas'):
-                        y_pd = y_series.to_pandas()
+                    # Rolling realized volatility on GPU
+                    import cupy as cp
+                    if hasattr(y_series, 'to_cupy'):
+                        y_gpu = y_series.to_cupy()
                     else:
-                        y_pd = pd.Series(y_np)
+                        y_gpu = cp.asarray(y_np)
                     
                     window = int(getattr(self, 'vol_scaling_window', 50))
-                    vol_est = y_pd.rolling(window=window, min_periods=10).std()
-                    vol_est = vol_est.fillna(y_pd.expanding(min_periods=1).std())
+                    # Use CuPy for rolling operations
+                    vol_est = cp.nanstd(cp.lib.stride_tricks.sliding_window_view(y_gpu, window), axis=1)
+                    vol_est = cp.where(cp.isnan(vol_est), cp.nanstd(y_gpu), vol_est)
                     
                     min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
-                    vol_est = np.maximum(vol_est.values, min_vol)
+                    vol_est = cp.maximum(vol_est, min_vol)
                     
-                    y_scaled = y_np / vol_est
+                    y_scaled = y_gpu / vol_est
                     vol_weights = 1.0 / vol_est
                     
                     scaling_info.update({
@@ -216,26 +218,77 @@ class FeatureSelection:
             except Exception as e:
                 self._critical_error("Failed to build CPU matrix for MI redundancy", error=str(e))
         n = len(cand_limited)
-        # Compute pairwise MI approx: MI(X_i, X_j) by treating one as target
-        for i in range(n):  # For each feature as target
-            if cand_limited[i] not in keep:  # Skip if already removed
-                continue
-            try:
-                y = X[:, i]  # Target feature
-                mi = mutual_info_regression(X, y, discrete_features=False)  # Compute MI with all features
-            except Exception as e:
-                self._critical_error("MI row failed", feature=cand_limited[i], error=str(e))
-                # unreachable
-            for j in range(i + 1, n):  # Compare with remaining features
-                f_i, f_j = cand_limited[i], cand_limited[j]
-                if f_i in keep and f_j in keep and mi[j] >= mi_threshold:  # If both features still exist and MI above threshold
-                    # Remove the one with lower dCor
-                    if dcor_scores.get(f_i, 0.0) >= dcor_scores.get(f_j, 0.0):
-                        keep.discard(f_j)  # Remove feature with lower dCor
-                        self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi[j]), 4))
-                    else:
-                        keep.discard(f_i)  # Remove feature with lower dCor
-                        self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
+        
+        # PARALLEL MI computation using batch processing
+        try:
+            # Process features in batches for better performance
+            batch_size = min(16, n)  # Process up to 16 features in parallel
+            self._log_info("MI redundancy parallel processing", total_features=n, batch_size=batch_size)
+            
+            # Compute MI for all features in parallel batches
+            for batch_start in range(0, n, batch_size):
+                batch_end = min(batch_start + batch_size, n)
+                batch_features = cand_limited[batch_start:batch_end]
+                
+                # Compute MI for all features in this batch
+                batch_mi_results = []
+                for i, feature in enumerate(batch_features):
+                    if feature not in keep:  # Skip if already removed
+                        batch_mi_results.append(None)
+                        continue
+                    try:
+                        y = X[:, batch_start + i]  # Target feature
+                        mi = mutual_info_regression(X, y, discrete_features=False)  # Compute MI with all features
+                        batch_mi_results.append(mi)
+                    except Exception as e:
+                        self._log_warn(f"MI computation failed for feature {feature}: {e}")
+                        batch_mi_results.append(None)
+                
+                # Process redundancy removal for this batch
+                for i, (feature, mi) in enumerate(zip(batch_features, batch_mi_results)):
+                    if mi is None or feature not in keep:
+                        continue
+                    
+                    # Compare with remaining features (including those in other batches)
+                    for j in range(batch_start + i + 1, n):
+                        f_i, f_j = feature, cand_limited[j]
+                        if f_i in keep and f_j in keep and mi[j] >= mi_threshold:
+                            # Remove the one with lower dCor
+                            if dcor_scores.get(f_i, 0.0) >= dcor_scores.get(f_j, 0.0):
+                                keep.discard(f_j)  # Remove feature with lower dCor
+                                self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi[j]), 4))
+                            else:
+                                keep.discard(f_i)  # Remove feature with lower dCor
+                                self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
+                
+                # Progress logging
+                if n > 0:
+                    progress = batch_end
+                    if progress % max(1, n // 10) == 0 or progress == n:
+                        self._log_info("MI redundancy progress", processed=progress, total=n)
+        
+        except Exception as e:
+            # Fallback to original sequential processing
+            self._log_warn(f"MI parallel processing failed, using sequential fallback: {e}")
+            for i in range(n):  # For each feature as target
+                if cand_limited[i] not in keep:  # Skip if already removed
+                    continue
+                try:
+                    y = X[:, i]  # Target feature
+                    mi = mutual_info_regression(X, y, discrete_features=False)  # Compute MI with all features
+                except Exception as e:
+                    self._critical_error("MI row failed", feature=cand_limited[i], error=str(e))
+                    # unreachable
+                for j in range(i + 1, n):  # Compare with remaining features
+                    f_i, f_j = cand_limited[i], cand_limited[j]
+                    if f_i in keep and f_j in keep and mi[j] >= mi_threshold:  # If both features still exist and MI above threshold
+                        # Remove the one with lower dCor
+                        if dcor_scores.get(f_i, 0.0) >= dcor_scores.get(f_j, 0.0):
+                            keep.discard(f_j)  # Remove feature with lower dCor
+                            self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi[j]), 4))
+                        else:
+                            keep.discard(f_i)  # Remove feature with lower dCor
+                            self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
         return list(keep)  # Return remaining features
 
     def _compute_mi_cluster_representatives_DISABLED(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
@@ -288,32 +341,83 @@ class FeatureSelection:
         if p < 2:
             return cand
 
-        # 2) Matriz MI por blocos (simetrizada)
+        # 2) Matriz MI por blocos (simetrizada) - PARALLEL PROCESSING
         chunk = max(8, int(self.mi_chunk_size))
         MI = np.zeros((p, p), dtype=np.float32)
         # progress bookkeeping
         nb = int(np.ceil(p / chunk))
         total_blocks = nb * nb
         done_blocks = 0
-        for i0 in range(0, p, chunk):
-            i1 = min(i0 + chunk, p)
-            Xi = X[:, i0:i1]
-            for j0 in range(0, p, chunk):
-                j1 = min(j0 + chunk, p)
-                Xj = X[:, j0:j1]
-                # compute MI for block pairs: MI(Xi_k, Xj_l)
+        
+        # Process blocks in parallel batches
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            import threading
+            
+            # Use thread pool for parallel MI computation
+            max_workers = min(4, nb)  # Limit to 4 workers to avoid memory issues
+            self._log_info("MI clustering parallel processing", total_blocks=total_blocks, max_workers=max_workers)
+            
+            def compute_mi_block(args):
+                i0, i1, j0, j1 = args
+                block_mi = np.zeros((i1 - i0, j1 - j0), dtype=np.float32)
                 for ii in range(i0, i1):
                     try:
                         y = X[:, ii]
                         mi_block = mutual_info_regression(X[:, j0:j1], y, discrete_features=False)
+                        block_mi[ii - i0, :] = mi_block.astype(np.float32)
                     except Exception as e:
-                        self._critical_error("MI block failed", i=int(ii), j0=int(j0), j1=int(j1), error=str(e))
-                        # unreachable
-                    MI[ii, j0:j1] = np.maximum(MI[ii, j0:j1], mi_block.astype(np.float32))
-                done_blocks += 1
-                # Log progress roughly every 10% of blocks
-                if total_blocks >= 10 and done_blocks % max(1, total_blocks // 10) == 0:
-                    self._log_info("MI blocks progress", done=done_blocks, total=total_blocks)
+                        self._log_warn(f"MI block failed for i={ii}, j0={j0}, j1={j1}: {e}")
+                        block_mi[ii - i0, :] = 0.0
+                return (i0, i1, j0, j1), block_mi
+            
+            # Prepare block arguments
+            block_args = []
+            for i0 in range(0, p, chunk):
+                i1 = min(i0 + chunk, p)
+                for j0 in range(0, p, chunk):
+                    j1 = min(j0 + chunk, p)
+                    block_args.append((i0, i1, j0, j1))
+            
+            # Process blocks in parallel
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_block = {executor.submit(compute_mi_block, args): args for args in block_args}
+                
+                for future in future_to_block:
+                    try:
+                        (i0, i1, j0, j1), block_mi = future.result()
+                        MI[i0:i1, j0:j1] = np.maximum(MI[i0:i1, j0:j1], block_mi)
+                        done_blocks += 1
+                        
+                        # Log progress roughly every 10% of blocks
+                        if total_blocks >= 10 and done_blocks % max(1, total_blocks // 10) == 0:
+                            self._log_info("MI blocks progress", done=done_blocks, total=total_blocks)
+                    except Exception as e:
+                        self._log_warn(f"MI block processing failed: {e}")
+                        done_blocks += 1
+            
+        except Exception as e:
+            # Fallback to original sequential processing
+            self._log_warn(f"MI parallel block processing failed, using sequential fallback: {e}")
+            for i0 in range(0, p, chunk):
+                i1 = min(i0 + chunk, p)
+                Xi = X[:, i0:i1]
+                for j0 in range(0, p, chunk):
+                    j1 = min(j0 + chunk, p)
+                    Xj = X[:, j0:j1]
+                    # compute MI for block pairs: MI(Xi_k, Xj_l)
+                    for ii in range(i0, i1):
+                        try:
+                            y = X[:, ii]
+                            mi_block = mutual_info_regression(X[:, j0:j1], y, discrete_features=False)
+                        except Exception as e:
+                            self._critical_error("MI block failed", i=int(ii), j0=int(j0), j1=int(j1), error=str(e))
+                            # unreachable
+                        MI[ii, j0:j1] = np.maximum(MI[ii, j0:j1], mi_block.astype(np.float32))
+                    done_blocks += 1
+                    # Log progress roughly every 10% of blocks
+                    if total_blocks >= 10 and done_blocks % max(1, total_blocks // 10) == 0:
+                        self._log_info("MI blocks progress", done=done_blocks, total=total_blocks)
         # Symmetrize by average
         MI = 0.5 * (MI + MI.T)
 
@@ -671,8 +775,14 @@ class FeatureSelection:
         task = str(getattr(self, 'stage3_task', 'auto')).lower()
         if task == 'auto':
             try:
-                y_vals = y_for_training.values if hasattr(y_for_training, 'values') else np.asarray(y_for_training)
-                uniq = np.unique(y_vals)
+                if hasattr(y_for_training, 'to_cupy'):
+                    import cupy as cp
+                    y_vals_gpu = y_for_training.to_cupy()
+                    uniq_gpu = cp.unique(y_vals_gpu)
+                    uniq = cp.asnumpy(uniq_gpu)
+                else:
+                    y_vals_cpu = np.asarray(y_for_training)
+                    uniq = np.unique(y_vals_cpu)
                 max_classes = int(getattr(self, 'stage3_classification_max_classes', 10))
                 task = 'classification' if (len(uniq) <= max(2, max_classes) and np.allclose(uniq, np.round(uniq))) else 'regression'
             except Exception:
@@ -684,75 +794,112 @@ class FeatureSelection:
             self._critical_error('No valid candidate features present in DataFrame')
             # unreachable
 
-        # Build a clean pandas DataFrame and numpy arrays; drop NaN/Inf jointly
+        # Build GPU-resident matrices; clean rows/columns without leaving device
         try:
             import cudf as _cudf
-            Xp_all = X_df[present].to_pandas() if isinstance(X_df, _cudf.DataFrame) else X_df[present].copy()
-            yp = y_series.to_pandas() if hasattr(y_series, 'to_pandas') else y_series
-            # Keep only numeric columns
-            import pandas as _pd
-            num_cols = [c for c in Xp_all.columns if _pd.api.types.is_numeric_dtype(Xp_all[c])]
-            dropped_non_numeric = [c for c in Xp_all.columns if c not in num_cols]
-            if dropped_non_numeric:
-                self._log_warn('Dropping non-numeric features for CatBoost', dropped=len(dropped_non_numeric), examples=dropped_non_numeric[:10])
-            Xp = Xp_all[num_cols]
-            # Append target and clean
-            data = Xp.copy()
-            data['__y__'] = yp
-            data.replace([np.inf, -np.inf], np.nan, inplace=True)
-            data = data.dropna()
-            # Drop constant columns (zero variance)
-            try:
-                nunq = data.drop(columns=['__y__']).nunique()
-                const_cols = nunq[nunq <= 1].index.tolist()
-                if const_cols:
-                    data = data.drop(columns=const_cols, errors='ignore')
-                    self._log_warn('Dropping constant-variance features for CatBoost', dropped=len(const_cols), examples=const_cols[:10])
-            except Exception:
-                pass
-            # Final safety: ensure we still have features
-            if data.shape[1] <= 1:  # only __y__ remains
-                self._critical_error('No usable numeric features after cleaning for CatBoost')
-                # unreachable
-            y = data.pop('__y__').to_numpy(dtype=np.float32, copy=False)
-            X = data.to_numpy(dtype=np.float32, copy=False)
-            # Update candidates list to the used order
-            candidates = list(data.columns)
+            import cupy as cp
+            from cudf.api.types import is_numeric_dtype as _is_numeric_dtype
         except Exception as e:
-            self._critical_error('Failed to materialize training arrays for CatBoost', error=str(e))
+            self._critical_error('GPU dependencies missing for CatBoost selection', error=str(e))
             return candidates, {f: 1.0 for f in candidates}, backend_used, 0.0, {'error': str(e)}
 
-        # Optional downsampling
+        X_local = X_df[present] if isinstance(X_df, _cudf.DataFrame) else _cudf.DataFrame.from_pandas(X_df[present])
+        if isinstance(y_for_training, _cudf.Series):
+            y_local = y_for_training
+        elif hasattr(y_for_training, 'to_pandas'):
+            y_local = _cudf.Series(y_for_training.to_pandas())
+        else:
+            y_local = _cudf.Series(y_for_training)
+
+        X_local = X_local.reset_index(drop=True)
+        y_local = y_local.reset_index(drop=True)
+
+        numeric_cols = [c for c in present if _is_numeric_dtype(X_local[c].dtype)]
+        dropped_non_numeric = [c for c in present if c not in numeric_cols]
+        if dropped_non_numeric:
+            self._log_warn('Dropping non-numeric features for CatBoost (GPU path)',
+                           dropped=len(dropped_non_numeric),
+                           examples=dropped_non_numeric[:10])
+
+        X_numeric = X_local[numeric_cols].astype('float32') if numeric_cols else _cudf.DataFrame()
+        y_numeric = y_local.astype('float32')
+
+        if X_numeric.empty:
+            self._critical_error('No numeric features available for CatBoost after GPU filtering')
+
+        X_gpu = X_numeric.to_cupy()
+        y_gpu = y_numeric.to_cupy()
+
+        valid_rows = cp.isfinite(X_gpu).all(axis=1) & cp.isfinite(y_gpu)
+        if not bool(cp.all(valid_rows)):
+            valid_count = int(cp.sum(valid_rows).item())
+            removed_rows = int(X_gpu.shape[0]) - valid_count
+            self._log_warn('Removing rows with NaN/Inf for CatBoost', removed_rows=removed_rows)
+            X_gpu = X_gpu[valid_rows]
+            y_gpu = y_gpu[valid_rows]
+
+        if X_gpu.shape[0] < 100:
+            self._critical_error('Insufficient data after GPU cleaning for CatBoost', samples=int(X_gpu.shape[0]))
+
+        col_std = cp.nanstd(X_gpu, axis=0)
+        keep_mask = cp.isfinite(col_std) & (col_std > 1e-8)
+        if not bool(cp.any(keep_mask)):
+            self._critical_error('No usable numeric features after GPU cleaning for CatBoost')
+
+        keep_mask_host = keep_mask.get()
+        kept_features = [col for col, keep in zip(numeric_cols, keep_mask_host) if keep]
+        if len(kept_features) != len(numeric_cols):
+            dropped_const = [col for col, keep in zip(numeric_cols, keep_mask_host) if not keep]
+            self._log_warn('Dropping constant-variance features for CatBoost',
+                           dropped=len(dropped_const),
+                           examples=dropped_const[:10])
+
+        X_gpu = X_gpu[:, keep_mask]
+        feature_names = kept_features
+
+        # Optional GPU-side downsampling before transferring to host memory
         use_full = bool(getattr(self, 'stage3_catboost_use_full_dataset', False))
-        if not use_full and X.shape[0] > int(getattr(self, 'selection_max_rows', 100000)):
-            max_rows = int(getattr(self, 'selection_max_rows', 100000))
+        max_rows_cfg = int(getattr(self, 'selection_max_rows', 100000))
+        if not use_full and X_gpu.shape[0] > max_rows_cfg:
             if task == 'classification' and bool(getattr(self, 'stage3_stratified_sampling', True)):
                 try:
-                    classes, counts = np.unique(y, return_counts=True)
-                    quotas = {c: max(1, int(round(max_rows * cnt / float(len(y))))) for c, cnt in zip(classes, counts)}
+                    classes, counts = cp.unique(y_gpu, return_counts=True)
+                    total_rows = float(y_gpu.shape[0])
                     idx_parts = []
-                    for c in classes:
-                        cls_idx = np.nonzero(y == c)[0]
-                        k = min(len(cls_idx), quotas[c])
-                        if k > 0:
-                            sel = np.linspace(0, len(cls_idx) - 1, k, dtype=int)
+                    for cls_val, cls_count in zip(classes.tolist(), counts.tolist()):
+                        quota = max(1, int(round(max_rows_cfg * (cls_count / total_rows))))
+                        cls_idx = cp.where(y_gpu == cls_val)[0]
+                        take = min(int(cls_idx.shape[0]), quota)
+                        if take > 0:
+                            sel = cp.linspace(0, cls_idx.shape[0] - 1, take, dtype=cp.int32)
                             idx_parts.append(cls_idx[sel])
                     if idx_parts:
-                        idx = np.sort(np.concatenate(idx_parts))
-                        if idx.shape[0] > max_rows:
-                            idx = idx[:max_rows]
-                        self._log_info('Stratified sampling applied', original_rows=X.shape[0], sampled_rows=int(idx.shape[0]))
-                        X, y = X[idx], y[idx]
+                        idx = cp.sort(cp.concatenate(idx_parts))
+                        if idx.shape[0] > max_rows_cfg:
+                            idx = idx[:max_rows_cfg]
+                        self._log_info('Stratified sampling applied (GPU)',
+                                       original_rows=int(y_gpu.shape[0]),
+                                       sampled_rows=int(idx.shape[0]))
+                        X_gpu = X_gpu[idx]
+                        y_gpu = y_gpu[idx]
                     else:
-                        ids = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
-                        X, y = X[ids], y[ids]
+                        ids = cp.linspace(0, X_gpu.shape[0] - 1, max_rows_cfg, dtype=cp.int32)
+                        X_gpu = X_gpu[ids]
+                        y_gpu = y_gpu[ids]
                 except Exception as se:
-                    self._log_warn('Stratified sampling failed; using systematic', error=str(se))
-                    ids = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
-                    X, y = X[ids], y[ids]
+                    self._log_warn('Stratified sampling failed on GPU; using systematic', error=str(se))
+                    ids = cp.linspace(0, X_gpu.shape[0] - 1, max_rows_cfg, dtype=cp.int32)
+                    X_gpu = X_gpu[ids]
+                    y_gpu = y_gpu[ids]
             else:
-                ids = np.linspace(0, X.shape[0] - 1, max_rows, dtype=int)
-                X, y = X[ids], y[ids]
+                ids = cp.linspace(0, X_gpu.shape[0] - 1, max_rows_cfg, dtype=cp.int32)
+                X_gpu = X_gpu[ids]
+                y_gpu = y_gpu[ids]
+
+        # Transfer cleaned data to host for CatBoost (mandatory CPU step)
+        X = cp.asnumpy(X_gpu)
+        y = cp.asnumpy(y_gpu)
+        candidates = feature_names
 
         # Model params
         iterations = int(getattr(self, 'stage3_catboost_iterations', 200))

@@ -5,7 +5,7 @@ This package contains modular components for statistical testing and feature sel
 """
 
 from .controller import StatisticalTests
-from .adf_tests import ADFTests
+# ADF tests removed from project
 from .distance_correlation import DistanceCorrelation
 from .feature_selection import FeatureSelection
 from .statistical_analysis import StatisticalAnalysis
@@ -19,7 +19,6 @@ from .utils import (
 
 __all__ = [
     'StatisticalTests',
-    'ADFTests', 
     'DistanceCorrelation',
     'FeatureSelection',
     'StatisticalAnalysis',

@@ -18,7 +18,7 @@ import json
 import re
 
 from features.base_engine import BaseFeatureEngine
-from .adf_tests import ADFTests
+# ADF tests removed from project
 from .distance_correlation import DistanceCorrelation
 from .feature_selection import FeatureSelection
 from .statistical_analysis import StatisticalAnalysis
@@ -48,7 +48,6 @@ class StatisticalTests(BaseFeatureEngine):
         self.settings = settings
         
         # Initialize component modules
-        self.adf_tests = ADFTests(logger)
         self.distance_correlation = DistanceCorrelation(logger)
         self.feature_selection = FeatureSelection(logger)
         self.statistical_analysis = StatisticalAnalysis(logger)
@@ -229,6 +228,10 @@ class StatisticalTests(BaseFeatureEngine):
             self.mi_threshold = 0.3
             self.stage3_top_n = 50
             
+            # Protection lists (always keep) - fallback defaults
+            self.always_keep_features = []
+            self.always_keep_prefixes = []
+            
             # Rolling dCor defaults when unified config missing
             self.stage1_rolling_enabled = False
             self.stage1_rolling_window = 2000
@@ -387,7 +390,16 @@ class StatisticalTests(BaseFeatureEngine):
         except Exception as e:
             self._log_warn("sample_head_across_partitions failed; falling back to head", error=str(e))
             try:
-                out = df.head(int(n))
+                # Check dataset size first to avoid Dask warning
+                try:
+                    dataset_size = len(df)
+                    actual_n = min(int(n), dataset_size)
+                    if actual_n < int(n):
+                        self._log_info(f"Dataset has {dataset_size} rows, limiting head() to {actual_n} rows")
+                except Exception:
+                    actual_n = int(n)
+                
+                out = df.head(actual_n)
                 # Ensure cuDF
                 if not isinstance(out, cudf.DataFrame):
                     out = cudf.from_pandas(out)
@@ -395,7 +407,15 @@ class StatisticalTests(BaseFeatureEngine):
             except Exception:
                 try:
                     # Last resort: first partition only
-                    out = df.get_partition(0).head(int(n)).compute()
+                    try:
+                        dataset_size = len(df)
+                        actual_n = min(int(n), dataset_size)
+                        if actual_n < int(n):
+                            self._log_info(f"Dataset has {dataset_size} rows, limiting partition head() to {actual_n} rows")
+                    except Exception:
+                        actual_n = int(n)
+                    
+                    out = df.get_partition(0).head(actual_n).compute()
                     if not isinstance(out, cudf.DataFrame):
                         out = cudf.from_pandas(out)
                     return out
@@ -445,7 +465,16 @@ class StatisticalTests(BaseFeatureEngine):
         except Exception as e:
             self._log_warn("sample_tail_across_partitions failed; falling back to tail of first partition", error=str(e))
             try:
-                out = df.get_partition(max(0, nparts - 1)).tail(int(n)).compute()
+                # Check dataset size first to avoid Dask warning
+                try:
+                    dataset_size = len(df)
+                    actual_n = min(int(n), dataset_size)
+                    if actual_n < int(n):
+                        self._log_info(f"Dataset has {dataset_size} rows, limiting tail() to {actual_n} rows")
+                except Exception:
+                    actual_n = int(n)
+                
+                out = df.get_partition(max(0, nparts - 1)).tail(actual_n).compute()
                 if not isinstance(out, cudf.DataFrame):
                     out = cudf.from_pandas(out)
                 return out
@@ -485,16 +514,7 @@ class StatisticalTests(BaseFeatureEngine):
                           cols=len(df.columns),
                           memory_usage_mb=df.memory_usage(deep=True).sum() / 1024**2)
             
-            # 1. ADF TESTS IN BATCH
-            self._set_stage('adf')
-            self._log_info(f"🔍 Starting ADF (Augmented Dickey-Fuller) stationarity tests{currency_info}...")
-            cols_before = len(df.columns)
-            df = self.adf_tests._apply_comprehensive_adf_tests(df)
-            cols_after = len(df.columns)
-            self._log_info("✅ ADF tests completed", 
-                          currency_pair=currency_pair,
-                          features_added=cols_after - cols_before,
-                          total_features=cols_after)
+            # ADF tests removed from project
             
             # JB removed: no rolling JB features
             
@@ -616,13 +636,7 @@ class StatisticalTests(BaseFeatureEngine):
             except Exception as e:
                 self._log_warn("[MT] Persist comparison failed", error=str(e))
 
-    # --- ADF Stage ---
-        from .stage_adf import run as run_adf
-        self._set_stage('adf')
-        self._log_info("Stage start: ADF rolling on frac_diff*")
-        df = run_adf(self, df, window=252, min_periods=200)
-        df = self._persist_and_wait(df, stage="adf", timeout_s=600)
-        self._log_info("Stage end: ADF")
+    # ADF stage removed from project
 
     # JB removed: no rolling JB features
 
@@ -697,7 +711,7 @@ class StatisticalTests(BaseFeatureEngine):
             
             for col in all_columns:
                 # Skip target columns and metrics
-                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_'))):
+                if (col.startswith(('y_ret_fwd_', 'dcor_', 'stage1_', 'cpcv_'))):
                     target_skipped.append(col)
                     continue
                 
@@ -711,8 +725,12 @@ class StatisticalTests(BaseFeatureEngine):
                     prefix_skipped.append(col)
                     continue
                 
-                # Include frac_diff columns and other relevant features, but only numeric types
-                if ('frac_diff' in col or col.startswith(('y_', 'x_')) or any(col.startswith(prefix) for prefix in self.feature_allow_prefixes)):
+                # Include frac_diff columns, always_keep_features, always_keep_prefixes, and other relevant features, but only numeric types
+                if ('frac_diff' in col or 
+                    col.startswith(('y_', 'x_')) or 
+                    col in self.always_keep_features or
+                    any(col.startswith(prefix) for prefix in self.feature_allow_prefixes) or
+                    any(col.startswith(prefix) for prefix in self.always_keep_prefixes)):
                     dt = dtype_map.get(col, '')
                     if _is_numeric_dt(dt):
                         candidates.append(col)
@@ -969,7 +987,7 @@ class StatisticalTests(BaseFeatureEngine):
             # Check if any forbidden features are in candidates (this should not happen)
             forbidden_in_candidates = []
             for col in candidates:
-                if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')) or 
+                if (col.startswith(('y_ret_fwd_', 'dcor_', 'stage1_', 'cpcv_')) or 
                     col in self.feature_denylist or
                     any(col.startswith(prefix) for prefix in self.feature_deny_prefixes)):
                     forbidden_in_candidates.append(col)
@@ -1085,7 +1103,7 @@ class StatisticalTests(BaseFeatureEngine):
                     # Double-check: ensure we're not reintroducing forbidden features
                     forbidden_in_last_resort = []
                     for col in valid_candidates:
-                        if (col.startswith(('y_ret_fwd_', 'dcor_', 'adf_', 'stage1_', 'cpcv_')) or 
+                        if (col.startswith(('y_ret_fwd_', 'dcor_', 'stage1_', 'cpcv_')) or 
                             col in self.feature_denylist or
                             any(col.startswith(prefix) for prefix in self.feature_deny_prefixes)):
                             forbidden_in_last_resort.append(col)
