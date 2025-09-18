@@ -29,6 +29,7 @@ from features.signal_processing import apply_emd_to_series
 from features.base_engine import CriticalPipelineError
 from utils.logging_utils import get_logger, set_currency_pair_context
 from features.engine_metrics import EngineMetrics
+from data_io.r2_uploader import R2Uploader
 
 logger = get_logger(__name__, "orchestration.processor")
 
@@ -103,6 +104,15 @@ class DataProcessor:
 
             # Nota: Seleção final de features (CatBoost) ocorre dentro do engine statistical_tests
             # após dCor → VIF → MI (Stage 3 embutido). Nenhuma execução duplicada aqui.
+
+            # Export selected-feature parquet and upload to R2 (best-effort, does not fail task)
+            try:
+                sel_path = self._export_selected_features_parquet_cudf(gdf, currency_pair)
+                if sel_path:
+                    uploaded = self._upload_selected_features_to_r2(sel_path, currency_pair)
+                    logger.info(f"Selected-feature parquet upload: {'OK' if uploaded else 'SKIPPED/FAILED'}")
+            except Exception as _e:
+                logger.warning(f"Could not export/upload selected-feature parquet for {currency_pair}: {_e}")
             
             # Save processed data
             if not self._save_processed_data(gdf, currency_pair):  # Salva dados processados
@@ -145,15 +155,7 @@ class DataProcessor:
                 logger.info(f"Loaded parquet data: {len(gdf)} rows, {len(gdf.columns)} columns")
                 return gdf
             
-            # Optional fallback: Feather (sync) if exists
-            try:
-                gdf = self.loader.load_currency_pair_data_feather_sync(r2_path)
-                if gdf is not None:
-                    gdf = self._drop_denied_columns(gdf)
-                    logger.info(f"Loaded feather data: {len(gdf)} rows, {len(gdf.columns)} columns")
-                    return gdf
-            except Exception:
-                pass
+            # No fallback to Feather - only Parquet is supported
             
             logger.error(f"Failed to load data from {r2_path}")
             return None
@@ -881,28 +883,17 @@ def _noop_ctx():
             import pathlib
             out_dir = pathlib.Path(self.settings.output.output_path) / currency_pair / 'checkpoint'
             out_dir.mkdir(parents=True, exist_ok=True)
-            # File name per engine
-            fname = f"{engine_name}." + ('parquet' if str(getattr(self.settings.output, 'intermediate_format', 'parquet')).lower() == 'parquet' else 'feather')
+            # File name per engine - always use parquet
+            fname = f"{engine_name}.parquet"
 
-            # Save
-            fmt = str(getattr(self.settings.output, 'intermediate_format', 'parquet')).lower()
-            if fmt == 'feather':
-                import pyarrow.feather as feather
-                table = gdf.to_arrow()
-                feather.write_feather(
-                    table,
-                    str(out_dir / fname),
-                    compression=str(getattr(self.settings.output, 'intermediate_compression', 'zstd')),
-                    version=int(getattr(self.settings.output, 'intermediate_version', 2)),
-                )
-            else:
-                import pyarrow.parquet as pq
-                table = gdf.to_arrow()
-                pq.write_table(
-                    table,
-                    str(out_dir / fname),
-                    compression=str(getattr(self.settings.output, 'intermediate_compression', 'zstd')),
-                )
+            # Save as Parquet
+            import pyarrow.parquet as pq
+            table = gdf.to_arrow()
+            pq.write_table(
+                table,
+                str(out_dir / fname),
+                compression=str(getattr(self.settings.output, 'intermediate_compression', 'zstd')),
+            )
             logger.info(f"Saved intermediate checkpoint: {out_dir / fname}")
         except Exception as e:
             logger.warning(f"Could not save intermediate checkpoint for {engine_name}: {e}")
@@ -1150,15 +1141,8 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             ddf = None
             try:
                 with dask.annotate(task_key_name=f"load-{currency_pair}"):
-                    if r2_lower.endswith('.parquet'):
-                        ddf = self.loader.load_currency_pair_data(r2_path, client)
-                    elif r2_lower.endswith('.feather'):
-                        ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
-                    else:
-                        # Attempt feather (dir or file), then parquet
-                        ddf = self.loader.load_currency_pair_data_feather(r2_path, client)
-                        if ddf is None:
-                            ddf = self.loader.load_currency_pair_data(r2_path, client)
+                    # Only support Parquet format
+                    ddf = self.loader.load_currency_pair_data(r2_path, client)
             except Exception as _e:
                 logger.warning(f"Primary load path failed: {_e}; trying fallbacks")
                 if ddf is None:
@@ -1365,6 +1349,25 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                             pass
                     return False
 
+            # Export selected-feature parquet and upload to R2 (Dask path, best-effort)
+            try:
+                # Debug: Check method availability
+                methods = [m for m in dir(self) if 'export_selected_features' in m]
+                logger.info(f"Available export methods: {methods}")
+                
+                if hasattr(self, '_export_selected_features_parquet_dask'):
+                    logger.info(f"Method _export_selected_features_parquet_dask found, executing...")
+                    sel_path = self._export_selected_features_parquet_dask(ddf, currency_pair)
+                    if sel_path:
+                        uploaded = self._upload_selected_features_to_r2(sel_path, currency_pair)
+                        logger.info(f"Selected-feature parquet upload (Dask): {'OK' if uploaded else 'SKIPPED/FAILED'}")
+                else:
+                    logger.warning(f"Method _export_selected_features_parquet_dask not found on DataProcessor instance")
+                    logger.info(f"DataProcessor type: {type(self)}")
+                    logger.info(f"DataProcessor class: {self.__class__}")
+            except Exception as _e:
+                logger.warning(f"Could not export/upload selected-feature parquet (Dask) for {currency_pair}: {_e}")
+
             # Save directly from Dask without materializing everything on one GPU
             # Nota: Seleção final com CatBoost é parte do statistical_tests; não duplicar no caminho Dask.
 
@@ -1469,16 +1472,14 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             # Log I/O start
             logger.info(f"Starting save operation for {currency_pair}: {len(gdf.columns)} columns, {len(gdf)} rows")
             
-            logger.info(f"Saving processed data with {len(gdf.columns)} columns to Feather v2 files for {currency_pair}")
+            logger.info(f"Saving processed data with {len(gdf.columns)} columns to Parquet files for {currency_pair}")
             
             # Get the output path from settings
             output_path = self.settings.output.output_path
-            compression = "lz4"  # Fast compression for Feather v2
             
             # Create output directory structure
             import pathlib
             import gc
-            import pyarrow.feather as feather
             
             output_dir = pathlib.Path(output_path) / currency_pair
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1499,28 +1500,23 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             logger.info(f"Columns: {list(gdf.columns)}")
             logger.info(f"Data types: {gdf.dtypes.to_dict()}")
             
-            # Save using Feather v2 directly (cuDF DataFrame)
-            logger.info(f"Saving to: {output_dir} using Feather v2 (Arrow IPC)")
+            # Save using Parquet directly (cuDF DataFrame)
+            logger.info(f"Saving to: {output_dir} using Parquet format")
             
-            # Convert cuDF DataFrame to Arrow and save
+            # Save as Parquet
             try:
-                # Convert to Arrow (CPU)
-                table = gdf.to_arrow()
+                # Save as Parquet using cuDF
+                consolidated_path = output_dir / f"{currency_pair}.parquet"
                 
-                # Save as Feather v2
-                consolidated_path = output_dir / f"{currency_pair}.feather"
-                
-                feather.write_feather(
-                    table,
+                gdf.to_parquet(
                     str(consolidated_path),
-                    compression=compression,
-                    version=2  # Ensure Feather v2
+                    compression='snappy',
+                    index=False
                 )
                 
                 logger.info(f"Saved consolidated file: {consolidated_path} ({len(gdf)} rows)")
                 
                 # Clean up GPU memory
-                del table
                 gc.collect()
                 
             except Exception as save_error:
@@ -1528,7 +1524,7 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                 raise
             
             # Verify the saved data
-            saved_files = list(output_dir.glob("*.feather"))
+            saved_files = list(output_dir.glob("*.parquet"))
             total_size_mb = sum(f.stat().st_size for f in saved_files) / (1024 * 1024)
             
             # Log I/O completion
@@ -1537,7 +1533,7 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             logger.info(f"Successfully saved processed data for {currency_pair}")
             logger.info(f"Files created: {len(saved_files)}")
             logger.info(f"Total size: {total_size_mb:.2f} MB")
-            
+
             return True
             
         except Exception as save_error:
@@ -1546,19 +1542,176 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
 
     # Removido: persistência separada de selected_features.json (seleção centralizada no statistical_tests)
 
+    # ---------------- Selected features export (CatBoost) ----------------
+    def _get_selected_features(self) -> list:
+        """Retrieve the final feature list selected by Stage 3 (CatBoost)."""
+        try:
+            feats = getattr(self.stats, '_last_embedded_selected', None)
+            if feats:
+                return list(feats)
+        except Exception:
+            pass
+        try:
+            # Fallback: infer from importances map if available
+            imps = getattr(self.stats, '_last_importances', None) or {}
+            if imps:
+                # Keep all keys as 'selected'
+                return list(imps.keys())
+        except Exception:
+            pass
+        return []
+
+    def _export_selected_features_parquet_cudf(self, gdf: cudf.DataFrame, currency_pair: str) -> str:
+        """Create a single parquet with timestamp + CatBoost-selected features and return local path.
+
+        Returns empty string if nothing was written.
+        """
+        try:
+            selected = self._get_selected_features()
+            if not selected:
+                logger.warning(f"No CatBoost-selected features found for {currency_pair}; skipping model parquet export")
+                return ""
+            # Ensure timestamp + target + selected features (only those that exist)
+            cols = []
+            time_col = 'timestamp'
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_15m')
+            
+            if time_col in gdf.columns:
+                cols.append(time_col)
+            if target_col in gdf.columns:
+                cols.append(target_col)
+            
+            missing = []
+            for c in selected:
+                if c in gdf.columns and c not in cols:
+                    cols.append(c)
+                else:
+                    if c not in gdf.columns:
+                        missing.append(c)
+            if missing:
+                logger.info(f"Some selected features missing in frame (ignored): {missing[:10]}{'...' if len(missing)>10 else ''}")
+            
+            logger.info(f"Exporting {len(cols)} columns for {currency_pair}: timestamp + target ({target_col}) + {len(selected)} selected features")
+            if len(cols) <= 2:  # Need at least timestamp + target + some features
+                logger.warning(f"No valid selected features to export for {currency_pair} (only {len(cols)} columns)")
+                return ""
+
+            # Arrange output path: place at output root for easy pickup
+            import os
+            import pyarrow.parquet as pq
+            out_root = self.settings.output.output_path
+            os.makedirs(out_root, exist_ok=True)
+            out_file = os.path.join(out_root, f"{currency_pair}_feature_model.parquet")
+
+            # Convert to Arrow Table and write single parquet
+            try:
+                table = gdf[cols].to_arrow()
+            except Exception:
+                # Fallback via pandas
+                table = gdf[cols].to_pandas().to_arrow()
+            pq.write_table(table, out_file, compression='snappy')
+            logger.info(f"Exported CatBoost-selected features parquet: {out_file}")
+            return out_file
+        except Exception as e:
+            logger.error(f"Failed to export selected features parquet for {currency_pair}: {e}")
+            return ""
+
+    def _export_selected_features_parquet_dask(self, ddf, currency_pair: str) -> str:
+        """Create a single parquet with timestamp + selected features from Dask-cuDF DataFrame.
+
+        Streams partitions to a single file to avoid collecting the full dataset.
+        Returns empty string if nothing was written.
+        """
+        try:
+            selected = self._get_selected_features()
+            if not selected:
+                logger.warning(f"No CatBoost-selected features found for {currency_pair}; skipping model parquet export (Dask)")
+                return ""
+            cols = []
+            time_col = 'timestamp'
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_15m')
+            cols_exist = set(list(ddf.columns))
+            
+            if time_col in cols_exist:
+                cols.append(time_col)
+            if target_col in cols_exist:
+                cols.append(target_col)
+            
+            kept = 0
+            for c in selected:
+                if c in cols_exist and c not in cols:
+                    cols.append(c)
+                    kept += 1
+            logger.info(f"Exporting {len(cols)} columns for {currency_pair} (Dask): timestamp + target ({target_col}) + {kept} selected features")
+            
+            if kept == 0 and len(cols) <= 2:  # Need at least timestamp + target + some features
+                logger.warning(f"No valid selected features present in Dask frame for {currency_pair} (only {len(cols)} columns)")
+                return ""
+
+            import os
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            from dask import delayed
+
+            out_root = self.settings.output.output_path
+            os.makedirs(out_root, exist_ok=True)
+            out_file = os.path.join(out_root, f"{currency_pair}_feature_model.parquet")
+
+            # Materialize partitions one-by-one on driver and append to a single parquet
+            parts = ddf[cols].to_delayed()
+            if not parts:
+                logger.warning(f"No partitions to export for {currency_pair}")
+                return ""
+
+            # Compute first partition to establish schema
+            first = parts[0].compute()
+            try:
+                first_table = first.to_arrow()
+            except Exception:
+                first_table = pa.Table.from_pandas(first.to_pandas())
+            writer = pq.ParquetWriter(out_file, first_table.schema, compression='snappy')
+            try:
+                writer.write_table(first_table)
+                # Remaining partitions
+                for p in parts[1:]:
+                    part = p.compute()
+                    try:
+                        tbl = part.to_arrow()
+                    except Exception:
+                        tbl = pa.Table.from_pandas(part.to_pandas())
+                    writer.write_table(tbl)
+            finally:
+                writer.close()
+
+            logger.info(f"Exported CatBoost-selected features parquet (Dask): {out_file}")
+            return out_file
+        except Exception as e:
+            logger.error(f"Failed Dask export of selected features for {currency_pair}: {e}")
+            return ""
+
+    def _upload_selected_features_to_r2(self, local_file: str, currency_pair: str) -> bool:
+        """Upload the local parquet file to R2 under bucket root as symbol_feature_model.parquet."""
+        try:
+            if not local_file:
+                return False
+            uploader = R2Uploader()
+            remote_key = f"{currency_pair}_feature_model.parquet"
+            return uploader.upload_file(local_file, remote_key, content_type="application/octet-stream")
+        except Exception as e:
+            logger.error(f"Failed to upload selected features for {currency_pair} to R2: {e}")
+            return False
+
     def _save_processed_data_dask(self, ddf, currency_pair: str) -> bool:
-        """Save the processed Dask-cuDF DataFrame as partitioned Feather files.
+        """Save the processed Dask-cuDF DataFrame as partitioned Parquet files.
 
         Avoids collecting the entire dataset into a single GPU/host memory.
-        Compatible with our loader, which can read directories with part-*.feather.
+        Compatible with our loader, which can read directories with part-*.parquet.
         """
         try:
             from dask import delayed, compute
             import pathlib, os
-            import pyarrow.feather as feather
 
             output_path = self.settings.output.output_path
-            compression = "lz4"
             output_dir = pathlib.Path(output_path) / currency_pair
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1576,27 +1729,26 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             # Build delayed write tasks, one per partition
             parts = ddf.to_delayed()
 
-            def _write_part(pdf, out_dir: str, idx: int, comp: str, cols: list):
+            def _write_part(pdf, out_dir: str, idx: int, cols: list):
                 # pdf is a cuDF DataFrame (computed partition)
                 try:
                     # Ensure column order is consistent
                     if cols:
                         exist = [c for c in cols if c in pdf.columns]
                         pdf = pdf[exist]
-                    table = pdf.to_arrow()
-                    fname = os.path.join(out_dir, f"part-{idx:05d}.feather")
-                    feather.write_feather(table, fname, compression=comp, version=2)
+                    fname = os.path.join(out_dir, f"part-{idx:05d}.parquet")
+                    pdf.to_parquet(fname, compression='snappy', index=False)
                     return fname
                 except Exception as e:
                     raise e
 
             cols_order = list(ddf.columns)
             tasks = [
-                delayed(_write_part)(part, str(output_dir), i, compression, cols_order)
+                delayed(_write_part)(part, str(output_dir), i, cols_order)
                 for i, part in enumerate(parts)
             ]
             written = compute(*tasks)
-            logger.info(f"Saved {len(written)} feather parts to {output_dir}")
+            logger.info(f"Saved {len(written)} parquet parts to {output_dir}")
             return True
         except Exception as e:
             logger.error(f"Failed to save Dask data for {currency_pair}: {e}", exc_info=True)

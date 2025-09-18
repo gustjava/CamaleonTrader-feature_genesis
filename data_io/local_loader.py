@@ -397,121 +397,9 @@ class LocalDataLoader:
             self._log_warn(f"Error estimating rows, using default: {e}")
             return 100000  # Default estimate
 
-    def load_currency_pair_data_feather(
-        self,
-        currency_pair_path: str,
-        client: Client
-    ) -> Optional[dask_cudf.DataFrame]:
-        """
-        Load currency pair data from Feather v2 files to GPU memory.
+    # Feather loading methods removed - only Parquet is supported
 
-        Args:
-            currency_pair_path: The relative path to the currency pair data,
-                                which will be joined with the local data root.
-            client: Dask client for distributed loading.
-
-        Returns:
-            Optional[dask_cudf.DataFrame]: Loaded data as dask_cudf DataFrame, None if failed.
-        """
-        try:
-            local_path = self._get_local_path(currency_pair_path)
-            logger.info(f"Attempting to load Feather v2 data from local path: {local_path}")
-
-            if not local_path.exists():
-                logger.warning(f"Local data path does not exist: {local_path}")
-                return None
-
-            # Case 1: direct feather file
-            if local_path.is_file() and local_path.suffix.lower() == ".feather":
-                logger.info(f"Loading single Feather v2 file: {local_path}")
-                df = dask_cudf.read_feather(local_path)
-            # Case 2: directory containing feather parts or consolidated file
-            elif local_path.is_dir():
-                feather_files = list(local_path.glob("*.feather"))
-                if not feather_files:
-                    logger.warning(f"No Feather v2 files found in: {local_path}")
-                    return None
-                consolidated_file = local_path / f"{local_path.name}.feather"
-                if consolidated_file.exists():
-                    logger.info(f"Loading consolidated Feather v2 file: {consolidated_file}")
-                    df = dask_cudf.read_feather(consolidated_file)
-                else:
-                    logger.info(f"Loading {len(feather_files)} partitioned Feather v2 files from directory")
-                    df = dask_cudf.read_feather(local_path)
-            else:
-                logger.warning(f"Unsupported Feather path type: {local_path}")
-                return None
-
-            # Do not persist here; keep lazy to allow column pruning later
-
-            num_partitions = df.npartitions
-            logger.info(f"Successfully loaded Feather v2 data from {local_path} with {num_partitions} partitions")
-
-            sample_df = df.head()
-            logger.info(f"Data schema: {len(sample_df.columns)} columns")
-            logger.info(f"Data types: {sample_df.dtypes.to_dict()}")
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Failed to load Feather v2 data from {currency_pair_path}: {e}", exc_info=True)
-            return None
-
-    def load_currency_pair_data_feather_sync(
-        self,
-        currency_pair_path: str
-    ) -> Optional[cudf.DataFrame]:
-        """
-        Load currency pair data from Feather v2 files synchronously (single GPU).
-
-        Args:
-            currency_pair_path: The relative path to the currency pair data.
-
-        Returns:
-            Optional[cudf.DataFrame]: Loaded data as cudf DataFrame, None if failed.
-        """
-        try:
-            local_path = self._get_local_path(currency_pair_path)
-            logger.info(f"Loading Feather v2 data synchronously from: {local_path}")
-
-            if not local_path.exists():
-                logger.warning(f"Local data path does not exist: {local_path}")
-                return None
-
-            # Case 1: direct feather file
-            if local_path.is_file() and local_path.suffix.lower() == ".feather":
-                df = cudf.read_feather(local_path)
-            # Case 2: directory with consolidated or parts
-            elif local_path.is_dir():
-                feather_files = list(local_path.glob("*.feather"))
-                if not feather_files:
-                    logger.warning(f"No Feather v2 files found in: {local_path}")
-                    return None
-                consolidated_file = local_path / f"{local_path.name}.feather"
-                if consolidated_file.exists():
-                    logger.info(f"Loading consolidated Feather v2 file: {consolidated_file}")
-                    df = cudf.read_feather(consolidated_file)
-                else:
-                    import glob
-                    part_files = sorted(glob.glob(str(local_path / "part-*.feather")))
-                    if not part_files:
-                        logger.warning(f"No partition files found in: {local_path}")
-                        return None
-                    dfs = [cudf.read_feather(p) for p in part_files]
-                    df = cudf.concat(dfs, ignore_index=True)
-            else:
-                logger.warning(f"Unsupported Feather path type: {local_path}")
-                return None
-
-            logger.info(f"Successfully loaded Feather v2 data from {local_path}")
-            logger.info(f"Data shape: {df.shape}")
-            logger.info(f"Data types: {df.dtypes.to_dict()}")
-
-            return df
-
-        except Exception as e:
-            logger.error(f"Failed to load Feather v2 data from {currency_pair_path}: {e}", exc_info=True)
-            return None
+    # Synchronous Feather loading method removed - only Parquet is supported
 
     def validate_data_path(self, currency_pair_path: str) -> bool:
         """
@@ -634,11 +522,10 @@ class LocalDataLoader:
             
             logger.info(f"Scanning for currency pairs in: {data_root}")
             
-            # Look for parquet or feather files directly in the data directory
+            # Look for parquet files directly in the data directory
             parquet_files = list(data_root.glob("*.parquet"))
-            feather_files = list(data_root.glob("*.feather"))
             
-            logger.info(f"Found {len(parquet_files)} parquet files and {len(feather_files)} feather files")
+            logger.info(f"Found {len(parquet_files)} parquet files")
             
             # Process parquet files
             for parquet_file in parquet_files:
@@ -669,29 +556,7 @@ class LocalDataLoader:
                 else:
                     logger.warning(f"Skipping invalid currency pair format from file {parquet_file.name}: {currency_pair}")
             
-            # Process feather files
-            for feather_file in feather_files:
-                # Extract currency pair name from filename
-                filename = feather_file.stem
-                
-                currency_pair = None
-                if '_' in filename:
-                    currency_pair = filename.split('_')[0].upper()
-                else:
-                    currency_pair = filename.upper()
-                
-                if len(currency_pair) == 6 and currency_pair.isalpha():
-                    pair_info = {
-                        'currency_pair': currency_pair,
-                        'data_path': str(feather_file.relative_to(data_root)),
-                        'file_type': 'feather',
-                        'file_size_mb': feather_file.stat().st_size / (1024 * 1024),
-                        'filename': feather_file.name
-                    }
-                    currency_pairs.append(pair_info)
-                    logger.info(f"Found currency pair: {currency_pair} from file {feather_file.name}")
-                else:
-                    logger.warning(f"Skipping invalid currency pair format from file {feather_file.name}: {currency_pair}")
+            # Feather file processing removed - only Parquet is supported
             
             logger.info(f"Discovered {len(currency_pairs)} currency pairs")
             return currency_pairs

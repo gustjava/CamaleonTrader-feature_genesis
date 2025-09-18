@@ -446,11 +446,11 @@ class OutputConfig:
     """Output configuration."""
     output_path: str = "./output"
     compression: str = "lz4"
-    format: str = "feather"
+    format: str = "parquet"
     version: int = 2
     # Intermediate checkpoints
     save_intermediate_per_engine: bool = False
-    intermediate_format: str = "parquet"  # parquet|feather
+    intermediate_format: str = "parquet"  # only parquet supported
     intermediate_compression: str = "zstd"
     intermediate_version: int = 2
 

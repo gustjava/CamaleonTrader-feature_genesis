@@ -77,7 +77,7 @@ def example_pipeline_execution():
         info_event(processor_logger, Events.TASK_START, 
                    f"Processing pair {pair}", 
                    index=i, total=3, pair=pair, 
-                   file=f"{pair}_2023.feather", size_mb=512.4)
+                   file=f"{pair}_2023.parquet", size_mb=512.4)
         
         # Engine processing with timing
         with time_event(engine_logger, Events.ENGINE_START, 

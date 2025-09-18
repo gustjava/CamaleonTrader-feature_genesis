@@ -134,7 +134,7 @@ Eliminar numeração por "Stage" nos logs e adotar mensagens orientadas à funci
 INFO  orchestration.main  pipeline.start  run_id=42 hostname=worker-01
 INFO  orchestration.orchestrator  task.discovery.found  count=8 path=/data/forex
 INFO  orchestration.cluster  cluster.ready  gpus=4 dashboard=http://localhost:8787
-INFO  orchestration.processor  task.start  pair=EURUSD file=EURUSD_2023.feather size_mb=512.4
+INFO  orchestration.processor  task.start  pair=EURUSD file=EURUSD_2023.parquet size_mb=512.4
 INFO  features.FeatureEngineeringEngine  engine.start  pair=EURUSD order=2 desc="BK filter"
 INFO  features.FeatureEngineeringEngine  engine.end    cols_before=120 cols_after=158 new_cols=38 duration_ms=8423
 INFO  data_io.local_loader  io.save.end   pair=EURUSD parts=32 path=/out/EURUSD/
@@ -144,7 +144,7 @@ INFO  orchestration.main  pipeline.summary total=8 success=8 failed=0
 
 ### Arquivo JSON (mesmo evento, com campos extra)
 ```json
-{"ts":"...","level":"INFO","component":"orchestration.processor","event":"task.start","run_id":42,"task_id":101,"pair":"EURUSD","filename":"EURUSD_2023.feather","size_mb":512.4}
+{"ts":"...","level":"INFO","component":"orchestration.processor","event":"task.start","run_id":42,"task_id":101,"pair":"EURUSD","filename":"EURUSD_2023.parquet","size_mb":512.4}
 ```
 
 ---

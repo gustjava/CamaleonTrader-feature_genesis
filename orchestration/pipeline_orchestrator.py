@@ -138,14 +138,14 @@ class PipelineOrchestrator:
             
             # Check if output file already exists (idempotent approach)
             out_dir = Path(self.settings.output.output_path) / currency_pair
-            consolidated = out_dir / f"{currency_pair}.feather"
+            consolidated = out_dir / f"{currency_pair}.parquet"
             if not self.settings.development.force_reprocessing:
                 if consolidated.exists():
                     logger.info(f"Skipping pair {currency_pair}; consolidated output exists")
                     continue
-                # Also skip if partitioned feather outputs exist
+                # Also skip if partitioned parquet outputs exist
                 try:
-                    if out_dir.exists() and any(out_dir.glob("part-*.feather")):
+                    if out_dir.exists() and any(out_dir.glob("part-*.parquet")):
                         logger.info(f"Skipping pair {currency_pair}; partitioned output exists")
                         continue
                 except Exception:
@@ -160,7 +160,7 @@ class PipelineOrchestrator:
                     logger.warning(f"Could not remove consolidated output {consolidated}: {e}")
                 # Remove partitioned outputs as well
                 try:
-                    for p in out_dir.glob("part-*.feather"):
+                    for p in out_dir.glob("part-*.parquet"):
                         p.unlink()
                     logger.info(f"Removed existing partitioned outputs: {out_dir}")
                 except Exception as e:
@@ -180,19 +180,19 @@ class PipelineOrchestrator:
         return pending_tasks
     
     def _clean_existing_output_files(self):
-        """Clean up existing feather files for debugging."""
-        logger.info("Cleaning up existing feather files for debug...")
+        """Clean up existing parquet files for debugging."""
+        logger.info("Cleaning up existing parquet files for debug...")
         import glob
         
-        feather_files = glob.glob(f"{self.settings.output.output_path}/*/*.feather")
-        for feather_file in feather_files:
+        parquet_files = glob.glob(f"{self.settings.output.output_path}/*/*.parquet")
+        for parquet_file in parquet_files:
             try:
-                os.remove(feather_file)
-                logger.info(f"Removed file: {feather_file}")
+                os.remove(parquet_file)
+                logger.info(f"Removed file: {parquet_file}")
             except Exception as e:
-                logger.warning(f"Could not remove file {feather_file}: {e}")
+                logger.warning(f"Could not remove file {parquet_file}: {e}")
         
-        logger.info(f"Cleanup complete, removed {len(feather_files)} files")
+        logger.info(f"Cleanup complete, removed {len(parquet_files)} files")
     
     def connect_database(self) -> bool:
         """Connect to the database for task tracking."""

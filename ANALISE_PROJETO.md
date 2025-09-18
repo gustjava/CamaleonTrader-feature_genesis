@@ -154,7 +154,7 @@
 **Tecnologias:**
 - **cuDF**: DataFrames GPU para processamento rápido
 - **Dask-cuDF**: DataFrames distribuídos para escalabilidade
-- **Feather v2**: Formato de serialização eficiente
+- **Parquet**: Formato de serialização eficiente com timestamp, target e features selecionadas
 - **Arrow**: Formato de dados colunar para interoperabilidade
 
 **Algoritmos:**
@@ -248,7 +248,7 @@
 ### 3.5 Processamento de Par de Moeda (`process_currency_pair_dask()`)
 1. **Carregamento de Dados**
    - Carrega dados como `dask_cuDF` DataFrame
-   - Suporta formatos Parquet e Feather
+   - Suporta formato Parquet
    - Aplica fallback entre formatos se necessário
 
 2. **Validação Inicial**
@@ -275,7 +275,7 @@
 
 2. **Salvamento Particionado**
    - Converte para tarefas delayed
-   - Salva cada partição como arquivo Feather separado
+   - Salva cada partição como arquivo Parquet separado
    - Usa compressão LZ4 para eficiência
 
 3. **Verificação de Integridade**

@@ -538,7 +538,7 @@ monitoring:
 output:
   output_path: "./output"
   compression: "lz4"
-  format: "feather"
+  format: "parquet"
   version: 2
 
 # Development Configuration

@@ -110,7 +110,7 @@ INFO  orchestration.main  pipeline.summary total=8 success=8 failed=0
 Arquivo JSON (mesmo evento, com campos extra):
 
 ```
-{"ts":"...","level":"INFO","component":"orchestration.processor","event":"task.start","run_id":42,"task_id":101,"pair":"EURUSD","filename":"EURUSD_2023.feather","size_mb":512.4}
+{"ts":"...","level":"INFO","component":"orchestration.processor","event":"task.start","run_id":42,"task_id":101,"pair":"EURUSD","filename":"EURUSD_2023.parquet","size_mb":512.4}
 ```
 
 ## 7) Passo a passo de implementação

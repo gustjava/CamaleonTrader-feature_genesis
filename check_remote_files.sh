@@ -109,16 +109,16 @@ else
 fi
 echo ''
 
-# 2. Procurar por arquivos Feather em todo o workspace
-echo '2. PROCURANDO ARQUIVOS FEATHER...'
+# 2. Procurar por arquivos Parquet em todo o workspace
+echo '2. PROCURANDO ARQUIVOS PARQUET...'
 echo \"Procurando em $REMOTE_PROJECT_DIR...\"
-find \"$REMOTE_PROJECT_DIR\" -name \"*.feather\" -type f 2>/dev/null | head -20 || echo \"   Nenhum arquivo .feather encontrado\"
+find \"$REMOTE_PROJECT_DIR\" -name \"*.parquet\" -type f 2>/dev/null | head -20 || echo \"   Nenhum arquivo .parquet encontrado\"
 
 echo \"Procurando em /data...\"
-find /data -name \"*.feather\" -type f 2>/dev/null | head -20 || echo \"   Nenhum arquivo .feather encontrado\"
+find /data -name \"*.parquet\" -type f 2>/dev/null | head -20 || echo \"   Nenhum arquivo .parquet encontrado\"
 
 echo \"Procurando em todo o sistema...\"
-find / -name \"*.feather\" -type f 2>/dev/null | grep -E '(feature_genesis|output|data)' | head -20 || echo \"   Nenhum arquivo .feather relevante encontrado\"
+find / -name \"*.parquet\" -type f 2>/dev/null | grep -E '(feature_genesis|output|data)' | head -20 || echo \"   Nenhum arquivo .parquet relevante encontrado\"
 echo ''
 
 # 3. Verificar estrutura de diretórios do projeto
@@ -185,7 +185,7 @@ echo ''
 echo '=== RESUMO FINAL ==='
 echo \"Diretório de saída configurado: $REMOTE_OUTPUT_DIR\"
 echo \"Diretório existe: \$([ -d \"$REMOTE_OUTPUT_DIR\" ] && echo 'SIM' || echo 'NÃO')\"
-echo \"Arquivos .feather encontrados: \$(find \"$REMOTE_PROJECT_DIR\" -name \"*.feather\" 2>/dev/null | wc -l)\"
+echo \"Arquivos .parquet encontrados: \$(find \"$REMOTE_PROJECT_DIR\" -name \"*.parquet\" 2>/dev/null | wc -l)\"
 echo \"Processos do pipeline ativos: \$(ps aux | grep -E '(python.*orchestration|dask-worker|dask-scheduler)' | grep -v grep | wc -l)\"
 echo \"Espaço livre em disco: \$(df -h /workspace | tail -1 | awk '{print \$4}')\"
 echo \"Memória livre: \$(free -h | grep Mem | awk '{print \$7}')\"

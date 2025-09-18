@@ -24,19 +24,15 @@ if [ -d "$OUTPUT_DIR" ]; then
     ls -la "$OUTPUT_DIR"
     
     # Contar arquivos por tipo
-    feather_count=$(find "$OUTPUT_DIR" -name "*.feather" -type f 2>/dev/null | wc -l)
+    # Feather files removed - only parquet supported
     parquet_count=$(find "$OUTPUT_DIR" -name "*.parquet" -type f 2>/dev/null | wc -l)
     
     echo ""
     echo "📊 Estatísticas:"
-    echo "   Arquivos .feather: $feather_count"
+    # Feather count removed - only parquet supported
     echo "   Arquivos .parquet: $parquet_count"
     
-    if [ $feather_count -gt 0 ]; then
-        echo ""
-        echo "📁 Arquivos .feather encontrados:"
-        find "$OUTPUT_DIR" -name "*.feather" -type f 2>/dev/null | head -10
-    fi
+    # Feather file listing removed - only parquet supported
 else
     echo "❌ Diretório de saída NÃO existe: $OUTPUT_DIR"
     echo "   Verificando se existe em outros locais..."
@@ -45,15 +41,15 @@ else
 fi
 echo ""
 
-echo "2. PROCURANDO ARQUIVOS FEATHER EM TODO O SISTEMA..."
+echo "2. PROCURANDO ARQUIVOS PARQUET EM TODO O SISTEMA..."
 echo "Procurando em $PROJECT_DIR..."
-find "$PROJECT_DIR" -name "*.feather" -type f 2>/dev/null | head -20 || echo "   Nenhum arquivo .feather encontrado"
+find "$PROJECT_DIR" -name "*.parquet" -type f 2>/dev/null | head -20 || echo "   Nenhum arquivo .parquet encontrado"
 
 echo "Procurando em $DATA_DIR..."
-find "$DATA_DIR" -name "*.feather" -type f 2>/dev/null | head -20 || echo "   Nenhum arquivo .feather encontrado"
+find "$DATA_DIR" -name "*.parquet" -type f 2>/dev/null | head -20 || echo "   Nenhum arquivo .parquet encontrado"
 
 echo "Procurando em todo o sistema (relevantes)..."
-find / -name "*.feather" -type f 2>/dev/null | grep -E "(feature_genesis|output|data)" | head -20 || echo "   Nenhum arquivo .feather relevante encontrado"
+find / -name "*.parquet" -type f 2>/dev/null | grep -E "(feature_genesis|output|data)" | head -20 || echo "   Nenhum arquivo .parquet relevante encontrado"
 echo ""
 
 echo "3. VERIFICANDO PROCESSOS DO PIPELINE..."
@@ -102,7 +98,7 @@ echo ""
 echo "=== RESUMO FINAL ==="
 echo "Diretório de saída configurado: $OUTPUT_DIR"
 echo "Diretório existe: $([ -d "$OUTPUT_DIR" ] && echo 'SIM' || echo 'NÃO')"
-echo "Arquivos .feather encontrados: $(find "$PROJECT_DIR" -name "*.feather" 2>/dev/null | wc -l)"
+echo "Arquivos .parquet encontrados: $(find "$PROJECT_DIR" -name "*.parquet" 2>/dev/null | wc -l)"
 echo "Processos do pipeline ativos: $(ps aux | grep -E "(python.*orchestration|dask-worker|dask-scheduler)" | grep -v grep | wc -l)"
 echo "Espaço livre em disco: $(df -h /workspace | tail -1 | awk '{print $4}')"
 echo "Memória livre: $(free -h | grep Mem | awk '{print $7}')"

@@ -160,23 +160,13 @@ if [ -d \"$REMOTE_OUTPUT_DIR\" ]; then
     echo \"Diretório de saída encontrado: $REMOTE_OUTPUT_DIR\"
     
     # Contar arquivos por tipo
-    feather_count=\$(find \"$REMOTE_OUTPUT_DIR\" -name \"*.feather\" -type f 2>/dev/null | wc -l)
+    # Feather count removed - only parquet supported
     parquet_count=\$(find \"$REMOTE_OUTPUT_DIR\" -name \"*.parquet\" -type f 2>/dev/null | wc -l)
     
-    echo \"Arquivos .feather: \$feather_count\"
+    # Feather count removed - only parquet supported
     echo \"Arquivos .parquet: \$parquet_count\"
     
-    if [ \$feather_count -gt 0 ]; then
-        echo \"Primeiros arquivos .feather:\"
-        find \"$REMOTE_OUTPUT_DIR\" -name \"*.feather\" -type f 2>/dev/null | head -5
-        
-        # Verificar tamanho dos arquivos
-        echo \"Tamanhos dos arquivos:\"
-        for file in \$(find \"$REMOTE_OUTPUT_DIR\" -name \"*.feather\" -type f 2>/dev/null | head -5); do
-            size_mb=\$(du -h \"\$file\" | cut -f1)
-            echo \"  \$(basename \$file): \$size_mb\"
-        done
-    fi
+    # Feather file listing removed - only parquet supported
 else
     echo \"❌ Diretório de saída não encontrado: $REMOTE_OUTPUT_DIR\"
 fi
@@ -215,7 +205,7 @@ echo ''
 echo '=== RESUMO FINAL ==='
 echo \"Diretório de saída: $REMOTE_OUTPUT_DIR\"
 echo \"Existe: \$([ -d \"$REMOTE_OUTPUT_DIR\" ] && echo 'SIM' || echo 'NÃO')\"
-echo \"Arquivos .feather: \$(find \"$REMOTE_OUTPUT_DIR\" -name \"*.feather\" 2>/dev/null | wc -l)\"
+echo \"Arquivos .parquet: \$(find \"$REMOTE_OUTPUT_DIR\" -name \"*.parquet\" 2>/dev/null | wc -l)\"
 echo \"Processos ativos: \$(ps aux | grep -E '(python.*orchestration|dask-worker|dask-scheduler)' | grep -v grep | wc -l)\"
 echo \"Espaço livre: \$(df -h /workspace | tail -1 | awk '{print \$4}')\"
 echo \"Memória livre: \$(free -h | grep Mem | awk '{print \$7}')\"

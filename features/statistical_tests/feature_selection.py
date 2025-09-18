@@ -630,20 +630,12 @@ class FeatureSelection:
                     if esr > 0:
                         fit_kwargs.update({'use_best_model': True, 'early_stopping_rounds': esr})
                     try:
-                        print(f"🔥 [TERMINAL DEBUG] CatBoost fit START - train_pool: {train_pool}, fit_kwargs: {fit_kwargs}")
-                        sys.stdout.flush()
                         self._log_info('CatBoost fit start (with validation)', train_size=len(tr_idx), valid_size=len(va_idx))
                         model.fit(train_pool, **fit_kwargs)
-                        print(f"✅ [TERMINAL DEBUG] CatBoost fit SUCCESS")
-                        sys.stdout.flush()
                         self._log_info('CatBoost fit successful (with validation)')
                     except Exception as fit_err:
-                        print(f"❌ [TERMINAL DEBUG] CatBoost fit FAILED: {fit_err}")
-                        sys.stdout.flush()
                         # Log detailed traceback and re-raise
                         tb = _tb.format_exc()
-                        print(f"📜 [TERMINAL DEBUG] Full traceback:\n{tb}")
-                        sys.stdout.flush()
                         self._log_error('CatBoost fit failed (with validation)', error=str(fit_err), traceback=tb)
                         # Return safe fallback values to prevent pipeline crash
                         fi = np.ones(len(candidates), dtype=float)  # Uniform importances indicate failure
@@ -713,60 +705,31 @@ class FeatureSelection:
                     score = metrics['training_r2']
 
             # Feature importance: always specify a valid type and provide data when possible
-            print(f"🎯 [TERMINAL DEBUG] Getting feature importance from trained model...")
-            sys.stdout.flush()
             fi = None
             _fi_errors = []
             try:
-                print(f"🔍 [TERMINAL DEBUG] Trying PredictionValuesChange with data...")
-                sys.stdout.flush()
                 fi = model.get_feature_importance(data=train_pool, type='PredictionValuesChange')
-                print(f"✅ [TERMINAL DEBUG] PredictionValuesChange SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                sys.stdout.flush()
             except Exception as _e1:
-                print(f"❌ [TERMINAL DEBUG] PredictionValuesChange FAILED: {_e1}")
-                sys.stdout.flush()
                 _fi_errors.append(str(_e1))
                 try:
-                    print(f"🔍 [TERMINAL DEBUG] Trying FeatureImportance with data...")
-                    sys.stdout.flush()
                     fi = model.get_feature_importance(data=train_pool, type='FeatureImportance')
-                    print(f"✅ [TERMINAL DEBUG] FeatureImportance with data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                    sys.stdout.flush()
                 except Exception as _e2:
-                    print(f"❌ [TERMINAL DEBUG] FeatureImportance with data FAILED: {_e2}")
-                    sys.stdout.flush()
                     _fi_errors.append(str(_e2))
                     try:
-                        print(f"🔍 [TERMINAL DEBUG] Trying FeatureImportance without data...")
-                        sys.stdout.flush()
                         fi = model.get_feature_importance(type='FeatureImportance')
-                        print(f"✅ [TERMINAL DEBUG] FeatureImportance no data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                        sys.stdout.flush()
                     except Exception as _e3:
-                        print(f"❌ [TERMINAL DEBUG] FeatureImportance no data FAILED: {_e3}")
-                        sys.stdout.flush()
                         _fi_errors.append(str(_e3))
                         try:
-                            print(f"🔍 [TERMINAL DEBUG] Trying PredictionValuesChange without data...")
-                            sys.stdout.flush()
                             fi = model.get_feature_importance(type='PredictionValuesChange')
-                            print(f"✅ [TERMINAL DEBUG] PredictionValuesChange no data SUCCESS - shape: {fi.shape}, sample: {fi[:5]}")
-                            sys.stdout.flush()
                         except Exception as _e4:
-                            print(f"❌ [TERMINAL DEBUG] PredictionValuesChange no data FAILED: {_e4}")
-                            sys.stdout.flush()
                             _fi_errors.append(str(_e4))
                             fi = None
             if fi is None:
-                print(f"🚨 [TERMINAL DEBUG] ALL feature importance methods FAILED - returning zeros")
-                sys.stdout.flush()
                 # As a last resort, produce zeros and log
                 self._log_warn('CatBoost get_feature_importance failed; returning zeros', errors=_fi_errors[:3])
                 fi = np.zeros(len(candidates), dtype=float)
             else:
-                print(f"🎊 [TERMINAL DEBUG] Feature importance obtained successfully - unique values: {len(np.unique(fi))}")
-                sys.stdout.flush()
+                pass  # Feature importance obtained successfully
                 # Ensure correct length; if mismatch, fallback to zeros to keep pipeline stable
                 try:
                     fi = np.asarray(fi, dtype=float)
