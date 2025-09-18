@@ -9,7 +9,7 @@ import sys
 import os
 import time
 import traceback
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 import cudf
@@ -29,10 +29,111 @@ from features import (
 from features.signal_processing import apply_emd_to_series
 from features.base_engine import CriticalPipelineError
 from features.final_model import FinalModelTrainer
+from utils.trading_metrics import GPUPostTrainingMetrics
 from utils.logging_utils import get_logger, set_currency_pair_context
 from features.engine_metrics import EngineMetrics
 
 logger = get_logger(__name__, "orchestration.processor")
+
+
+def _infer_default_timeframe(settings) -> str:
+    """Infer default timeframe string from configuration."""
+
+    try:
+        target_col = str(getattr(settings.features, 'selection_target_column', '') or '').lower()
+        if target_col:
+            parts = target_col.split('_')
+            if parts:
+                candidate = parts[-1]
+                if candidate and any(candidate.endswith(suffix) for suffix in ('m', 'h', 'd')):
+                    return candidate
+    except Exception:
+        pass
+    return '60m'
+
+
+def _gpu_metrics_resolve_timeframe_params(timeframe: Optional[str]) -> Dict[str, float]:
+    """Derive window size and annualization factor from timeframe text."""
+
+    timeframe_str = str(timeframe or '').lower()
+    if not timeframe_str or timeframe_str == 'unknown':
+        timeframe_str = '60m'
+
+    bars_per_day = 1
+    try:
+        if timeframe_str.endswith('m'):
+            minutes = max(int(timeframe_str[:-1] or 1), 1)
+            bars_per_day = max(int((24 * 60) / minutes), 1)
+        elif timeframe_str.endswith('h'):
+            hours = max(int(timeframe_str[:-1] or 1), 1)
+            bars_per_day = max(int(24 / hours), 1)
+    except Exception:
+        bars_per_day = 1
+
+    window_size = max(int(bars_per_day * 20), 1)
+    annual_factor = float((252 * bars_per_day) ** 0.5)
+
+    return {
+        'bars_per_day': float(bars_per_day),
+        'window_size': window_size,
+        'annual_factor': annual_factor
+    }
+
+
+def _gpu_metrics_extract_cost(container: Any, keys: List[str]) -> Optional[float]:
+    """Extract numeric cost from dict/namespace containers."""
+
+    if container is None:
+        return None
+
+    try:
+        if isinstance(container, (int, float)):
+            return float(container)
+        if isinstance(container, dict):
+            for key in keys:
+                if key in container:
+                    return float(container[key])
+        if hasattr(container, '__dict__'):
+            for key in keys:
+                if hasattr(container, key):
+                    return float(getattr(container, key))
+    except Exception:
+        return None
+
+    return None
+
+
+def _gpu_metrics_resolve_cost(settings, symbol: Optional[str], timeframe: Optional[str]) -> float:
+    """Resolve cost per trade with multiple configuration fallbacks."""
+
+    symbol_upper = (symbol or '').upper()
+    timeframe_key = str(timeframe or '').lower()
+    candidate_keys = [
+        f"{symbol_upper}_{timeframe_key}",
+        symbol_upper,
+        timeframe_key,
+        'default'
+    ]
+
+    sources: List[Any] = []
+    try:
+        sources.append(getattr(settings.features, 'final_metrics_cost_per_trade', None))
+    except Exception:
+        pass
+
+    try:
+        trading_cfg = getattr(settings, 'trading', None)
+        if trading_cfg is not None:
+            sources.append(getattr(trading_cfg, 'cost_per_trade', None))
+    except Exception:
+        pass
+
+    for source in sources:
+        value = _gpu_metrics_extract_cost(source, candidate_keys)
+        if value is not None:
+            return value
+
+    return 0.0
 
 
 class DataProcessor:
@@ -50,6 +151,7 @@ class DataProcessor:
     def __init__(self, client: Optional[Client] = None, run_id: Optional[int] = None):
         """Initialize the data processor."""
         self.settings = get_settings()
+        self.default_timeframe = _infer_default_timeframe(self.settings)
         self.loader = LocalDataLoader()
         self.db_handler = DatabaseHandler()
         self.db_connected = False
@@ -804,15 +906,64 @@ class DataProcessor:
                             logger.info(f"[FinalModel]   - MAE: {mae:.8f}")
                             logger.info(f"[FinalModel]   - R²: {r2:.6f}")
                             logger.info(f"[FinalModel]   - RMSE: {mse**0.5:.8f}")
+
+                            currency_pair = getattr(self, 'current_currency_pair', 'unknown')
+                            timeframe = getattr(self, 'current_timeframe', 'unknown')
+                            timeframe_lower = str(timeframe).lower()
+                            if currency_pair and currency_pair.upper() == 'EURAUD':
+                                if timeframe_lower == 'unknown':
+                                    timeframe_lower = '60m'
+
+                            if currency_pair and currency_pair.upper() == 'EURAUD' and timeframe_lower == '60m':
+                                try:
+                                    params = _gpu_metrics_resolve_timeframe_params(timeframe_lower)
+                                    cost_per_trade = _gpu_metrics_resolve_cost(self.settings, currency_pair, timeframe_lower)
+                                    gpu_metrics_engine = GPUPostTrainingMetrics(
+                                        cost_per_trade=cost_per_trade,
+                                        annual_factor=params['annual_factor'],
+                                        window_size=params['window_size']
+                                    )
+                                    gpu_metrics = gpu_metrics_engine.compute_metrics(
+                                        y_true=cp.asarray(y_test),
+                                        y_pred=cp.asarray(y_pred)
+                                    )
+
+                                    global_gpu = gpu_metrics['global']
+                                    stability_gpu = gpu_metrics['stability']
+
+                                    ic_pct = stability_gpu.get('ic_positive_pct', 0.0) * 100.0
+                                    sharpe_pct = stability_gpu.get('sharpe_positive_pct', 0.0) * 100.0
+                                    logger.info(
+                                        "[FinalMetrics] IC=%.4f, ICIR=%.4f, Hit=%.4f, Sharpe(liq)=%.4f, Sortino(liq)=%.4f, "
+                                        "MDD(liq)=%.6f, Q5-Q1=%.6f, Estab_IC=%.2f%%, Estab_Sharpe=%.2f%%",
+                                        global_gpu.get('IC', 0.0),
+                                        global_gpu.get('ICIR', 0.0),
+                                        global_gpu.get('hit', 0.0),
+                                        global_gpu.get('sharpe_liq', 0.0),
+                                        global_gpu.get('sortino_liq', 0.0),
+                                        global_gpu.get('mdd_liq', 0.0),
+                                        global_gpu.get('q5_minus_q1', 0.0),
+                                        ic_pct,
+                                        sharpe_pct
+                                    )
+                                    logger.info(
+                                        "[FinalMetrics] Z=%.3f, Turnover=%.4f, Trades=%d, TStat(Q5-Q1)=%.3f",
+                                        global_gpu.get('z_score', 0.0),
+                                        global_gpu.get('turnover', 0.0),
+                                        global_gpu.get('trades_total', 0),
+                                        global_gpu.get('tstat_q5q1', 0.0)
+                                    )
+                                except Exception as gpu_err:
+                                    logger.warning(f"[FinalMetrics] GPU metrics calculation failed: {gpu_err}")
                             
                             logger.info(f"[FinalModel] 🎯 All Feature Importances:")
                             for i, (feature_name, importance) in enumerate(sorted_features, 1):
                                 logger.info(f"[FinalModel]   {i:2d}. {feature_name}: {importance:.6f}")
                             
                             # Save model with proper naming
-                            currency_pair = getattr(self, 'current_currency_pair', 'unknown')
-                            timeframe = getattr(self, 'current_timeframe', 'unknown')
-                            model_filename = f"{currency_pair}_{timeframe}_model.cbm"
+                            effective_timeframe = timeframe_lower if timeframe_lower != 'unknown' else self.default_timeframe
+                            pair_lower = str(currency_pair or '').lower()
+                            model_filename = f"catboost_{pair_lower}_{effective_timeframe}.cbm"
                             model.save_model(model_filename)
                             logger.info(f"[FinalModel] 💾 Model saved as: {model_filename}")
                             
@@ -1301,6 +1452,9 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
             set_currency_pair_context(currency_pair)
             try:
                 self.current_currency_pair = currency_pair
+                self.current_timeframe = getattr(self, 'current_timeframe', self.default_timeframe)
+                if not self.current_timeframe or self.current_timeframe == 'unknown':
+                    self.current_timeframe = self.default_timeframe
             except Exception:
                 pass
             logger.info(f"Starting Dask processing for {currency_pair}")

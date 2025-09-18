@@ -15,7 +15,7 @@ from datetime import datetime
 import traceback as _tb
 
 from utils.logging_utils import get_logger
-from utils.trading_metrics import TradingMetrics
+from utils.trading_metrics import TradingMetrics, GPUPostTrainingMetrics
 from data_io.db_handler import DatabaseHandler
 from data_io.r2_uploader import R2ModelUploader
 
@@ -29,7 +29,7 @@ class FinalModelTrainer:
         """Initialize the final model trainer."""
         self.config = config
         self.logger = logger_instance or logger
-        self.trading_metrics = TradingMetrics(config)
+        self.trading_metrics = TradingMetrics(config=config)
         self.db_handler = DatabaseHandler()
         self.r2_uploader = R2ModelUploader()  # Initialize R2 uploader
         
@@ -52,6 +52,71 @@ class FinalModelTrainer:
         """Log critical error and raise exception."""
         self._log_error(message, **kwargs)
         raise RuntimeError(f"FinalModel Critical Error: {message}")
+    
+    def _cleanup_model_memory(self, model_results: Dict[str, Any], symbol: str, timeframe: str) -> None:
+        """
+        Clean up GPU memory after model training to prevent accumulation between currencies.
+        
+        Args:
+            model_results: Results containing model and predictions
+            symbol: Currency symbol for logging
+            timeframe: Timeframe for logging
+        """
+        try:
+            # 1. Clear CatBoost model from memory
+            if 'model' in model_results:
+                try:
+                    # Clear model reference
+                    del model_results['model']
+                except:
+                    pass
+            
+            # 2. Clear prediction arrays
+            for key in ['train_predictions', 'test_predictions']:
+                if key in model_results:
+                    try:
+                        del model_results[key]
+                    except:
+                        pass
+            
+            # 3. Force garbage collection
+            import gc
+            gc.collect()
+            
+            # 4. Clear GPU memory pools (CuPy)
+            try:
+                import cupy as cp
+                # Free all unused memory blocks
+                cp.get_default_memory_pool().free_all_blocks()
+                # Free all unused pinned memory
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                
+                # Get memory usage after cleanup
+                mempool = cp.get_default_memory_pool()
+                used_bytes = mempool.used_bytes()
+                used_mb = used_bytes / (1024 * 1024)
+                
+                self._log_info('GPU memory cleanup completed',
+                              symbol=symbol,
+                              timeframe=timeframe,
+                              gpu_memory_used_mb=f"{used_mb:.1f}")
+                
+            except ImportError:
+                # CuPy not available, skip GPU cleanup
+                self._log_info('CPU memory cleanup completed (CuPy not available)',
+                              symbol=symbol,
+                              timeframe=timeframe)
+            except Exception as cupy_err:
+                self._log_warn('GPU memory cleanup failed',
+                              symbol=symbol,
+                              timeframe=timeframe,
+                              error=str(cupy_err))
+                
+        except Exception as e:
+            self._log_warn('Memory cleanup failed',
+                          symbol=symbol,
+                          timeframe=timeframe,
+                          error=str(e))
 
     def build_and_evaluate_final_model(self, 
                                      X_df,  # Accept both cudf.DataFrame and dask_cudf.DataFrame
@@ -144,7 +209,11 @@ class FinalModelTrainer:
             
             # 5. Comprehensive evaluation
             evaluation_results = self._comprehensive_evaluation(
-                model_results, train_test_split, task_type
+                model_results,
+                train_test_split,
+                task_type,
+                symbol=symbol,
+                timeframe=timeframe
             )
             
             # 6. Save to database
@@ -193,6 +262,9 @@ class FinalModelTrainer:
                            train_score=evaluation_results.get('train_primary_metric', 0.0),
                            test_score=evaluation_results.get('test_primary_metric', 0.0))
             
+            # NOTE: Memory cleanup moved to AFTER R2 upload to avoid 
+            # deleting model before upload completes
+            
             return final_results
             
         except Exception as e:
@@ -200,6 +272,24 @@ class FinalModelTrainer:
                            error=str(e), 
                            error_type=type(e).__name__,
                            traceback=_tb.format_exc())
+            
+            # Clean up memory even on failure
+            try:
+                if 'model_results' in locals():
+                    self._cleanup_model_memory(model_results, symbol, timeframe)
+                else:
+                    # Fallback cleanup without model_results
+                    import gc
+                    gc.collect()
+                    try:
+                        import cupy as cp
+                        cp.get_default_memory_pool().free_all_blocks()
+                        cp.get_default_pinned_memory_pool().free_all_blocks()
+                    except:
+                        pass
+            except Exception as cleanup_err:
+                self._log_warn('Cleanup after error failed', error=str(cleanup_err))
+            
             raise
 
     def _determine_task_type(self, y_series) -> str:
@@ -394,6 +484,12 @@ class FinalModelTrainer:
                            best_iteration=best_iteration,
                            early_stopped=best_iteration < iterations)
             
+            # Clean up training pools to free memory
+            try:
+                del train_pool, test_pool
+            except:
+                pass
+            
             return model_results
             
         except Exception as e:
@@ -402,10 +498,14 @@ class FinalModelTrainer:
                            traceback=_tb.format_exc())
             raise
 
-    def _comprehensive_evaluation(self, 
-                                model_results: Dict[str, Any], 
-                                train_test_split: Dict[str, Any],
-                                task_type: str) -> Dict[str, Any]:
+    def _comprehensive_evaluation(
+        self,
+        model_results: Dict[str, Any],
+        train_test_split: Dict[str, Any],
+        task_type: str,
+        symbol: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Perform comprehensive evaluation using both standard and trading metrics."""
         
         self._log_info('Starting comprehensive model evaluation', task_type=task_type)
@@ -472,25 +572,44 @@ class FinalModelTrainer:
                 
                 # Advanced trading metrics for regression
                 try:
+                    self._log_info('Starting advanced trading metrics calculation',
+                                  symbol=symbol_upper, timeframe=timeframe_lower)
+                    
+                    # Create fresh TradingMetrics instance to avoid state issues
+                    fresh_trading_metrics = TradingMetrics(config=self.config)
+                    
                     # Training advanced metrics
-                    train_advanced = self.trading_metrics.compute_comprehensive_metrics(
+                    self._log_info('Computing training advanced metrics',
+                                  symbol=symbol_upper, timeframe=timeframe_lower)
+                    train_advanced = fresh_trading_metrics.compute_comprehensive_metrics(
                         predictions=train_pred,
                         targets=y_train,
                         prefix="train"
                     )
                     evaluation_results.update(train_advanced)
+                    self._log_info('Training advanced metrics completed',
+                                  symbol=symbol_upper, timeframe=timeframe_lower, 
+                                  metrics_count=len(train_advanced))
                     
                     # Test advanced metrics
-                    test_advanced = self.trading_metrics.compute_comprehensive_metrics(
+                    self._log_info('Computing test advanced metrics',
+                                  symbol=symbol_upper, timeframe=timeframe_lower)
+                    test_advanced = fresh_trading_metrics.compute_comprehensive_metrics(
                         predictions=test_pred,
                         targets=y_test,
                         prefix="test"
                     )
                     evaluation_results.update(test_advanced)
+                    self._log_info('Test advanced metrics completed',
+                                  symbol=symbol_upper, timeframe=timeframe_lower,
+                                  metrics_count=len(test_advanced))
                     
                     # Log advanced metrics
-                    self.trading_metrics.log_comprehensive_metrics(train_advanced, "Final Model Training")
-                    self.trading_metrics.log_comprehensive_metrics(test_advanced, "Final Model Testing")
+                    fresh_trading_metrics.log_comprehensive_metrics(train_advanced, "Final Model Training", logger=self.logger)
+                    fresh_trading_metrics.log_comprehensive_metrics(test_advanced, "Final Model Testing", logger=self.logger)
+                    
+                    self._log_info('Advanced trading metrics logging completed',
+                                  symbol=symbol_upper, timeframe=timeframe_lower)
                     
                     # Primary metric: use Skill Score or Information Coefficient if available
                     if 'test_skill_score' in test_advanced:
@@ -508,9 +627,113 @@ class FinalModelTrainer:
                         evaluation_results['train_primary_metric'] = evaluation_results['train_r2']
                         
                 except Exception as e:
-                    self._log_warn('Advanced trading metrics failed; using standard metrics', error=str(e))
+                    self._log_error('Advanced trading metrics failed; using standard metrics', 
+                                  error=str(e),
+                                  error_type=type(e).__name__,
+                                  symbol=symbol_upper,
+                                  timeframe=timeframe_lower,
+                                  traceback=_tb.format_exc())
                     evaluation_results['train_primary_metric'] = evaluation_results['train_r2']
                     evaluation_results['test_primary_metric'] = evaluation_results['test_r2']
+
+                symbol_upper = str(symbol or '').upper()
+                timeframe_lower = self._resolve_output_timeframe(timeframe)
+
+                # Enable GPU metrics for all symbols (removed hardcoded EURAUD restriction)
+                gpu_metrics_enabled = True
+
+                if gpu_metrics_enabled:
+                    try:
+                        self._log_info('Starting GPU post-training metrics calculation',
+                                      symbol=symbol_upper, timeframe=timeframe_lower)
+                        
+                        params = self._resolve_timeframe_params(timeframe_lower)
+                        cost_per_trade = self._resolve_cost_per_trade(symbol_upper, timeframe_lower)
+                        
+                        self._log_info('GPU metrics parameters resolved',
+                                      symbol=symbol_upper, timeframe=timeframe_lower,
+                                      cost_per_trade=cost_per_trade,
+                                      annual_factor=params['annual_factor'],
+                                      window_size=params['window_size'])
+                        
+                        # Create fresh GPU metrics engine for each symbol to avoid state issues
+                        gpu_metrics_engine = GPUPostTrainingMetrics(
+                            cost_per_trade=cost_per_trade,
+                            annual_factor=params['annual_factor'],
+                            window_size=params['window_size']
+                        )
+                        
+                        self._log_info('GPU metrics engine created, computing metrics',
+                                      symbol=symbol_upper, timeframe=timeframe_lower,
+                                      y_test_size=len(y_test), y_pred_size=len(test_pred))
+                        
+                        gpu_metrics = gpu_metrics_engine.compute_metrics(
+                            y_true=y_test,
+                            y_pred=test_pred
+                        )
+                        
+                        self._log_info('GPU metrics computation completed',
+                                      symbol=symbol_upper, timeframe=timeframe_lower,
+                                      has_global=bool(gpu_metrics.get('global')),
+                                      has_stability=bool(gpu_metrics.get('stability')),
+                                      has_windows=bool(gpu_metrics.get('windows')))
+
+                        evaluation_results['gpu_metrics_global'] = gpu_metrics['global']
+                        evaluation_results['gpu_metrics_windows'] = gpu_metrics['windows']
+                        evaluation_results['gpu_metrics_stability'] = gpu_metrics['stability']
+                        evaluation_results['gpu_metrics_bucket_means'] = gpu_metrics['bucket_means']
+
+                        stability = gpu_metrics['stability']
+                        global_gpu = gpu_metrics['global']
+                        ic_pct = stability.get('ic_positive_pct', 0.0)
+                        sharpe_pct = stability.get('sharpe_positive_pct', 0.0)
+                        self.logger.info(
+                            "[FinalMetrics] IC=%.4f, ICIR=%.4f, Hit=%.4f, Sharpe(liq)=%.4f, Sortino(liq)=%.4f, "
+                            "MDD(liq)=%.6f, Q5-Q1=%.6f, Estab_IC=%.2f%%, Estab_Sharpe=%.2f%%",
+                            global_gpu.get('IC', 0.0),
+                            global_gpu.get('ICIR', 0.0),
+                            global_gpu.get('hit', 0.0),
+                            global_gpu.get('sharpe_liq', 0.0),
+                            global_gpu.get('sortino_liq', 0.0),
+                            global_gpu.get('mdd_liq', 0.0),
+                            global_gpu.get('q5_minus_q1', 0.0),
+                            ic_pct * 100.0,
+                            sharpe_pct * 100.0
+                        )
+                        self.logger.info(
+                            "[FinalMetrics] Z=%.3f, Turnover=%.4f, Trades=%d, TStat(Q5-Q1)=%.3f",
+                            global_gpu.get('z_score', 0.0),
+                            global_gpu.get('turnover', 0.0),
+                            global_gpu.get('trades_total', 0),
+                            global_gpu.get('tstat_q5q1', 0.0)
+                        )
+                        
+                        # Log bucket monotonicity for validation
+                        bucket_means = gpu_metrics['bucket_means']
+                        if bucket_means:
+                            # The bucket_monotonicity comes from the bucket calculation
+                            bucket_mono = global_gpu.get('bucket_monotonicity', 0.0)
+                            self.logger.info(
+                                "[FinalMetrics] BucketMonotonicity(Spearman)=%.3f",
+                                bucket_mono
+                            )
+                    except Exception as gpu_err:
+                        self._log_error('GPU post-training metrics failed', 
+                                      error=str(gpu_err),
+                                      error_type=type(gpu_err).__name__,
+                                      symbol=symbol_upper,
+                                      timeframe=timeframe_lower,
+                                      traceback=_tb.format_exc())
+                        
+                        # Try to clean up GPU memory if possible
+                        try:
+                            import gc
+                            import cupy as cp
+                            gc.collect()
+                            cp.get_default_memory_pool().free_all_blocks()
+                            self._log_info('GPU memory cleanup attempted after metrics failure')
+                        except Exception as cleanup_err:
+                            self._log_warn('GPU memory cleanup failed', error=str(cleanup_err))
             
             # Add prediction statistics
             evaluation_results.update({
@@ -535,6 +758,94 @@ class FinalModelTrainer:
                            error=str(e), 
                            traceback=_tb.format_exc())
             raise
+
+    def _resolve_timeframe_params(self, timeframe: Optional[str]) -> Dict[str, float]:
+        """Infer window size and annualization factor from timeframe string."""
+        timeframe_str = str(timeframe or '').lower()
+        bars_per_day = 1
+        try:
+            if timeframe_str.endswith('m'):
+                minutes = max(int(timeframe_str[:-1] or 1), 1)
+                bars_per_day = max(int((24 * 60) / minutes), 1)
+            elif timeframe_str.endswith('h'):
+                hours = max(int(timeframe_str[:-1] or 1), 1)
+                bars_per_day = max(int(24 / hours), 1)
+        except Exception:
+            bars_per_day = 1
+
+        window_size = bars_per_day * 20
+        annual_factor = float((252 * bars_per_day) ** 0.5)
+        return {
+            'bars_per_day': float(bars_per_day),
+            'window_size': int(max(window_size, 1)),
+            'annual_factor': annual_factor
+        }
+
+    def _resolve_cost_per_trade(self, symbol: Optional[str], timeframe: Optional[str]) -> float:
+        """Resolve cost per trade from configuration with sensible fallbacks."""
+        symbol = (symbol or '').upper()
+        timeframe_key = str(timeframe or '').lower()
+        candidate_keys = [
+            f"{symbol}_{timeframe_key}",
+            symbol,
+            timeframe_key,
+            'default'
+        ]
+
+        sources = []
+        try:
+            features_attr = getattr(self.config.features, 'final_metrics_cost_per_trade', None)
+            sources.append(features_attr)
+        except Exception:
+            pass
+
+        try:
+            trading_cfg = getattr(self.config, 'trading', None)
+            if trading_cfg is not None:
+                sources.append(getattr(trading_cfg, 'cost_per_trade', None))
+        except Exception:
+            pass
+
+        for source in sources:
+            value = self._extract_cost_from_container(source, candidate_keys)
+            if value is not None:
+                return value
+
+        return 0.0
+
+    def _extract_cost_from_container(self, container: Any, keys: List[str]) -> Optional[float]:
+        """Attempt to extract a float cost from various container types."""
+        if container is None:
+            return None
+        try:
+            if isinstance(container, (int, float)):
+                return float(container)
+            if isinstance(container, dict):
+                for key in keys:
+                    if key in container:
+                        return float(container[key])
+            if hasattr(container, '__dict__'):
+                for key in keys:
+                    if hasattr(container, key):
+                        return float(getattr(container, key))
+        except Exception:
+            return None
+        return None
+
+    def _resolve_output_timeframe(self, timeframe: Optional[str]) -> str:
+        """Resolve timeframe used for artifact naming and uploads."""
+        timeframe_str = str(timeframe or '').strip().lower()
+        if timeframe_str and timeframe_str != 'unknown':
+            return timeframe_str
+
+        default_target = str(getattr(self.config.features, 'selection_target_column', '') or '').lower()
+        if default_target:
+            parts = default_target.split('_')
+            candidate = parts[-1] if parts else default_target
+            if candidate and candidate[-1] in ('m', 'h', 'd'):
+                return candidate
+
+        return '60m'
 
     def _save_to_database(self, 
                          symbol: str,
@@ -858,8 +1169,11 @@ class FinalModelTrainer:
                           timeframe=timeframe,
                           db_record_id=db_record_id)
             
-            # 1. Generate model name and version
-            model_name = f"catboost_{symbol}_{timeframe}"
+            # 1. Resolve naming components
+            resolved_timeframe = self._resolve_output_timeframe(timeframe)
+            symbol_upper = str(symbol or '').upper()
+            symbol_lower = symbol_upper.lower()
+            model_name_base = f"catboost_{symbol_lower}_{resolved_timeframe}"
             model_version = self._get_next_model_version(symbol, timeframe)
             
             # 2. Save model to temporary file
@@ -867,7 +1181,7 @@ class FinalModelTrainer:
             import os
             
             temp_dir = tempfile.mkdtemp()
-            model_file_path = os.path.join(temp_dir, f"{model_name}_v{model_version}.cbm")
+            model_file_path = os.path.join(temp_dir, f"{model_name_base}_v{model_version}.cbm")
             
             try:
                 # Save CatBoost model
@@ -882,10 +1196,10 @@ class FinalModelTrainer:
             
             # 3. Prepare model information
             model_info = {
-                'model_name': f"{model_name}_v{model_version}",
+                'model_name': f"{model_name_base}_v{model_version}",
                 'model_version': model_version,
-                'symbol': symbol,
-                'timeframe': timeframe,
+                'symbol': symbol_upper,
+                'timeframe': resolved_timeframe,
                 'task_type': task_type,
                 'db_record_id': db_record_id,
                 'created_at': datetime.now().isoformat(),
@@ -928,13 +1242,19 @@ class FinalModelTrainer:
             if upload_success:
                 self._log_info('Model successfully uploaded to R2', 
                               model_name=model_info['model_name'],
-                              symbol=symbol,
-                              r2_path=f"models/{symbol}/{model_info['model_name']}.cbm")
+                              symbol=symbol_upper,
+                              r2_path=f"models/{symbol_upper}/{model_info['model_name']}.cbm")
+                
+                # Clean up GPU memory after successful upload
+                self._cleanup_model_memory(model_results, symbol, timeframe)
                 return True
             else:
                 self._log_error('Failed to upload model to R2', 
                                model_name=model_info['model_name'],
                                symbol=symbol)
+                
+                # Clean up GPU memory even on upload failure
+                self._cleanup_model_memory(model_results, symbol, timeframe)
                 return False
             
         except Exception as e:
@@ -942,4 +1262,12 @@ class FinalModelTrainer:
                            symbol=symbol, 
                            error=str(e),
                            traceback=_tb.format_exc())
+            
+            # Clean up GPU memory even on exception
+            try:
+                self._cleanup_model_memory(model_results, symbol, timeframe)
+            except Exception as cleanup_err:
+                self._log_warn('Memory cleanup failed after R2 upload exception', 
+                              error=str(cleanup_err))
+            
             return False

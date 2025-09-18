@@ -8,13 +8,13 @@ to Cloudflare R2 storage with cleanup functionality.
 import json
 import logging
 import os
-import boto3
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, Any, List, Optional
-from botocore.exceptions import ClientError, NoCredentialsError
 
-from config import get_config
+import boto3
+from botocore.exceptions import ClientError
+
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,33 +24,62 @@ class R2ModelUploader:
     
     def __init__(self):
         """Initialize the R2 model uploader with configuration."""
-        self.config = get_config()
+        self.config = get_settings()
+        self.r2_config = getattr(self.config, 'r2', None)
         self.s3_client = None
+        self._fix_endpoint_url()  # Fix endpoint URL if needed
         self._initialize_s3_client()
-        
+    
+    def _fix_endpoint_url(self) -> None:
+        """Fix endpoint URL if it contains template placeholders."""
+        if self.r2_config is None:
+            return
+            
+        # Check if endpoint_url contains template placeholder
+        if "account_id.r2.cloudflarestorage.com" in self.r2_config.endpoint_url:
+            if self.r2_config.account_id:
+                # Replace template with actual account_id
+                self.r2_config.endpoint_url = f"https://{self.r2_config.account_id}.r2.cloudflarestorage.com"
+                logger.info(f"Fixed R2 endpoint URL to: {self.r2_config.endpoint_url}")
+            else:
+                logger.error("R2 account_id is empty but endpoint_url contains template")
+
     def _initialize_s3_client(self) -> None:
         """Initialize S3 client for R2 connectivity."""
         try:
-            r2_config = self.config.r2
-            
+            if self.r2_config is None:
+                raise RuntimeError("R2 configuration not available")
+
             self.s3_client = boto3.client(
                 's3',
-                endpoint_url=r2_config['endpoint_url'],
-                aws_access_key_id=r2_config['access_key'],
-                aws_secret_access_key=r2_config['secret_key'],
-                region_name=r2_config['region']
+                endpoint_url=self.r2_config.endpoint_url,
+                aws_access_key_id=self.r2_config.access_key,
+                aws_secret_access_key=self.r2_config.secret_key,
+                region_name=self.r2_config.region or 'auto'
             )
-            
-            # Test connection
-            self.s3_client.list_objects_v2(
-                Bucket=r2_config['bucket_name'],
-                MaxKeys=1
+
+            # Test connection (non-fatal if bucket empty)
+            try:
+                self.s3_client.list_objects_v2(
+                    Bucket=self.r2_config.bucket_name,
+                    MaxKeys=1
+                )
+            except ClientError as e:
+                # Allow NoSuchBucket or AccessDenied to surface
+                raise e
+
+            logger.info(
+                "R2 S3 client initialized successfully for bucket: %s",
+                self.r2_config.bucket_name
             )
-            
-            logger.info(f"R2 S3 client initialized successfully for bucket: {r2_config['bucket_name']}")
-            
+
         except Exception as e:
             logger.error(f"Failed to initialize R2 S3 client: {e}")
+            logger.error(f"R2 Config - account_id: {getattr(self.r2_config, 'account_id', 'MISSING')}")
+            logger.error(f"R2 Config - endpoint_url: {getattr(self.r2_config, 'endpoint_url', 'MISSING')}")
+            logger.error(f"R2 Config - bucket_name: {getattr(self.r2_config, 'bucket_name', 'MISSING')}")
+            logger.error(f"R2 Config - access_key: {'***' if getattr(self.r2_config, 'access_key', None) else 'MISSING'}")
+            logger.error(f"R2 Config - secret_key: {'***' if getattr(self.r2_config, 'secret_key', None) else 'MISSING'}")
             self.s3_client = None
             raise
     
@@ -61,17 +90,19 @@ class R2ModelUploader:
         Returns:
             bool: True if credentials are valid, False otherwise
         """
-        if not self.s3_client:
+        if not self.s3_client or self.r2_config is None:
             logger.error("S3 client not initialized")
             return False
-            
-        required_fields = ['account_id', 'access_key', 'secret_key', 'bucket_name']
-        
-        for field in required_fields:
-            if not self.config.r2.get(field):
-                logger.error(f"Missing R2 configuration field: {field}")
-                return False
-        
+
+        missing = []
+        for field in ['account_id', 'access_key', 'secret_key', 'bucket_name', 'endpoint_url']:
+            if not getattr(self.r2_config, field, None):
+                missing.append(field)
+
+        if missing:
+            logger.error(f"Missing R2 configuration fields: {missing}")
+            return False
+
         logger.debug("R2 credentials validation passed")
         return True
     
@@ -94,11 +125,12 @@ class R2ModelUploader:
         Returns:
             Dict[str, Any]: Complete model metadata
         """
+        symbol = str(model_info.get("symbol", "")).upper()
         metadata = {
             # Model identification
             "model_name": model_info["model_name"],
             "model_version": model_info["model_version"],
-            "symbol": model_info["symbol"],
+            "symbol": symbol,
             "timeframe": model_info.get("timeframe", "1H"),
             "created_at": datetime.now().isoformat(),
             
@@ -145,7 +177,7 @@ class R2ModelUploader:
                 "model_file": f"{model_info['model_name']}.cbm",
                 "metadata_file": f"{model_info['model_name']}_metadata.json",
                 "upload_timestamp": datetime.now().isoformat(),
-                "r2_path": f"models/{model_info['symbol']}/",
+                "r2_path": f"models/{symbol}/",
                 "size_bytes": None  # Will be filled after upload
             }
         }
@@ -173,7 +205,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return False
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.r2_config.bucket_name
             
             # Prepare upload arguments
             upload_args = {}
@@ -206,8 +238,17 @@ class R2ModelUploader:
                 logger.error(f"Upload verification failed for {r2_key}: {e}")
                 return False
             
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            logger.error(f"AWS/R2 ClientError uploading {local_file_path}: {error_code} - {error_message}")
+            logger.error(f"Error details: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to upload {local_file_path} to R2: {e}")
+            logger.error(f"Error type: {type(e).__name__}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             return False
     
     def upload_model(
@@ -247,9 +288,9 @@ class R2ModelUploader:
             )
             
             # Define R2 paths
-            symbol = model_info["symbol"]
+            symbol = str(model_info["symbol"]).upper()
             model_name = model_info["model_name"]
-            
+
             model_r2_key = f"models/{symbol}/{model_name}.cbm"
             metadata_r2_key = f"models/{symbol}/{model_name}_metadata.json"
             
@@ -292,7 +333,7 @@ class R2ModelUploader:
                 return False
             
             # Update metadata with file size information
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.r2_config.bucket_name
             try:
                 model_response = self.s3_client.head_object(
                     Bucket=bucket_name,
@@ -339,7 +380,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return []
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.r2_config.bucket_name
             prefix = f"models/{symbol}/" if symbol else "models/"
             
             response = self.s3_client.list_objects_v2(
@@ -390,7 +431,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return None
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.r2_config.bucket_name
             metadata_key = f"models/{symbol}/{model_name}_metadata.json"
             
             response = self.s3_client.get_object(
@@ -423,7 +464,7 @@ class R2ModelUploader:
             if not self._validate_r2_credentials():
                 return False
             
-            bucket_name = self.config.r2['bucket_name']
+            bucket_name = self.r2_config.bucket_name
             model_key = f"models/{symbol}/{model_name}.cbm"
             metadata_key = f"models/{symbol}/{model_name}_metadata.json"
             
