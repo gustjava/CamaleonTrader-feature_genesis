@@ -143,7 +143,7 @@ features:
   # Statistical tests parameters
   distance_corr_max_samples: 20000
   distance_corr_tile_size: 2048
-  selection_target_column: y_ret_fwd_15m
+  selection_target_column: y_ret_fwd_60m
   # Optional list to run multi-target sweep (per run, per pair)
   selection_target_columns: []
   dcor_top_k: 50
@@ -176,19 +176,38 @@ features:
   stage3_catboost_thread_count: 1
   stage3_catboost_loss_regression: RMSE
   stage3_catboost_loss_classification: Logloss
+  # Enhanced CatBoost parameters for better regularization
+  stage3_catboost_l2_leaf_reg: 10           # Regularização L2 para evitar overfitting
+  stage3_catboost_bootstrap_type: Bernoulli # Bootstrap robusto
+  stage3_catboost_subsample: 0.7           # Subsample para regularização
   # Walkforward / temporal validation for embedded CatBoost selection
   stage3_cv_splits: 5                       # Use TimeSeriesSplit with K folds (>=2 enables aggregation)
   stage3_cv_min_train: 200                  # Minimum rows in each training fold
-  stage3_catboost_early_stopping_rounds: 50 # Enable early stopping on validation fold
+  stage3_catboost_early_stopping_rounds: 100 # Aumentado para não cortar prematuramente
   # Data usage control for embedded stage
   stage3_catboost_use_full_dataset: true    # Use full dataset (disable selection_max_rows sampling)
+  
+  # Vol-scaling target configuration
+  enable_vol_scaling: true                  # Enable volatility-adjusted targets
+  vol_scaling_method: garch                 # garch|realized_vol|rolling_std
+  vol_scaling_window: 60                    # Window for volatility estimation
+  vol_scaling_min_vol: 1e-6                # Minimum volatility to avoid division by zero
+  
+  # Enhanced feature selection stability
+  feature_selection_stability: true        # Enable stability-based selection
+  stability_threshold: 0.65                # Keep features present in >= 65% of folds
+  enable_mrmr_diversification: true        # Apply mRMR for diversity post-ranking
+  mrmr_k: 30                               # Top-k features for mRMR
+  
+  # Post-selection validation
+  stage3_enable_post_validation: true      # Re-train with selected features for real performance metrics
   # Force GPU usage for all stages
   force_gpu_usage: true
   gpu_fallback_enabled: false  # Disable CPU fallbacks to force GPU usage
   # Stage 3 embedded selector (SelectFromModel)
   stage3_selector_method: selectfrommodel   # wrappers|selectfrommodel
   stage3_importance_type: gain              # gain|split|weight (backend-dependent)
-  stage3_importance_threshold: median       # 'median' or numeric value
+  stage3_importance_threshold: 0.75        # Percentil 75% em vez de median para seleção mais rigorosa
   stage3_save_importances_format: json      # json|parquet
   # Stage 3 sampling/labels controls
   stage3_stratified_sampling: true
@@ -401,6 +420,10 @@ features:
   mi_cluster_threshold: 0.3
   mi_max_candidates: 400
   mi_chunk_size: 128
+  # MI backend options: 'cpu' (sklearn) or 'gpu_hist' (CuPy histogram-based on GPU)
+  mi_backend: cpu
+  mi_gpu_bins: 64
+  mi_use_dask_gpu: true
   cpcv_enabled: true
   cpcv_n_groups: 10
   cpcv_k_leave_out: 2
@@ -536,7 +559,7 @@ monitoring:
 # Output Configuration
 # Data output settings and file formats
 output:
-  output_path: "./output"
+  output_path: "./parquet"
   compression: "lz4"
   format: "parquet"
   version: 2

@@ -152,7 +152,7 @@ class FeatureConfig:
     distance_corr_max_samples: int = 10000
     distance_corr_tile_size: int = 2048
     # Selection stage (Stage 1) and dCor extras
-    selection_target_column: str = "y_ret_1m"
+    selection_target_column: str = "y_ret_fwd_60m"
     selection_target_columns: List[str] = field(default_factory=list)
     dcor_top_k: int = 50
     dcor_include_permutation: bool = True
@@ -279,6 +279,10 @@ class FeatureConfig:
     mi_cluster_threshold: float = 0.3
     mi_max_candidates: int = 400
     mi_chunk_size: int = 128
+    # MI backend configuration
+    mi_backend: str = "cpu"            # 'cpu' (sklearn) or 'gpu_hist'
+    mi_gpu_bins: int = 64               # number of bins for histogram MI on GPU
+    mi_use_dask_gpu: bool = False       # reserved: parallelize MI tasks with dask (GPU workers)
     # CPCV controls
     cpcv_enabled: bool = True
     cpcv_n_groups: int = 6

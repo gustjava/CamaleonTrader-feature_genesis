@@ -206,6 +206,26 @@ class StatisticalTests(BaseFeatureEngine):
             self.mi_cluster_threshold = float(getattr(uc.features, 'mi_cluster_threshold', 0.3))
             self.mi_max_candidates = int(getattr(uc.features, 'mi_max_candidates', 400))
             self.mi_chunk_size = int(getattr(uc.features, 'mi_chunk_size', 128))
+            # MI backend selection (CPU vs GPU)
+            self.mi_backend = str(getattr(uc.features, 'mi_backend', 'cpu'))
+            self.mi_gpu_bins = int(getattr(uc.features, 'mi_gpu_bins', 64))
+            self.mi_use_dask_gpu = bool(getattr(uc.features, 'mi_use_dask_gpu', False))
+
+            # Propagate MI-related configs to FeatureSelection
+            try:
+                fs = self.feature_selection
+                for _name in [
+                    'mi_cluster_enabled', 'mi_cluster_method', 'mi_cluster_threshold',
+                    'mi_max_candidates', 'mi_chunk_size',
+                    'mi_backend', 'mi_gpu_bins', 'mi_use_dask_gpu',
+                    'mi_threshold',
+                ]:
+                    try:
+                        setattr(fs, _name, getattr(self, _name))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             
         except Exception:
             # Fallback defaults when unified config is not available

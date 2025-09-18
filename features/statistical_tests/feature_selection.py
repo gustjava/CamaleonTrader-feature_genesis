@@ -28,6 +28,15 @@ class FeatureSelection:
         self.mi_max_candidates = mi_max_candidates
         self.mi_chunk_size = mi_chunk_size
         self.mi_cluster_threshold = mi_cluster_threshold
+        # MI backend defaults (controller may override via setattr)
+        try:
+            self.mi_backend = getattr(self, 'mi_backend', 'cpu')
+            self.mi_gpu_bins = int(getattr(self, 'mi_gpu_bins', 64))
+            self.mi_use_dask_gpu = bool(getattr(self, 'mi_use_dask_gpu', False))
+        except Exception:
+            self.mi_backend = 'cpu'
+            self.mi_gpu_bins = 64
+            self.mi_use_dask_gpu = False
     
     def _log_info(self, message: str, **kwargs):
         """Log info message with optional context."""
@@ -51,58 +60,92 @@ class FeatureSelection:
 
 
     def _compute_mi_redundancy(self, X_df, candidates: List[str], dcor_scores: Dict[str, float], mi_threshold: float) -> List[str]:
-        """Remove non-linear redundancy via pairwise MI (keeps higher dCor in pair)."""
-        try:
-            from sklearn.feature_selection import mutual_info_regression  # Import MI computation
-        except Exception as e:
-            self._critical_error("MI not available for redundancy computation", error=str(e))
-            return candidates  # unreachable
+        """Remove non-linear redundancy via pairwise MI (keeps higher dCor in pair).
 
-        keep = set(candidates)  # Start with all candidates
-        # Cap number of pairs (quadratic); if large, limit candidates
-        max_cands = min(len(candidates), 200)  # Limit to 200 candidates for performance
-        cand_limited = candidates[:max_cands]  # Take first max_cands candidates
-        # Drop rows with NaNs across selected columns to satisfy sklearn
+        Backend controlled by self.mi_backend: 'cpu' (sklearn) or 'gpu_hist'.
+        """
+        backend = str(getattr(self, 'mi_backend', 'cpu')).lower()
+
+        keep = set(candidates)
+        max_cands = min(len(candidates), 200)
+        cand_limited = candidates[:max_cands]
+        # Drop NaNs across selected columns
         try:
             X_sub = X_df[cand_limited].dropna()
         except Exception as e:
             self._critical_error("Failed to drop NaNs for MI redundancy", error=str(e))
             X_sub = X_df[cand_limited]
-        # Ensure CPU NumPy array for sklearn
+
+        # CPU path using sklearn
+        if backend == 'cpu':
+            try:
+                from sklearn.feature_selection import mutual_info_regression
+            except Exception as e:
+                self._critical_error("MI not available for redundancy computation", error=str(e))
+                return candidates
+            # Ensure CPU numpy
+            try:
+                import cudf as _cudf
+                if isinstance(X_sub, _cudf.DataFrame):
+                    X = X_sub.to_pandas().values
+                else:
+                    X = X_sub.values
+            except Exception:
+                try:
+                    X = X_sub.to_pandas().values
+                except Exception as e:
+                    self._critical_error("Failed to build CPU matrix for MI redundancy", error=str(e))
+            n = len(cand_limited)
+            for i in range(n):
+                if cand_limited[i] not in keep:
+                    continue
+                try:
+                    y = X[:, i]
+                    mi = mutual_info_regression(X, y, discrete_features=False)
+                except Exception as e:
+                    self._critical_error("MI row failed", feature=cand_limited[i], error=str(e))
+                for j in range(i + 1, n):
+                    f_i, f_j = cand_limited[i], cand_limited[j]
+                    if f_i in keep and f_j in keep and float(mi[j]) >= float(mi_threshold):
+                        if dcor_scores.get(f_i, 0.0) >= dcor_scores.get(f_j, 0.0):
+                            keep.discard(f_j)
+                            self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi[j]), 4))
+                        else:
+                            keep.discard(f_i)
+                            self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
+            return list(keep)
+
+        # GPU histogram path
         try:
             import cudf as _cudf
-            if isinstance(X_sub, _cudf.DataFrame):
-                X = X_sub.to_pandas().values
-            else:
-                X = X_sub.values  # pandas/NumPy path
-        except Exception:
-            # Fallback try without cudf import
-            try:
-                X = X_sub.to_pandas().values
-            except Exception as e:
-                self._critical_error("Failed to build CPU matrix for MI redundancy", error=str(e))
+            if not isinstance(X_sub, _cudf.DataFrame):
+                X_sub = _cudf.from_pandas(X_sub)
+        except Exception as e:
+            self._log_warn("GPU MI backend unavailable, falling back to CPU", error=str(e))
+            setattr(self, 'mi_backend', 'cpu')
+            return self._compute_mi_redundancy(X_df, candidates, dcor_scores, mi_threshold)
+
+        bins = int(getattr(self, 'mi_gpu_bins', 64))
         n = len(cand_limited)
-        # Compute pairwise MI approx: MI(X_i, X_j) by treating one as target
-        for i in range(n):  # For each feature as target
-            if cand_limited[i] not in keep:  # Skip if already removed
+        for i in range(n):
+            if cand_limited[i] not in keep:
                 continue
-            try:
-                y = X[:, i]  # Target feature
-                mi = mutual_info_regression(X, y, discrete_features=False)  # Compute MI with all features
-            except Exception as e:
-                self._critical_error("MI row failed", feature=cand_limited[i], error=str(e))
-                # unreachable
-            for j in range(i + 1, n):  # Compare with remaining features
+            y_series = X_sub[cand_limited[i]].astype('f4')
+            mi_vec = []
+            for j in range(n):
+                x_series = X_sub[cand_limited[j]].astype('f4')
+                mi_val = self._mi_two_continuous_hist_gpu(x_series, y_series, bins=bins)
+                mi_vec.append(mi_val)
+            for j in range(i + 1, n):
                 f_i, f_j = cand_limited[i], cand_limited[j]
-                if f_i in keep and f_j in keep and mi[j] >= mi_threshold:  # If both features still exist and MI above threshold
-                    # Remove the one with lower dCor
+                if f_i in keep and f_j in keep and float(mi_vec[j]) >= float(mi_threshold):
                     if dcor_scores.get(f_i, 0.0) >= dcor_scores.get(f_j, 0.0):
-                        keep.discard(f_j)  # Remove feature with lower dCor
-                        self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi[j]), 4))
+                        keep.discard(f_j)
+                        self._log_info("MI redundancy removal (GPU)", pair=f"{f_i},{f_j}", kept=f_i, removed=f_j, mi=round(float(mi_vec[j]), 4))
                     else:
-                        keep.discard(f_i)  # Remove feature with lower dCor
-                        self._log_info("MI redundancy removal", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi[j]), 4))
-        return list(keep)  # Return remaining features
+                        keep.discard(f_i)
+                        self._log_info("MI redundancy removal (GPU)", pair=f"{f_i},{f_j}", kept=f_j, removed=f_i, mi=round(float(mi_vec[j]), 4))
+        return list(keep)
 
     def _compute_mi_cluster_representatives(self, X_df, candidates: List[str], dcor_scores: Dict[str, float]) -> List[str]:
         """Clustering global por MI para reduzir redundância (escalável).
@@ -113,13 +156,20 @@ class FeatureSelection:
           com `distance_threshold` derivado de `mi_cluster_threshold`.
         - Seleciona 1 representante por cluster (maior dCor do Estágio 1).
         """
+        import numpy as np
+        backend = str(getattr(self, 'mi_backend', 'cpu')).lower()
+        use_gpu = backend in ("gpu", "gpu_hist")
+        if backend == 'cpu':
+            try:
+                from sklearn.feature_selection import mutual_info_regression
+            except Exception as e:
+                self._critical_error("MI clustering unavailable (sklearn)", error=str(e))
+                return self._compute_mi_redundancy(X_df, candidates, dcor_scores, mi_threshold=float(self.mi_threshold))
         try:
-            import numpy as np
-            from sklearn.feature_selection import mutual_info_regression
             from sklearn.cluster import AgglomerativeClustering
         except Exception as e:
-            self._critical_error("MI clustering unavailable", error=str(e))
-            return self._compute_mi_redundancy(X_df, candidates, dcor_scores, mi_threshold=float(self.mi_threshold))  # unreachable
+            self._critical_error("AgglomerativeClustering unavailable", error=str(e))
+            return candidates
 
         if len(candidates) <= 2:
             return candidates
@@ -131,26 +181,35 @@ class FeatureSelection:
             ordered = list(candidates)
         max_c = max(2, int(self.mi_max_candidates))
         cand = ordered[:min(len(ordered), max_c)]
-        # Drop rows with NaNs across selected columns to satisfy sklearn
+        # Drop rows with NaNs across selected columns
         try:
             X_sub = X_df[cand].dropna()
         except Exception as e:
             self._critical_error("Failed to drop NaNs for MI clustering", error=str(e))
             X_sub = X_df[cand]
-        # Ensure CPU NumPy array for sklearn
-        try:
-            import cudf as _cudf
-            if isinstance(X_sub, _cudf.DataFrame):
-                X = X_sub.to_pandas().values
-            else:
-                X = X_sub.values
-        except Exception:
+        # Prepare CPU/GPU data structures
+        if use_gpu:
             try:
-                X = X_sub.to_pandas().values
+                import cudf as _cudf
+                if not isinstance(X_sub, _cudf.DataFrame):
+                    X_sub = _cudf.from_pandas(X_sub)
             except Exception as e:
-                self._critical_error("Failed to build CPU matrix for MI clustering", error=str(e))
-        n = X.shape[0]
-        p = X.shape[1]
+                self._log_warn("GPU MI backend unavailable for clustering; falling back to CPU", error=str(e))
+                use_gpu = False
+        if not use_gpu:
+            try:
+                import cudf as _cudf
+                if isinstance(X_sub, _cudf.DataFrame):
+                    X = X_sub.to_pandas().values
+                else:
+                    X = X_sub.values
+            except Exception:
+                try:
+                    X = X_sub.to_pandas().values
+                except Exception as e:
+                    self._critical_error("Failed to build CPU matrix for MI clustering", error=str(e))
+        n = len(X_sub)
+        p = len(cand)
         if p < 2:
             return cand
 
@@ -161,25 +220,41 @@ class FeatureSelection:
         nb = int(np.ceil(p / chunk))
         total_blocks = nb * nb
         done_blocks = 0
-        for i0 in range(0, p, chunk):
-            i1 = min(i0 + chunk, p)
-            Xi = X[:, i0:i1]
-            for j0 in range(0, p, chunk):
-                j1 = min(j0 + chunk, p)
-                Xj = X[:, j0:j1]
-                # compute MI for block pairs: MI(Xi_k, Xj_l)
-                for ii in range(i0, i1):
-                    try:
-                        y = X[:, ii]
-                        mi_block = mutual_info_regression(X[:, j0:j1], y, discrete_features=False)
-                    except Exception as e:
-                        self._critical_error("MI block failed", i=int(ii), j0=int(j0), j1=int(j1), error=str(e))
-                        # unreachable
-                    MI[ii, j0:j1] = np.maximum(MI[ii, j0:j1], mi_block.astype(np.float32))
-                done_blocks += 1
-                # Log progress roughly every 10% of blocks
-                if total_blocks >= 10 and done_blocks % max(1, total_blocks // 10) == 0:
-                    self._log_info("MI blocks progress", done=done_blocks, total=total_blocks)
+        if not use_gpu:
+            from sklearn.feature_selection import mutual_info_regression
+            for i0 in range(0, p, chunk):
+                i1 = min(i0 + chunk, p)
+                for j0 in range(0, p, chunk):
+                    j1 = min(j0 + chunk, p)
+                    for ii in range(i0, i1):
+                        try:
+                            y = X[:, ii]
+                            mi_block = mutual_info_regression(X[:, j0:j1], y, discrete_features=False)
+                        except Exception as e:
+                            self._critical_error("MI block failed", i=int(ii), j0=int(j0), j1=int(j1), error=str(e))
+                        MI[ii, j0:j1] = np.maximum(MI[ii, j0:j1], np.asarray(mi_block, dtype=np.float32))
+                    done_blocks += 1
+                    if total_blocks >= 10 and done_blocks % max(1, total_blocks // 10) == 0:
+                        self._log_info("MI blocks progress", done=done_blocks, total=total_blocks)
+        else:
+            bins = int(getattr(self, 'mi_gpu_bins', 64))
+            for i0 in range(0, p, chunk):
+                i1 = min(i0 + chunk, p)
+                for j0 in range(0, p, chunk):
+                    j1 = min(j0 + chunk, p)
+                    for ii in range(i0, i1):
+                        y_col = cand[ii]
+                        y_series = X_sub[y_col].astype('f4')
+                        vals = []
+                        for jj in range(j0, j1):
+                            x_col = cand[jj]
+                            x_series = X_sub[x_col].astype('f4')
+                            mi_val = self._mi_two_continuous_hist_gpu(x_series, y_series, bins=bins)
+                            vals.append(mi_val)
+                        MI[ii, j0:j1] = np.maximum(MI[ii, j0:j1], np.asarray(vals, dtype=np.float32))
+                    done_blocks += 1
+                    if total_blocks >= 10 and done_blocks % max(1, total_blocks // 10) == 0:
+                        self._log_info("MI blocks progress (GPU)", done=done_blocks, total=total_blocks)
         # Symmetrize by average
         MI = 0.5 * (MI + MI.T)
 
@@ -248,6 +323,44 @@ class FeatureSelection:
                       kept_features=reps)
         
         return reps
+
+    # ---------------- GPU MI helpers ----------------
+    def _mi_two_continuous_hist_gpu(self, x_series, y_series, bins: int = 64) -> float:
+        """Approximate mutual information I(X;Y) via 2D histogram on GPU.
+
+        Works for continuous variables by binning both axes. Requires CuPy available.
+        """
+        try:
+            import cupy as cp
+            try:
+                x = x_series.to_cupy()
+            except Exception:
+                x = cp.asarray(x_series)
+            try:
+                y = y_series.to_cupy()
+            except Exception:
+                y = cp.asarray(y_series)
+            m = cp.isfinite(x) & cp.isfinite(y)
+            x = x[m].astype(cp.float32, copy=False)
+            y = y[m].astype(cp.float32, copy=False)
+            if x.size == 0 or y.size == 0:
+                return 0.0
+            H, _, _ = cp.histogram2d(x, y, bins=bins)
+            H = H.astype(cp.float32)
+            total = H.sum()
+            if float(total) <= 0.0:
+                return 0.0
+            pxy = H / total
+            px = pxy.sum(axis=1)
+            py = pxy.sum(axis=0)
+            eps = cp.float32(1e-12)
+            num = pxy + eps
+            den = (px[:, None] + eps) * (py[None, :] + eps)
+            mi = cp.sum(num * cp.log(num / den))
+            return float(mi)
+        except Exception as e:
+            self._log_warn("GPU histogram MI failed", error=str(e))
+            return 0.0
 
     def _to_cupy_matrix(self, gdf: cudf.DataFrame, cols: List[str], dtype: str = 'f4') -> Tuple[cp.ndarray, List[str]]:
         """Build a CuPy matrix (n_rows x n_cols) from cuDF columns without CPU copies.
@@ -873,10 +986,12 @@ class FeatureSelection:
         
         # Check for errors in aggregated metrics
         if agg_metrics:
-            for m in agg_metrics:
+            for i, m in enumerate(agg_metrics):
                 if isinstance(m, dict) and 'error' in m:
                     has_errors = True
-                    error_messages.append(m.get('error', 'unknown error'))
+                    error_msg = m.get('error', 'unknown error')
+                    error_type = m.get('error_type', 'unknown')
+                    error_messages.append(f"CV fold {i}: {error_type} - {error_msg}")
         
         # Check if all importances are uniform (indicates failure)
         if agg_fi is not None:
@@ -885,7 +1000,8 @@ class FeatureSelection:
                 # Check if all values are identical (uniform)
                 if np.allclose(fi_array, fi_array[0], rtol=1e-10):
                     has_errors = True
-                    error_messages.append('uniform feature importances detected')
+                    uniform_msg = f'uniform feature importances detected (all={fi_array[0]:.6f})'
+                    error_messages.append(uniform_msg)
         
         # Update backend status based on error detection
         if has_errors:
@@ -901,6 +1017,133 @@ class FeatureSelection:
         thr_cfg = getattr(self, 'stage3_importance_threshold', 'median')
         threshold = self._parse_importance_threshold(thr_cfg, list(importances.values()))
         selected = [f for f, v in importances.items() if float(v) >= float(threshold)]
+
+        # Post-selection validation: re-train with only selected features
+        post_selection_metrics = {}
+        enable_post_validation = bool(getattr(self, 'stage3_enable_post_validation', True))
+        
+        if enable_post_validation and selected and len(selected) > 0 and len(selected) < len(candidates):
+            try:
+                self._log_info('Starting post-selection validation', selected_features=len(selected), original_features=len(candidates))
+                
+                # Re-train model with only selected features
+                X_selected = X[:, [i for i, feat in enumerate(candidates) if feat in selected]]
+                selected_candidates = [feat for feat in candidates if feat in selected]
+                
+                # Quick single-fold validation with selected features only
+                if X_selected.shape[1] > 0:
+                    # Use same model configuration but with selected features
+                    if task == 'classification':
+                        model_selected = CatBoostClassifier(
+                            iterations=min(iterations, 200),  # Faster validation
+                            learning_rate=learning_rate,
+                            depth=depth if depth > 0 else 6,
+                            random_seed=random_state,
+                            task_type=task_type,
+                            devices=devices,
+                            loss_function=loss_function,
+                            eval_metric=eval_metric,
+                            verbose=0,
+                            thread_count=thread_count,
+                            l2_leaf_reg=l2_leaf_reg,
+                            bootstrap_type=bootstrap_type,
+                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                        )
+                    else:
+                        model_selected = CatBoostRegressor(
+                            iterations=min(iterations, 200),  # Faster validation
+                            learning_rate=learning_rate,
+                            depth=depth if depth > 0 else 6,
+                            random_seed=random_state,
+                            task_type=task_type,
+                            devices=devices,
+                            loss_function=loss_fn,
+                            eval_metric=loss_fn,
+                            verbose=0,
+                            thread_count=thread_count,
+                            l2_leaf_reg=l2_leaf_reg,
+                            bootstrap_type=bootstrap_type,
+                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                        )
+                    
+                    # Create pools with selected features
+                    pool_selected = _Pool(X_selected, y, feature_names=selected_candidates)
+                    
+                    # Train with selected features
+                    model_selected.fit(pool_selected)
+                    
+                    # Predict and calculate metrics
+                    pred_selected = model_selected.predict(pool_selected)
+                    
+                    # Basic metrics for comparison
+                    if task == 'classification':
+                        from sklearn.metrics import accuracy_score, f1_score
+                        post_selection_metrics['post_accuracy'] = float(accuracy_score(y, pred_selected))
+                        post_selection_metrics['post_f1'] = float(f1_score(y, pred_selected, average='weighted', zero_division=0))
+                        post_selection_metrics['post_score'] = post_selection_metrics['post_f1']
+                    else:
+                        from sklearn.metrics import r2_score, mean_squared_error
+                        post_selection_metrics['post_r2'] = float(r2_score(y, pred_selected))
+                        post_selection_metrics['post_mse'] = float(mean_squared_error(y, pred_selected))
+                        post_selection_metrics['post_rmse'] = float(np.sqrt(post_selection_metrics['post_mse']))
+                        post_selection_metrics['post_score'] = post_selection_metrics['post_r2']
+                        
+                        # Advanced trading metrics for selected features
+                        try:
+                            from utils.trading_metrics import TradingMetrics
+                            trading_metrics_selected = TradingMetrics(logger=self.logger)
+                            
+                            pred_selected_adv = pred_selected if isinstance(pred_selected, np.ndarray) else np.array(pred_selected)
+                            y_adv = y if isinstance(y, np.ndarray) else np.array(y)
+                            
+                            selected_advanced_metrics = trading_metrics_selected.compute_comprehensive_metrics(
+                                predictions=pred_selected_adv,
+                                targets=y_adv,
+                                prefix="post_selected"
+                            )
+                            
+                            post_selection_metrics.update(selected_advanced_metrics)
+                            
+                            # Log comparison
+                            trading_metrics_selected.log_comprehensive_metrics(
+                                selected_advanced_metrics, 
+                                f"CatBoost Post-Selection ({len(selected)} features)"
+                            )
+                            
+                        except Exception as adv_err:
+                            self._log_warn('Advanced metrics failed for selected features', error=str(adv_err))
+                    
+                    # Performance comparison
+                    original_score = model_score
+                    selected_score = post_selection_metrics['post_score']
+                    performance_drop = original_score - selected_score
+                    performance_drop_pct = (performance_drop / max(abs(original_score), 1e-8)) * 100
+                    
+                    post_selection_metrics.update({
+                        'features_reduction': len(candidates) - len(selected),
+                        'features_reduction_pct': ((len(candidates) - len(selected)) / len(candidates)) * 100,
+                        'performance_drop': performance_drop,
+                        'performance_drop_pct': performance_drop_pct,
+                        'original_score': original_score,
+                        'selected_score': selected_score,
+                        'efficiency_ratio': selected_score / len(selected) if len(selected) > 0 else 0.0
+                    })
+                    
+                    self._log_info('Post-selection validation completed',
+                                   original_features=len(candidates),
+                                   selected_features=len(selected),
+                                   original_score=round(original_score, 6),
+                                   selected_score=round(selected_score, 6),
+                                   performance_drop=round(performance_drop, 6),
+                                   performance_drop_pct=round(performance_drop_pct, 2))
+                    
+            except Exception as post_err:
+                self._log_warn('Post-selection validation failed', error=str(post_err))
+                post_selection_metrics['post_validation_error'] = str(post_err)
+        
+        # Merge post-selection metrics into final metrics
+        if post_selection_metrics:
+            final_metrics.update(post_selection_metrics)
 
         # Log summary
         self._log_info('CatBoost feature selection completed',

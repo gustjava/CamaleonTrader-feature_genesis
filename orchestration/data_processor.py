@@ -111,6 +111,15 @@ class DataProcessor:
                 if sel_path:
                     uploaded = self._upload_selected_features_to_r2(sel_path, currency_pair)
                     logger.info(f"Selected-feature parquet upload: {'OK' if uploaded else 'SKIPPED/FAILED'}")
+                    
+                    # Create and upload metadata JSON
+                    try:
+                        json_path = self._create_export_metadata_json(currency_pair, sel_path)
+                        if json_path:
+                            json_uploaded = self._upload_metadata_json_to_r2(json_path, currency_pair)
+                            logger.info(f"Export metadata JSON upload: {'OK' if json_uploaded else 'SKIPPED/FAILED'}")
+                    except Exception as json_e:
+                        logger.warning(f"Could not create/upload metadata JSON for {currency_pair}: {json_e}")
             except Exception as _e:
                 logger.warning(f"Could not export/upload selected-feature parquet for {currency_pair}: {_e}")
             
@@ -680,7 +689,12 @@ class DataProcessor:
                         # Feature importance types
                         if 'feature_importance_types' in e_detailed_metrics:
                             fi_types = e_detailed_metrics['feature_importance_types']
-                            logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {list(fi_types.keys())}")
+                            if isinstance(fi_types, dict):
+                                logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {list(fi_types.keys())}")
+                            elif isinstance(fi_types, list):
+                                logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {fi_types}")
+                            else:
+                                logger.info(f"[StatTests]   🎯 Feature Importance Types Available: {str(fi_types)}")
                     
                     # Log all winning features with their CatBoost importance scores
                     if e_out and e_importances:
@@ -756,6 +770,298 @@ class DataProcessor:
             logger.info("[StatTests] ✅ FEATURE SELECTION COMPLETED")
 
         return ddf
+
+    def _get_selected_features(self) -> list:
+        """Retrieve the final feature list selected by Stage 3 (CatBoost)."""
+        try:
+            feats = getattr(self.stats, '_last_embedded_selected', None)
+            if feats:
+                return list(feats)
+        except Exception:
+            pass
+        try:
+            # Fallback: infer from importances map if available
+            imps = getattr(self.stats, '_last_importances', None) or {}
+            if imps:
+                # Keep all keys as 'selected'
+                return list(imps.keys())
+        except Exception:
+            pass
+        return []
+
+    def _export_selected_features_parquet_cudf(self, gdf: cudf.DataFrame, currency_pair: str) -> str:
+        """Create a single parquet with timestamp + CatBoost-selected features and return local path.
+
+        Returns empty string if nothing was written.
+        """
+        try:
+            selected = self._get_selected_features()
+            if not selected:
+                logger.warning(f"No CatBoost-selected features found for {currency_pair}; skipping model parquet export")
+                return ""
+            # Ensure timestamp + target + selected features (only those that exist)
+            cols = []
+            time_col = 'timestamp'
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+            
+            if time_col in gdf.columns:
+                cols.append(time_col)
+            if target_col in gdf.columns:
+                cols.append(target_col)
+            
+            missing = []
+            for c in selected:
+                if c in gdf.columns and c not in cols:
+                    cols.append(c)
+                else:
+                    if c not in gdf.columns:
+                        missing.append(c)
+            if missing:
+                logger.info(f"Some selected features missing in frame (ignored): {missing[:10]}{'...' if len(missing)>10 else ''}")
+            
+            logger.info(f"Exporting {len(cols)} columns for {currency_pair}: timestamp + target ({target_col}) + {len(selected)} selected features")
+            if len(cols) <= 2:  # Need at least timestamp + target + some features
+                logger.warning(f"No valid selected features to export for {currency_pair} (only {len(cols)} columns)")
+                return ""
+
+            # Arrange output path: place at output root for easy pickup
+            import os
+            import pyarrow.parquet as pq
+            out_root = self.settings.output.output_path
+            os.makedirs(out_root, exist_ok=True)
+            out_file = os.path.join(out_root, f"{currency_pair}_{target_col}.parquet")
+
+            # Convert to Arrow Table and write single parquet
+            try:
+                table = gdf[cols].to_arrow()
+            except Exception:
+                # Fallback via pandas
+                table = gdf[cols].to_pandas().to_arrow()
+            pq.write_table(table, out_file, compression='snappy')
+            logger.info(f"Exported CatBoost-selected features parquet: {out_file}")
+            return out_file
+        except Exception as e:
+            logger.error(f"Failed to export selected features parquet for {currency_pair}: {e}")
+            return ""
+
+    def _export_selected_features_parquet_dask(self, ddf, currency_pair: str) -> str:
+        """Create a single parquet with timestamp + selected features from Dask-cuDF DataFrame.
+
+        Streams partitions to a single file to avoid collecting the full dataset.
+        Returns empty string if nothing was written.
+        """
+        try:
+            selected = self._get_selected_features()
+            if not selected:
+                logger.warning(f"No CatBoost-selected features found for {currency_pair}; skipping model parquet export (Dask)")
+                return ""
+            cols = []
+            time_col = 'timestamp'
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+            cols_exist = set(list(ddf.columns))
+            
+            if time_col in cols_exist:
+                cols.append(time_col)
+            if target_col in cols_exist:
+                cols.append(target_col)
+            
+            kept = 0
+            for c in selected:
+                if c in cols_exist and c not in cols:
+                    cols.append(c)
+                    kept += 1
+            logger.info(f"Exporting {len(cols)} columns for {currency_pair} (Dask): timestamp + target ({target_col}) + {kept} selected features")
+            
+            if kept == 0 and len(cols) <= 2:  # Need at least timestamp + target + some features
+                logger.warning(f"No valid selected features present in Dask frame for {currency_pair} (only {len(cols)} columns)")
+                return ""
+
+            import os
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            from dask import delayed
+
+            out_root = self.settings.output.output_path
+            os.makedirs(out_root, exist_ok=True)
+            out_file = os.path.join(out_root, f"{currency_pair}_{target_col}.parquet")
+
+            # Materialize partitions one-by-one on driver and append to a single parquet
+            parts = ddf[cols].to_delayed()
+            if not parts:
+                logger.warning(f"No partitions to export for {currency_pair}")
+                return ""
+
+            # Compute first partition to establish schema
+            first = parts[0].compute()
+            try:
+                first_table = first.to_arrow()
+            except Exception:
+                first_table = pa.Table.from_pandas(first.to_pandas())
+            writer = pq.ParquetWriter(out_file, first_table.schema, compression='snappy')
+            try:
+                writer.write_table(first_table)
+                # Remaining partitions
+                for p in parts[1:]:
+                    part = p.compute()
+                    try:
+                        tbl = part.to_arrow()
+                    except Exception:
+                        tbl = pa.Table.from_pandas(part.to_pandas())
+                    writer.write_table(tbl)
+            finally:
+                writer.close()
+
+            logger.info(f"Exported CatBoost-selected features parquet (Dask): {out_file}")
+            return out_file
+        except Exception as e:
+            logger.error(f"Failed Dask export of selected features for {currency_pair}: {e}")
+            return ""
+
+    def _upload_selected_features_to_r2(self, local_file: str, currency_pair: str) -> bool:
+        """Upload the local parquet file to R2 under bucket root as symbol_feature_model.parquet."""
+        try:
+            if not local_file:
+                return False
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+            uploader = R2Uploader()
+            remote_key = f"{currency_pair}_{target_col}.parquet"
+            return uploader.upload_file(local_file, remote_key, content_type="application/octet-stream")
+        except Exception as e:
+            logger.error(f"Failed to upload selected features for {currency_pair} to R2: {e}")
+            return False
+
+    def _create_export_metadata_json(self, currency_pair: str, parquet_file: str) -> str:
+        """Create a JSON file with metadata about the exported features and upload to R2.
+        
+        Returns:
+            str: Path to the created JSON file, or empty string if failed
+        """
+        try:
+            import json
+            import os
+            from datetime import datetime
+            import pyarrow.parquet as pq
+            
+            # Get selected features
+            selected_features = self._get_selected_features()
+            if not selected_features:
+                logger.warning(f"No selected features found for {currency_pair}; skipping metadata JSON")
+                return ""
+            
+            # Get target column
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+            
+            # Get frac_diff configuration
+            frac_diff_config = getattr(self.settings.features, 'frac_diff', {})
+            frac_diff_d_values = frac_diff_config.get('d_values', [0.1, 0.2, 0.3, 0.4, 0.5])
+            
+            # Read parquet metadata
+            parquet_info = {}
+            if os.path.exists(parquet_file):
+                try:
+                    # Get file size
+                    parquet_info['file_size_bytes'] = os.path.getsize(parquet_file)
+                    
+                    # Get schema information
+                    parquet_file_obj = pq.ParquetFile(parquet_file)
+                    schema = parquet_file_obj.schema
+                    
+                    # Extract column information
+                    columns_info = []
+                    for field in schema:
+                        col_info = {
+                            'name': field.name,
+                            'type': str(field.physical_type),
+                            'nullable': field.nullable
+                        }
+                        columns_info.append(col_info)
+                    
+                    parquet_info['schema'] = {
+                        'columns': columns_info,
+                        'num_columns': len(columns_info),
+                        'num_rows': parquet_file_obj.metadata.num_rows
+                    }
+                except Exception as e:
+                    logger.warning(f"Could not read parquet metadata: {e}")
+                    parquet_info['error'] = str(e)
+            
+            # Categorize features
+            feature_categories = {
+                'frac_diff': [],
+                'technical_indicators': [],
+                'garch': [],
+                'statistical': [],
+                'other': []
+            }
+            
+            for feature in selected_features:
+                if 'frac_diff' in feature:
+                    feature_categories['frac_diff'].append(feature)
+                elif any(indicator in feature.lower() for indicator in ['sma', 'ema', 'rsi', 'macd', 'bb']):
+                    feature_categories['technical_indicators'].append(feature)
+                elif 'garch' in feature.lower():
+                    feature_categories['garch'].append(feature)
+                elif any(stat in feature.lower() for stat in ['adf', 'dcor', 'vif', 'mi']):
+                    feature_categories['statistical'].append(feature)
+                else:
+                    feature_categories['other'].append(feature)
+            
+            # Create metadata JSON
+            metadata = {
+                'export_info': {
+                    'currency_pair': currency_pair,
+                    'export_timestamp': datetime.now().isoformat(),
+                    'export_format': 'parquet',
+                    'compression': 'snappy'
+                },
+                'feature_selection': {
+                    'total_features_selected': len(selected_features),
+                    'selected_features': selected_features,
+                    'target_column': target_col,
+                    'feature_categories': feature_categories
+                },
+                'frac_diff_configuration': {
+                    'd_values_used': frac_diff_d_values,
+                    'frac_diff_features_count': len(feature_categories['frac_diff']),
+                    'frac_diff_features': feature_categories['frac_diff']
+                },
+                'parquet_file_info': parquet_info,
+                'pipeline_config': {
+                    'dcor_threshold': getattr(self.settings.features, 'dcor_min_threshold', 0.0),
+                    'vif_threshold': getattr(self.settings.features, 'vif_threshold', 5.0),
+                    'mi_threshold': getattr(self.settings.features, 'mi_threshold', 0.3),
+                    'stage3_top_n': getattr(self.settings.features, 'stage3_top_n', 50)
+                }
+            }
+            
+            # Save JSON file
+            output_root = self.settings.output.output_path
+            os.makedirs(output_root, exist_ok=True)
+            json_file = os.path.join(output_root, f"{currency_pair}_{target_col}_metadata.json")
+            
+            with open(json_file, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Created export metadata JSON: {json_file}")
+            return json_file
+            
+        except Exception as e:
+            logger.error(f"Failed to create export metadata JSON for {currency_pair}: {e}")
+            return ""
+
+    def _upload_metadata_json_to_r2(self, json_file: str, currency_pair: str) -> bool:
+        """Upload the metadata JSON file to R2."""
+        try:
+            if not json_file or not os.path.exists(json_file):
+                return False
+            
+            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_60m')
+            uploader = R2Uploader()
+            remote_key = f"{currency_pair}_{target_col}_metadata.json"
+            return uploader.upload_file(json_file, remote_key, content_type="application/json")
+        except Exception as e:
+            logger.error(f"Failed to upload metadata JSON for {currency_pair} to R2: {e}")
+            return False
 
 def _noop_ctx():
     from contextlib import contextmanager
@@ -1351,20 +1657,28 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
 
             # Export selected-feature parquet and upload to R2 (Dask path, best-effort)
             try:
-                # Debug: Check method availability
-                methods = [m for m in dir(self) if 'export_selected_features' in m]
-                logger.info(f"Available export methods: {methods}")
-                
-                if hasattr(self, '_export_selected_features_parquet_dask'):
-                    logger.info(f"Method _export_selected_features_parquet_dask found, executing...")
-                    sel_path = self._export_selected_features_parquet_dask(ddf, currency_pair)
-                    if sel_path:
-                        uploaded = self._upload_selected_features_to_r2(sel_path, currency_pair)
-                        logger.info(f"Selected-feature parquet upload (Dask): {'OK' if uploaded else 'SKIPPED/FAILED'}")
+                try:
+                    from dask.distributed import get_worker
+                    _w = get_worker()
+                    _addr = getattr(_w, 'address', None)
+                except Exception:
+                    _addr = None
+                if _addr:
+                    with dask.annotate(workers=[_addr], allow_other_workers=False, task_key_name=f"export-{currency_pair}"):
+                        sel_path = self._export_selected_features_parquet_dask(ddf, currency_pair)
                 else:
-                    logger.warning(f"Method _export_selected_features_parquet_dask not found on DataProcessor instance")
-                    logger.info(f"DataProcessor type: {type(self)}")
-                    logger.info(f"DataProcessor class: {self.__class__}")
+                    sel_path = self._export_selected_features_parquet_dask(ddf, currency_pair)
+                if sel_path:
+                    uploaded = self._upload_selected_features_to_r2(sel_path, currency_pair)
+                    logger.info(f"Selected-feature parquet upload (Dask): {'OK' if uploaded else 'SKIPPED/FAILED'}")
+                    # Create and upload metadata JSON
+                    try:
+                        json_path = self._create_export_metadata_json(currency_pair, sel_path)
+                        if json_path:
+                            json_uploaded = self._upload_metadata_json_to_r2(json_path, currency_pair)
+                            logger.info(f"Export metadata JSON upload (Dask): {'OK' if json_uploaded else 'SKIPPED/FAILED'}")
+                    except Exception as json_e:
+                        logger.warning(f"Could not create/upload metadata JSON (Dask) for {currency_pair}: {json_e}")
             except Exception as _e:
                 logger.warning(f"Could not export/upload selected-feature parquet (Dask) for {currency_pair}: {_e}")
 
@@ -1408,8 +1722,17 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                 pass
             try:
                 if self.client:
-                    # Free CuPy pools on all workers and run GC
-                    self.client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
+                    # Free CuPy pool and run GC on this worker specifically
+                    try:
+                        from dask.distributed import get_worker
+                        _w = get_worker()
+                        _addr = getattr(_w, 'address', None)
+                    except Exception:
+                        _addr = None
+                    if _addr:
+                        self.client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()), workers=[_addr])
+                    else:
+                        self.client.run(lambda: (__import__('gc').collect(), __import__('cupy').get_default_memory_pool().free_all_blocks()))
             except Exception:
                 pass
 
@@ -1543,163 +1866,9 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
     # Removido: persistência separada de selected_features.json (seleção centralizada no statistical_tests)
 
     # ---------------- Selected features export (CatBoost) ----------------
-    def _get_selected_features(self) -> list:
-        """Retrieve the final feature list selected by Stage 3 (CatBoost)."""
-        try:
-            feats = getattr(self.stats, '_last_embedded_selected', None)
-            if feats:
-                return list(feats)
-        except Exception:
-            pass
-        try:
-            # Fallback: infer from importances map if available
-            imps = getattr(self.stats, '_last_importances', None) or {}
-            if imps:
-                # Keep all keys as 'selected'
-                return list(imps.keys())
-        except Exception:
-            pass
-        return []
 
-    def _export_selected_features_parquet_cudf(self, gdf: cudf.DataFrame, currency_pair: str) -> str:
-        """Create a single parquet with timestamp + CatBoost-selected features and return local path.
 
-        Returns empty string if nothing was written.
-        """
-        try:
-            selected = self._get_selected_features()
-            if not selected:
-                logger.warning(f"No CatBoost-selected features found for {currency_pair}; skipping model parquet export")
-                return ""
-            # Ensure timestamp + target + selected features (only those that exist)
-            cols = []
-            time_col = 'timestamp'
-            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_15m')
-            
-            if time_col in gdf.columns:
-                cols.append(time_col)
-            if target_col in gdf.columns:
-                cols.append(target_col)
-            
-            missing = []
-            for c in selected:
-                if c in gdf.columns and c not in cols:
-                    cols.append(c)
-                else:
-                    if c not in gdf.columns:
-                        missing.append(c)
-            if missing:
-                logger.info(f"Some selected features missing in frame (ignored): {missing[:10]}{'...' if len(missing)>10 else ''}")
-            
-            logger.info(f"Exporting {len(cols)} columns for {currency_pair}: timestamp + target ({target_col}) + {len(selected)} selected features")
-            if len(cols) <= 2:  # Need at least timestamp + target + some features
-                logger.warning(f"No valid selected features to export for {currency_pair} (only {len(cols)} columns)")
-                return ""
 
-            # Arrange output path: place at output root for easy pickup
-            import os
-            import pyarrow.parquet as pq
-            out_root = self.settings.output.output_path
-            os.makedirs(out_root, exist_ok=True)
-            out_file = os.path.join(out_root, f"{currency_pair}_feature_model.parquet")
-
-            # Convert to Arrow Table and write single parquet
-            try:
-                table = gdf[cols].to_arrow()
-            except Exception:
-                # Fallback via pandas
-                table = gdf[cols].to_pandas().to_arrow()
-            pq.write_table(table, out_file, compression='snappy')
-            logger.info(f"Exported CatBoost-selected features parquet: {out_file}")
-            return out_file
-        except Exception as e:
-            logger.error(f"Failed to export selected features parquet for {currency_pair}: {e}")
-            return ""
-
-    def _export_selected_features_parquet_dask(self, ddf, currency_pair: str) -> str:
-        """Create a single parquet with timestamp + selected features from Dask-cuDF DataFrame.
-
-        Streams partitions to a single file to avoid collecting the full dataset.
-        Returns empty string if nothing was written.
-        """
-        try:
-            selected = self._get_selected_features()
-            if not selected:
-                logger.warning(f"No CatBoost-selected features found for {currency_pair}; skipping model parquet export (Dask)")
-                return ""
-            cols = []
-            time_col = 'timestamp'
-            target_col = getattr(self.settings.features, 'selection_target_column', 'y_ret_fwd_15m')
-            cols_exist = set(list(ddf.columns))
-            
-            if time_col in cols_exist:
-                cols.append(time_col)
-            if target_col in cols_exist:
-                cols.append(target_col)
-            
-            kept = 0
-            for c in selected:
-                if c in cols_exist and c not in cols:
-                    cols.append(c)
-                    kept += 1
-            logger.info(f"Exporting {len(cols)} columns for {currency_pair} (Dask): timestamp + target ({target_col}) + {kept} selected features")
-            
-            if kept == 0 and len(cols) <= 2:  # Need at least timestamp + target + some features
-                logger.warning(f"No valid selected features present in Dask frame for {currency_pair} (only {len(cols)} columns)")
-                return ""
-
-            import os
-            import pyarrow as pa
-            import pyarrow.parquet as pq
-            from dask import delayed
-
-            out_root = self.settings.output.output_path
-            os.makedirs(out_root, exist_ok=True)
-            out_file = os.path.join(out_root, f"{currency_pair}_feature_model.parquet")
-
-            # Materialize partitions one-by-one on driver and append to a single parquet
-            parts = ddf[cols].to_delayed()
-            if not parts:
-                logger.warning(f"No partitions to export for {currency_pair}")
-                return ""
-
-            # Compute first partition to establish schema
-            first = parts[0].compute()
-            try:
-                first_table = first.to_arrow()
-            except Exception:
-                first_table = pa.Table.from_pandas(first.to_pandas())
-            writer = pq.ParquetWriter(out_file, first_table.schema, compression='snappy')
-            try:
-                writer.write_table(first_table)
-                # Remaining partitions
-                for p in parts[1:]:
-                    part = p.compute()
-                    try:
-                        tbl = part.to_arrow()
-                    except Exception:
-                        tbl = pa.Table.from_pandas(part.to_pandas())
-                    writer.write_table(tbl)
-            finally:
-                writer.close()
-
-            logger.info(f"Exported CatBoost-selected features parquet (Dask): {out_file}")
-            return out_file
-        except Exception as e:
-            logger.error(f"Failed Dask export of selected features for {currency_pair}: {e}")
-            return ""
-
-    def _upload_selected_features_to_r2(self, local_file: str, currency_pair: str) -> bool:
-        """Upload the local parquet file to R2 under bucket root as symbol_feature_model.parquet."""
-        try:
-            if not local_file:
-                return False
-            uploader = R2Uploader()
-            remote_key = f"{currency_pair}_feature_model.parquet"
-            return uploader.upload_file(local_file, remote_key, content_type="application/octet-stream")
-        except Exception as e:
-            logger.error(f"Failed to upload selected features for {currency_pair} to R2: {e}")
-            return False
 
     def _save_processed_data_dask(self, ddf, currency_pair: str) -> bool:
         """Save the processed Dask-cuDF DataFrame as partitioned Parquet files.

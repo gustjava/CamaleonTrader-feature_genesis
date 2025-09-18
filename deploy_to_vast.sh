@@ -259,6 +259,9 @@ conda install -c conda-forge -y \
   sqlalchemy pymysql cryptography \
   scikit-learn lightgbm catboost xgboost matplotlib || true
 
+echo '--- [REMOTO] Instalando boto3 para upload R2...'
+pip install --no-cache-dir boto3 || true
+
 echo '--- [REMOTO] Garantindo instalação da biblioteca EMD (signal processing)...'
 pip install --no-cache-dir emd || true
 
