@@ -643,6 +643,8 @@ class FinalModelTrainer:
                 gpu_metrics_enabled = True
 
                 if gpu_metrics_enabled:
+                    self._log_info('GPU metrics enabled for symbol',
+                                  symbol=symbol_upper, timeframe=timeframe_lower)
                     try:
                         self._log_info('Starting GPU post-training metrics calculation',
                                       symbol=symbol_upper, timeframe=timeframe_lower)
@@ -717,6 +719,11 @@ class FinalModelTrainer:
                                 "[FinalMetrics] BucketMonotonicity(Spearman)=%.3f",
                                 bucket_mono
                             )
+                        
+                        self._log_info('GPU metrics logging completed successfully',
+                                      symbol=symbol_upper, timeframe=timeframe_lower,
+                                      q5_minus_q1=global_gpu.get('q5_minus_q1', 0.0),
+                                      tstat_q5q1=global_gpu.get('tstat_q5q1', 0.0))
                     except Exception as gpu_err:
                         self._log_error('GPU post-training metrics failed', 
                                       error=str(gpu_err),
@@ -734,6 +741,9 @@ class FinalModelTrainer:
                             self._log_info('GPU memory cleanup attempted after metrics failure')
                         except Exception as cleanup_err:
                             self._log_warn('GPU memory cleanup failed', error=str(cleanup_err))
+                else:
+                    self._log_info('GPU metrics disabled for symbol',
+                                  symbol=symbol_upper, timeframe=timeframe_lower)
             
             # Add prediction statistics
             evaluation_results.update({
