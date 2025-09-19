@@ -341,15 +341,15 @@ class FinalModelTrainer:
         import warnings
         
         # Get enhanced parameters from config
-        iterations = int(getattr(self.config.features, 'stage3_catboost_iterations', 750))
-        learning_rate = float(getattr(self.config.features, 'stage3_catboost_learning_rate', 0.025))
-        depth = int(getattr(self.config.features, 'stage3_catboost_depth', 6))
-        l2_leaf_reg = float(getattr(self.config.features, 'stage3_catboost_l2_leaf_reg', 10.0))
+        iterations = int(getattr(self.config.features, 'stage3_catboost_iterations', 1000))
+        learning_rate = float(getattr(self.config.features, 'stage3_catboost_learning_rate', 0.015))
+        depth = int(getattr(self.config.features, 'stage3_catboost_depth', 8))
+        l2_leaf_reg = float(getattr(self.config.features, 'stage3_catboost_l2_leaf_reg', 20.0))
         bootstrap_type = str(getattr(self.config.features, 'stage3_catboost_bootstrap_type', 'Bernoulli'))
         subsample = float(getattr(self.config.features, 'stage3_catboost_subsample', 0.7))
         task_type_gpu = str(getattr(self.config.features, 'stage3_catboost_task_type', 'GPU'))
         devices = str(getattr(self.config.features, 'stage3_catboost_devices', '0'))
-        early_stopping = int(getattr(self.config.features, 'stage3_catboost_early_stopping_rounds', 100))
+        early_stopping = int(getattr(self.config.features, 'stage3_catboost_early_stopping_rounds', 200))
         random_state = int(getattr(self.config.features, 'stage3_random_state', 42))
         
         self._log_info('Training final CatBoost model', 

@@ -721,9 +721,9 @@ class FeatureSelection:
                 X, y = X[ids], y[ids]
 
         # Model params
-        iterations = int(getattr(self, 'stage3_catboost_iterations', 200))
-        learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', 0.05))
-        depth = int(getattr(self, 'stage3_catboost_depth', 6))
+        iterations = int(getattr(self, 'stage3_catboost_iterations', 1000))
+        learning_rate = float(getattr(self, 'stage3_catboost_learning_rate', 0.015))
+        depth = int(getattr(self, 'stage3_catboost_depth', 8))
         task_type = str(getattr(self, 'stage3_catboost_task_type', 'GPU'))
         devices_cfg = str(getattr(self, 'stage3_catboost_devices', '0'))
         thread_count = int(getattr(self, 'stage3_catboost_thread_count', 1))
@@ -748,7 +748,7 @@ class FeatureSelection:
         import warnings
         
         # Enhanced parameters from config
-        l2_leaf_reg = float(getattr(self, 'stage3_catboost_l2_leaf_reg', 10.0))
+        l2_leaf_reg = float(getattr(self, 'stage3_catboost_l2_leaf_reg', 20.0))
         bootstrap_type = str(getattr(self, 'stage3_catboost_bootstrap_type', 'Bernoulli'))
         subsample = float(getattr(self, 'stage3_catboost_subsample', 0.7))
         
@@ -799,7 +799,7 @@ class FeatureSelection:
                 )
 
         # Early stopping + CV setup
-        esr = int(getattr(self, 'stage3_catboost_early_stopping_rounds', 0))
+        esr = int(getattr(self, 'stage3_catboost_early_stopping_rounds', 200))
         n_splits_cfg = int(getattr(self, 'stage3_cv_splits', 0))
         min_train = int(getattr(self, 'stage3_cv_min_train', 200))
 

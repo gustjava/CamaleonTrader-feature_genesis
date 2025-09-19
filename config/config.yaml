@@ -168,10 +168,10 @@ features:
   stage3_use_gpu: true
   stage3_wrapper_backend: xgb_gpu  # lgbm|xgb_gpu
   # Stage 3 CatBoost (explicit keys; fallback to LGBM values if omitted)
-  stage3_catboost_iterations: 750           # Aumentado para treino mais longo e estável
-  stage3_catboost_learning_rate: 0.025      # Reduzido para treinamento mais conservador
-  stage3_catboost_depth: 6                  # Aumentado para capturar mais complexidade
-  stage3_catboost_l2_leaf_reg: 10           # Regularização L2 para evitar overfitting
+  stage3_catboost_iterations: 1000          # Aumentado significativamente para treino mais longo
+  stage3_catboost_learning_rate: 0.015      # Reduzido para acompanhar mais iterações
+  stage3_catboost_depth: 8                  # Aumentado para capturar mais complexidade
+  stage3_catboost_l2_leaf_reg: 20           # Regularização L2 aumentada para controlar overfitting
   stage3_catboost_bootstrap_type: Bernoulli # Bootstrap robusto
   stage3_catboost_subsample: 0.7           # Subsample para regularização
   stage3_catboost_task_type: GPU            # GPU|CPU
@@ -182,7 +182,7 @@ features:
   # Walkforward / temporal validation for embedded CatBoost selection
   stage3_cv_splits: 5                       # Use TimeSeriesSplit with K folds (>=2 enables aggregation)
   stage3_cv_min_train: 200                  # Minimum rows in each training fold
-  stage3_catboost_early_stopping_rounds: 100 # Aumentado para não cortar prematuramente
+  stage3_catboost_early_stopping_rounds: 200 # Aumentado significativamente para evitar parada prematura
   # Data usage control for embedded stage
   stage3_catboost_use_full_dataset: true    # Use full dataset (disable selection_max_rows sampling)
   

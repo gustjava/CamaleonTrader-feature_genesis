@@ -16,6 +16,7 @@ from pathlib import Path
 import cudf
 import cupy as cp
 import dask
+import numpy as np
 
 # Suppress GPU memory warnings globally for this module
 warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
@@ -817,8 +818,9 @@ class DataProcessor:
                                 warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
                                 model = CatBoostRegressor(
                                     iterations=1000,
-                                    learning_rate=0.03,
-                                    depth=6,
+                                    learning_rate=0.015,
+                                    depth=8,
+                                    l2_leaf_reg=20,
                                     random_seed=split_seed,
                                     task_type='GPU',
                                     verbose=200
