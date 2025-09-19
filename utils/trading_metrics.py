@@ -702,8 +702,46 @@ class GPUPostTrainingMetrics:
             # (mantemos 'ranks' em cuDF para qcut)
             ranks = cudf.Series(yp_cut).rank(method="first")
 
-        # Corta quantis em GPU
-        df["bucket"] = cudf.qcut(ranks, q)  # IntervalIndex ordenado
+        # Corta quantis em GPU - implementação robusta e compatível
+        try:
+            # Tentar usar qcut se disponível
+            df["bucket"] = cudf.qcut(ranks, q, labels=False, duplicates='drop')
+        except (AttributeError, Exception) as e:
+            # Fallback robusto: implementar qcut manualmente sem cudf.cut problemático
+            
+            # Converter para CuPy para cálculos mais diretos
+            rank_values = ranks.to_cupy().astype(cp.float64)
+            n_samples = len(rank_values)
+            
+            # Calcular thresholds usando percentis em CuPy
+            percentiles = cp.linspace(0, 100, q + 1)  # [0, 25, 50, 75, 100] para q=4
+            thresholds = cp.percentile(rank_values, percentiles)
+            
+            # Garantir thresholds únicos
+            if len(cp.unique(thresholds)) < len(thresholds):
+                # Adicionar pequenos offsets para lidar com empates
+                for i in range(1, len(thresholds)):
+                    if thresholds[i] <= thresholds[i-1]:
+                        thresholds[i] = thresholds[i-1] + (i * 1e-9)
+            
+            # Criar buckets manualmente usando CuPy
+            bucket_indices = cp.zeros(n_samples, dtype=cp.int32)
+            
+            for i in range(q):
+                if i == 0:
+                    # Primeiro bucket: valores <= threshold[1]
+                    mask = rank_values <= thresholds[i + 1]
+                elif i == q - 1:
+                    # Último bucket: valores > threshold[q-1]
+                    mask = rank_values > thresholds[i]
+                else:
+                    # Buckets intermediários: threshold[i] < valores <= threshold[i+1]
+                    mask = (rank_values > thresholds[i]) & (rank_values <= thresholds[i + 1])
+                
+                bucket_indices[mask] = i
+            
+            # Converter de volta para cuDF
+            df["bucket"] = cudf.Series(bucket_indices)
 
         # ---- Agregações por bucket (GPU) ----
         # means, vars, counts 100% em GPU
@@ -723,13 +761,13 @@ class GPUPostTrainingMetrics:
         spread_q = float(qk_mean - q1_mean)
 
         # Erro-padrão do spread (independência aproximada): sqrt(var(Qq)/nq + var(Q1)/n1)
-        v1 = var_s.iloc[0].astype("float64").to_cupy()
-        n1 = cnt_s.iloc[0].astype("float64").to_cupy()
-        vk = var_s.iloc[-1].astype("float64").to_cupy()
-        nk = cnt_s.iloc[-1].astype("float64").to_cupy()
+        v1 = cp.float64(var_s.iloc[0])
+        n1 = cp.float64(cnt_s.iloc[0])
+        vk = cp.float64(var_s.iloc[-1])
+        nk = cp.float64(cnt_s.iloc[-1])
 
         se = cp.sqrt(v1 / (n1 + 1e-12) + vk / (nk + 1e-12)) + 1e-12
-        tstat_spread = float((qk_mean - q1_mean).astype("float64").to_cupy() / se)
+        tstat_spread = float(cp.float64(spread_q) / se)
 
         # ---- Saídas ----
         bucket_means = mean_s  # já em GPU e ordenado
@@ -765,7 +803,12 @@ class GPUPostTrainingMetrics:
             # Optional: Check bucket monotonicity (for validation)
             try:
                 idx = cudf.Series(cp.arange(1, len(bucket_means) + 1, dtype=cp.float64))
-                rho = cp.corrcoef(idx.to_cupy(), bucket_means.astype('float64').to_cupy())[0, 1]
+                # Garantir que bucket_means é uma Series antes de chamar to_cupy()
+                if hasattr(bucket_means, 'to_cupy'):
+                    means_cp = bucket_means.astype('float64').to_cupy()
+                else:
+                    means_cp = cp.asarray(bucket_means, dtype=cp.float64)
+                rho = cp.corrcoef(idx.to_cupy(), means_cp)[0, 1]
                 bucket_monotonicity = float(rho)
             except:
                 bucket_monotonicity = 0.0
@@ -780,7 +823,10 @@ class GPUPostTrainingMetrics:
         except Exception as e:
             # Log the specific error for debugging
             import traceback
-            print(f"Bucket stats error: {e}")
+            print(f"Bucket stats calculation failed: {e}")
+            print(f"Error type: {type(e).__name__}")
+            if "qcut" in str(e):
+                print("Note: cuDF version doesn't have qcut(), using fallback implementation")
             print(f"Traceback: {traceback.format_exc()}")
             return {'spread': 0.0, 'tstat': 0.0, 'bucket_means': {}, 'bucket_monotonicity': 0.0}
 

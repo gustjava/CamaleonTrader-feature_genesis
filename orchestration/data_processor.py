@@ -180,6 +180,13 @@ class DataProcessor:
         try:
             # Set currency pair context for all subsequent logs
             set_currency_pair_context(currency_pair)
+            try:
+                self.current_currency_pair = currency_pair
+                current_tf = getattr(self, 'current_timeframe', None)
+                if not current_tf or current_tf == 'unknown':
+                    self.current_timeframe = self.default_timeframe
+            except Exception:
+                pass
             logger.info(f"Starting processing for {currency_pair}")
             
             # Connect to database for task tracking (non-fatal)
@@ -910,67 +917,89 @@ class DataProcessor:
                             currency_pair = getattr(self, 'current_currency_pair', 'unknown')
                             timeframe = getattr(self, 'current_timeframe', 'unknown')
                             timeframe_lower = str(timeframe).lower()
-                            if currency_pair and currency_pair.upper() == 'EURAUD':
-                                if timeframe_lower == 'unknown':
-                                    timeframe_lower = '60m'
+                            currency_upper = str(currency_pair or '').upper()
+                            resolved_tf = timeframe_lower if timeframe_lower != 'unknown' else self.default_timeframe
+                            try:
+                                params = _gpu_metrics_resolve_timeframe_params(resolved_tf)
+                                cost_per_trade = _gpu_metrics_resolve_cost(self.settings, currency_upper, resolved_tf)
+                                gpu_metrics_engine = GPUPostTrainingMetrics(
+                                    cost_per_trade=cost_per_trade,
+                                    annual_factor=params['annual_factor'],
+                                    window_size=params['window_size']
+                                )
+                                gpu_metrics = gpu_metrics_engine.compute_metrics(
+                                    y_true=cp.asarray(y_test),
+                                    y_pred=cp.asarray(y_pred)
+                                )
 
-                            if currency_pair and currency_pair.upper() == 'EURAUD' and timeframe_lower == '60m':
-                                try:
-                                    params = _gpu_metrics_resolve_timeframe_params(timeframe_lower)
-                                    cost_per_trade = _gpu_metrics_resolve_cost(self.settings, currency_pair, timeframe_lower)
-                                    gpu_metrics_engine = GPUPostTrainingMetrics(
-                                        cost_per_trade=cost_per_trade,
-                                        annual_factor=params['annual_factor'],
-                                        window_size=params['window_size']
-                                    )
-                                    gpu_metrics = gpu_metrics_engine.compute_metrics(
-                                        y_true=cp.asarray(y_test),
-                                        y_pred=cp.asarray(y_pred)
-                                    )
+                                global_gpu = gpu_metrics['global']
+                                stability_gpu = gpu_metrics['stability']
 
-                                    global_gpu = gpu_metrics['global']
-                                    stability_gpu = gpu_metrics['stability']
-
-                                    ic_pct = stability_gpu.get('ic_positive_pct', 0.0) * 100.0
-                                    sharpe_pct = stability_gpu.get('sharpe_positive_pct', 0.0) * 100.0
-                                    logger.info(
-                                        "[FinalMetrics] IC=%.4f, ICIR=%.4f, Hit=%.4f, Sharpe(liq)=%.4f, Sortino(liq)=%.4f, "
-                                        "MDD(liq)=%.6f, Q5-Q1=%.6f, Estab_IC=%.2f%%, Estab_Sharpe=%.2f%%",
-                                        global_gpu.get('IC', 0.0),
-                                        global_gpu.get('ICIR', 0.0),
-                                        global_gpu.get('hit', 0.0),
-                                        global_gpu.get('sharpe_liq', 0.0),
-                                        global_gpu.get('sortino_liq', 0.0),
-                                        global_gpu.get('mdd_liq', 0.0),
-                                        global_gpu.get('q5_minus_q1', 0.0),
-                                        ic_pct,
-                                        sharpe_pct
-                                    )
-                                    logger.info(
-                                        "[FinalMetrics] Z=%.3f, Turnover=%.4f, Trades=%d, TStat(Q5-Q1)=%.3f",
-                                        global_gpu.get('z_score', 0.0),
-                                        global_gpu.get('turnover', 0.0),
-                                        global_gpu.get('trades_total', 0),
-                                        global_gpu.get('tstat_q5q1', 0.0)
-                                    )
-                                except Exception as gpu_err:
-                                    logger.warning(f"[FinalMetrics] GPU metrics calculation failed: {gpu_err}")
+                                ic_pct = stability_gpu.get('ic_positive_pct', 0.0) * 100.0
+                                sharpe_pct = stability_gpu.get('sharpe_positive_pct', 0.0) * 100.0
+                                logger.info(
+                                    "[FinalMetrics] IC=%.4f, ICIR=%.4f, Hit=%.4f, Sharpe(liq)=%.4f, Sortino(liq)=%.4f, "
+                                    "MDD(liq)=%.6f, Q5-Q1=%.6f, Estab_IC=%.2f%%, Estab_Sharpe=%.2f%%",
+                                    global_gpu.get('IC', 0.0),
+                                    global_gpu.get('ICIR', 0.0),
+                                    global_gpu.get('hit', 0.0),
+                                    global_gpu.get('sharpe_liq', 0.0),
+                                    global_gpu.get('sortino_liq', 0.0),
+                                    global_gpu.get('mdd_liq', 0.0),
+                                    global_gpu.get('q5_minus_q1', 0.0),
+                                    ic_pct,
+                                    sharpe_pct
+                                )
+                                logger.info(
+                                    "[FinalMetrics] Z=%.3f, Turnover=%.4f, Trades=%d, TStat(Q5-Q1)=%.3f",
+                                    global_gpu.get('z_score', 0.0),
+                                    global_gpu.get('turnover', 0.0),
+                                    global_gpu.get('trades_total', 0),
+                                    global_gpu.get('tstat_q5q1', 0.0)
+                                )
+                            except Exception as gpu_err:
+                                logger.warning(f"[FinalMetrics] GPU metrics calculation failed: {gpu_err}")
                             
                             logger.info(f"[FinalModel] 🎯 All Feature Importances:")
                             for i, (feature_name, importance) in enumerate(sorted_features, 1):
                                 logger.info(f"[FinalModel]   {i:2d}. {feature_name}: {importance:.6f}")
                             
                             # Save model with proper naming
-                            effective_timeframe = timeframe_lower if timeframe_lower != 'unknown' else self.default_timeframe
+                            effective_timeframe = resolved_tf
                             pair_lower = str(currency_pair or '').lower()
                             model_filename = f"catboost_{pair_lower}_{effective_timeframe}.cbm"
                             model.save_model(model_filename)
                             logger.info(f"[FinalModel] 💾 Model saved as: {model_filename}")
-                            
+
+                            # Always run the full FinalModelTrainer pipeline to ensure upload/logging
+                            try:
+                                trainer = FinalModelTrainer(
+                                    config=self.settings,
+                                    logger_instance=logger
+                                )
+                                trainer.build_and_evaluate_final_model(
+                                    X_df=full_gdf,
+                                    y_series=full_gdf[target],
+                                    selected_features=final_features,
+                                    feature_importances=dict(sorted_features),
+                                    selection_metadata=combined,
+                                    symbol=currency_pair,
+                                    timeframe=resolved_tf
+                                )
+                            except Exception as final_err:
+                                logger.error(
+                                    f"[FinalModel] Failed to execute FinalModelTrainer after fallback: {final_err}",
+                                    exc_info=True
+                                )
+                                raise RuntimeError(
+                                    f"FinalModelTrainer failure for {currency_pair} {resolved_tf}: {final_err}"
+                                )
+
                         except Exception as e:
                             logger.error(f"[FinalModel] Failed to build final model: {e}")
                             logger.error(f"[FinalModel] Error details: {traceback.format_exc()}")
-                            
+                            raise RuntimeError(f"Fallback CatBoost failed for {currency_pair}: {e}")
+
                     else:
                         logger.warning("[StatTests] ⚠️  FINAL SELECTION: No features selected!")
                     try:

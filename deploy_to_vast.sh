@@ -265,6 +265,13 @@ pip install --no-cache-dir boto3 || true
 echo '--- [REMOTO] Garantindo instalação da biblioteca EMD (signal processing)...'
 pip install --no-cache-dir emd || true
 
+echo '--- [REMOTO] Atualizando cuDF para versão com qcut() para trading metrics...'
+# Atualizar cuDF para versão mais recente que tem qcut()
+# RAPIDS 23.08+ tem cudf.qcut() 
+conda install -c rapidsai -c conda-forge -c nvidia cudf=23.08 || \
+pip install --no-cache-dir --upgrade cudf-cu11==23.08.* || \
+pip install --no-cache-dir --upgrade cudf-cu12==23.08.* || true
+
 echo '--- [REMOTO] Verificando se rclone está instalado...'
 if ! command -v rclone &> /dev/null; then
     echo 'rclone não encontrado, instalando...'

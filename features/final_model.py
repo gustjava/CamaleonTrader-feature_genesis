@@ -16,7 +16,6 @@ import traceback as _tb
 
 from utils.logging_utils import get_logger
 from utils.trading_metrics import TradingMetrics, GPUPostTrainingMetrics
-from data_io.db_handler import DatabaseHandler
 from data_io.r2_uploader import R2ModelUploader
 
 logger = get_logger(__name__, "features.final_model")
@@ -30,7 +29,6 @@ class FinalModelTrainer:
         self.config = config
         self.logger = logger_instance or logger
         self.trading_metrics = TradingMetrics(config=config)
-        self.db_handler = DatabaseHandler()
         self.r2_uploader = R2ModelUploader()  # Initialize R2 uploader
         
     def _log_info(self, message: str, **kwargs):
@@ -216,19 +214,7 @@ class FinalModelTrainer:
                 timeframe=timeframe
             )
             
-            # 6. Save to database
-            db_record_id = self._save_to_database(
-                symbol=symbol,
-                timeframe=timeframe,
-                selected_features=selected_features,
-                feature_importances=feature_importances,
-                selection_metadata=selection_metadata,
-                model_results=model_results,
-                evaluation_results=evaluation_results,
-                task_type=task_type
-            )
-            
-            # 7. Upload model to R2 cloud storage
+            # 6. Upload model to R2 cloud storage (skip database - using JSON metadata)
             r2_upload_success = self._upload_model_to_r2(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -236,13 +222,11 @@ class FinalModelTrainer:
                 feature_importances=feature_importances,
                 model_results=model_results,
                 evaluation_results=evaluation_results,
-                task_type=task_type,
-                db_record_id=db_record_id
+                task_type=task_type
             )
             
-            # 8. Compile final results
+            # 7. Compile final results
             final_results = {
-                'database_record_id': db_record_id,
                 'r2_upload_success': r2_upload_success,
                 'symbol': symbol,
                 'timeframe': timeframe,
@@ -298,19 +282,14 @@ class FinalModelTrainer:
             y_vals = y_series.values if hasattr(y_series, 'values') else np.asarray(y_series)
             unique_values = len(np.unique(y_vals[np.isfinite(y_vals)]))
             
-            # Use configuration or heuristic
-            max_classes = int(getattr(self.config.features, 'stage3_classification_max_classes', 10))
-            
-            if unique_values <= max_classes and unique_values <= len(y_vals) * 0.1:
-                task_type = 'classification'
-                self._log_info('Task determined as classification', 
-                              unique_values=unique_values, 
-                              max_classes=max_classes)
-            else:
-                task_type = 'regression'
-                self._log_info('Task determined as regression', 
-                              unique_values=unique_values,
-                              y_std=float(np.std(y_vals)))
+            # For forex trading data, ALWAYS use regression (targets are continuous returns)
+            # This ensures trading metrics (IC, ICIR, Hit, Sharpe, etc.) are calculated
+            task_type = 'regression'
+            self._log_info('Task determined as regression (forex trading data)', 
+                          unique_values=unique_values,
+                          y_std=float(np.std(y_vals)),
+                          y_min=float(np.min(y_vals)),
+                          y_max=float(np.max(y_vals)))
             
             return task_type
             
@@ -570,6 +549,9 @@ class FinalModelTrainer:
                     'test_rmse': float(np.sqrt(mean_squared_error(y_test, test_pred)))
                 })
                 
+                symbol_upper = str(symbol or '').upper()
+                timeframe_lower = self._resolve_output_timeframe(timeframe)
+
                 # Advanced trading metrics for regression
                 try:
                     self._log_info('Starting advanced trading metrics calculation',
@@ -636,114 +618,112 @@ class FinalModelTrainer:
                     evaluation_results['train_primary_metric'] = evaluation_results['train_r2']
                     evaluation_results['test_primary_metric'] = evaluation_results['test_r2']
 
-                symbol_upper = str(symbol or '').upper()
-                timeframe_lower = self._resolve_output_timeframe(timeframe)
+                # Capture frac_diff configuration for selected features (if available)
+                try:
+                    frac_diff_details = self._extract_frac_diff_details(X_df, selected_features)
+                    if frac_diff_details:
+                        evaluation_results['frac_diff_details'] = frac_diff_details
+                        self._log_info('Recorded frac_diff details for selected features',
+                                       symbol=symbol_upper, timeframe=timeframe_lower,
+                                       frac_diff_features=len(frac_diff_details))
+                except Exception as frac_err:
+                    self._log_warn('Failed to record frac_diff details',
+                                   error=str(frac_err),
+                                   symbol=symbol_upper,
+                                   timeframe=timeframe_lower)
 
-                # Enable GPU metrics for all symbols (removed hardcoded EURAUD restriction)
-                gpu_metrics_enabled = True
-
-                if gpu_metrics_enabled:
-                    self._log_info('GPU metrics enabled for symbol',
+                try:
+                    self._log_info('Starting GPU post-training metrics calculation',
                                   symbol=symbol_upper, timeframe=timeframe_lower)
+
+                    params = self._resolve_timeframe_params(timeframe_lower)
+                    cost_per_trade = self._resolve_cost_per_trade(symbol_upper, timeframe_lower)
+
+                    self._log_info('GPU metrics parameters resolved',
+                                  symbol=symbol_upper, timeframe=timeframe_lower,
+                                  cost_per_trade=cost_per_trade,
+                                  annual_factor=params['annual_factor'],
+                                  window_size=params['window_size'])
+
+                    gpu_metrics_engine = GPUPostTrainingMetrics(
+                        cost_per_trade=cost_per_trade,
+                        annual_factor=params['annual_factor'],
+                        window_size=params['window_size']
+                    )
+
+                    self._log_info('GPU metrics engine created, computing metrics',
+                                  symbol=symbol_upper, timeframe=timeframe_lower,
+                                  y_test_size=len(y_test), y_pred_size=len(test_pred))
+
+                    gpu_metrics = gpu_metrics_engine.compute_metrics(
+                        y_true=y_test,
+                        y_pred=test_pred
+                    )
+
+                    self._log_info('GPU metrics computation completed',
+                                  symbol=symbol_upper, timeframe=timeframe_lower,
+                                  has_global=bool(gpu_metrics.get('global')),
+                                  has_stability=bool(gpu_metrics.get('stability')),
+                                  has_windows=bool(gpu_metrics.get('windows')))
+
+                    evaluation_results['gpu_metrics_global'] = gpu_metrics['global']
+                    evaluation_results['gpu_metrics_windows'] = gpu_metrics['windows']
+                    evaluation_results['gpu_metrics_stability'] = gpu_metrics['stability']
+                    evaluation_results['gpu_metrics_bucket_means'] = gpu_metrics['bucket_means']
+
+                    stability = gpu_metrics['stability']
+                    global_gpu = gpu_metrics['global']
+                    ic_pct = stability.get('ic_positive_pct', 0.0)
+                    sharpe_pct = stability.get('sharpe_positive_pct', 0.0)
+                    self.logger.info(
+                        "[FinalMetrics] IC=%.4f, ICIR=%.4f, Hit=%.4f, Sharpe(liq)=%.4f, Sortino(liq)=%.4f, "
+                        "MDD(liq)=%.6f, Q5-Q1=%.6f, Estab_IC=%.2f%%, Estab_Sharpe=%.2f%%",
+                        global_gpu.get('IC', 0.0),
+                        global_gpu.get('ICIR', 0.0),
+                        global_gpu.get('hit', 0.0),
+                        global_gpu.get('sharpe_liq', 0.0),
+                        global_gpu.get('sortino_liq', 0.0),
+                        global_gpu.get('mdd_liq', 0.0),
+                        global_gpu.get('q5_minus_q1', 0.0),
+                        ic_pct * 100.0,
+                        sharpe_pct * 100.0
+                    )
+                    self.logger.info(
+                        "[FinalMetrics] Z=%.3f, Turnover=%.4f, Trades=%d, TStat(Q5-Q1)=%.3f",
+                        global_gpu.get('z_score', 0.0),
+                        global_gpu.get('turnover', 0.0),
+                        global_gpu.get('trades_total', 0),
+                        global_gpu.get('tstat_q5q1', 0.0)
+                    )
+
+                    bucket_means = gpu_metrics['bucket_means']
+                    if bucket_means:
+                        bucket_mono = global_gpu.get('bucket_monotonicity', 0.0)
+                        self.logger.info(
+                            "[FinalMetrics] BucketMonotonicity(Spearman)=%.3f",
+                            bucket_mono
+                        )
+
+                    self._log_info('GPU metrics logging completed successfully',
+                                  symbol=symbol_upper, timeframe=timeframe_lower,
+                                  q5_minus_q1=global_gpu.get('q5_minus_q1', 0.0),
+                                  tstat_q5q1=global_gpu.get('tstat_q5q1', 0.0))
+                except Exception as gpu_err:
+                    self._log_error('GPU post-training metrics failed', 
+                                  error=str(gpu_err),
+                                  error_type=type(gpu_err).__name__,
+                                  symbol=symbol_upper,
+                                  timeframe=timeframe_lower,
+                                  traceback=_tb.format_exc())
+
                     try:
-                        self._log_info('Starting GPU post-training metrics calculation',
-                                      symbol=symbol_upper, timeframe=timeframe_lower)
-                        
-                        params = self._resolve_timeframe_params(timeframe_lower)
-                        cost_per_trade = self._resolve_cost_per_trade(symbol_upper, timeframe_lower)
-                        
-                        self._log_info('GPU metrics parameters resolved',
-                                      symbol=symbol_upper, timeframe=timeframe_lower,
-                                      cost_per_trade=cost_per_trade,
-                                      annual_factor=params['annual_factor'],
-                                      window_size=params['window_size'])
-                        
-                        # Create fresh GPU metrics engine for each symbol to avoid state issues
-                        gpu_metrics_engine = GPUPostTrainingMetrics(
-                            cost_per_trade=cost_per_trade,
-                            annual_factor=params['annual_factor'],
-                            window_size=params['window_size']
-                        )
-                        
-                        self._log_info('GPU metrics engine created, computing metrics',
-                                      symbol=symbol_upper, timeframe=timeframe_lower,
-                                      y_test_size=len(y_test), y_pred_size=len(test_pred))
-                        
-                        gpu_metrics = gpu_metrics_engine.compute_metrics(
-                            y_true=y_test,
-                            y_pred=test_pred
-                        )
-                        
-                        self._log_info('GPU metrics computation completed',
-                                      symbol=symbol_upper, timeframe=timeframe_lower,
-                                      has_global=bool(gpu_metrics.get('global')),
-                                      has_stability=bool(gpu_metrics.get('stability')),
-                                      has_windows=bool(gpu_metrics.get('windows')))
-
-                        evaluation_results['gpu_metrics_global'] = gpu_metrics['global']
-                        evaluation_results['gpu_metrics_windows'] = gpu_metrics['windows']
-                        evaluation_results['gpu_metrics_stability'] = gpu_metrics['stability']
-                        evaluation_results['gpu_metrics_bucket_means'] = gpu_metrics['bucket_means']
-
-                        stability = gpu_metrics['stability']
-                        global_gpu = gpu_metrics['global']
-                        ic_pct = stability.get('ic_positive_pct', 0.0)
-                        sharpe_pct = stability.get('sharpe_positive_pct', 0.0)
-                        self.logger.info(
-                            "[FinalMetrics] IC=%.4f, ICIR=%.4f, Hit=%.4f, Sharpe(liq)=%.4f, Sortino(liq)=%.4f, "
-                            "MDD(liq)=%.6f, Q5-Q1=%.6f, Estab_IC=%.2f%%, Estab_Sharpe=%.2f%%",
-                            global_gpu.get('IC', 0.0),
-                            global_gpu.get('ICIR', 0.0),
-                            global_gpu.get('hit', 0.0),
-                            global_gpu.get('sharpe_liq', 0.0),
-                            global_gpu.get('sortino_liq', 0.0),
-                            global_gpu.get('mdd_liq', 0.0),
-                            global_gpu.get('q5_minus_q1', 0.0),
-                            ic_pct * 100.0,
-                            sharpe_pct * 100.0
-                        )
-                        self.logger.info(
-                            "[FinalMetrics] Z=%.3f, Turnover=%.4f, Trades=%d, TStat(Q5-Q1)=%.3f",
-                            global_gpu.get('z_score', 0.0),
-                            global_gpu.get('turnover', 0.0),
-                            global_gpu.get('trades_total', 0),
-                            global_gpu.get('tstat_q5q1', 0.0)
-                        )
-                        
-                        # Log bucket monotonicity for validation
-                        bucket_means = gpu_metrics['bucket_means']
-                        if bucket_means:
-                            # The bucket_monotonicity comes from the bucket calculation
-                            bucket_mono = global_gpu.get('bucket_monotonicity', 0.0)
-                            self.logger.info(
-                                "[FinalMetrics] BucketMonotonicity(Spearman)=%.3f",
-                                bucket_mono
-                            )
-                        
-                        self._log_info('GPU metrics logging completed successfully',
-                                      symbol=symbol_upper, timeframe=timeframe_lower,
-                                      q5_minus_q1=global_gpu.get('q5_minus_q1', 0.0),
-                                      tstat_q5q1=global_gpu.get('tstat_q5q1', 0.0))
-                    except Exception as gpu_err:
-                        self._log_error('GPU post-training metrics failed', 
-                                      error=str(gpu_err),
-                                      error_type=type(gpu_err).__name__,
-                                      symbol=symbol_upper,
-                                      timeframe=timeframe_lower,
-                                      traceback=_tb.format_exc())
-                        
-                        # Try to clean up GPU memory if possible
-                        try:
-                            import gc
-                            import cupy as cp
-                            gc.collect()
-                            cp.get_default_memory_pool().free_all_blocks()
-                            self._log_info('GPU memory cleanup attempted after metrics failure')
-                        except Exception as cleanup_err:
-                            self._log_warn('GPU memory cleanup failed', error=str(cleanup_err))
-                else:
-                    self._log_info('GPU metrics disabled for symbol',
-                                  symbol=symbol_upper, timeframe=timeframe_lower)
+                        import gc
+                        import cupy as cp
+                        gc.collect()
+                        cp.get_default_memory_pool().free_all_blocks()
+                        self._log_info('GPU memory cleanup attempted after metrics failure')
+                    except Exception as cleanup_err:
+                        self._log_warn('GPU memory cleanup failed', error=str(cleanup_err))
             
             # Add prediction statistics
             evaluation_results.update({
@@ -857,296 +837,51 @@ class FinalModelTrainer:
 
         return '60m'
 
-    def _save_to_database(self, 
-                         symbol: str,
-                         timeframe: str,
-                         selected_features: List[str],
-                         feature_importances: Dict[str, float],
-                         selection_metadata: Dict[str, Any],
-                         model_results: Dict[str, Any],
-                         evaluation_results: Dict[str, Any],
-                         task_type: str) -> int:
-        """Save all results to the database and return the record ID."""
-        
-        self._log_info('Saving results to database', symbol=symbol, timeframe=timeframe)
-        
-        try:
-            # Prepare data for database
-            timestamp = datetime.utcnow()
-            
-            # Create model name with symbol prefix
-            model_name = f"catboost_{symbol.lower()}_{timeframe}"
-            model_version = self._get_next_model_version(symbol, timeframe)
-            
-            # Main model record
-            model_record = {
-                'model_name': model_name,
-                'model_version': model_version,
-                'symbol': symbol,
-                'timeframe': timeframe,
-                'task_type': task_type,
-                'feature_count': len(selected_features),
-                'training_samples': len(model_results['train_predictions']),
-                'test_samples': len(model_results['test_predictions']),
-                'train_score': evaluation_results['train_primary_metric'],
-                'test_score': evaluation_results['test_primary_metric'],
-                'model_config': json.dumps(model_results['model_info']),
-                'selection_metadata': json.dumps(selection_metadata),
-                'evaluation_metrics': json.dumps(evaluation_results),
-                'is_active': True,  # Mark as active model for this symbol
-                'created_at': timestamp,
-                'updated_at': timestamp
-            }
-            
-            # Insert main record
-            with self.db_handler.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # Create tables if they don't exist
-                self._create_database_tables(cursor)
-                
-                # Deactivate previous models for this symbol/timeframe
-                deactivate_sql = """
-                UPDATE final_models 
-                SET is_active = FALSE, updated_at = %s 
-                WHERE symbol = %s AND timeframe = %s AND is_active = TRUE
-                """
-                cursor.execute(deactivate_sql, (timestamp, symbol, timeframe))
-                
-                # Insert main model record
-                insert_model_sql = """
-                INSERT INTO final_models (
-                    model_name, model_version, symbol, timeframe, task_type, feature_count, 
-                    training_samples, test_samples, train_score, test_score, model_config, 
-                    selection_metadata, evaluation_metrics, is_active, created_at, updated_at
-                ) VALUES (
-                    %(model_name)s, %(model_version)s, %(symbol)s, %(timeframe)s, %(task_type)s, %(feature_count)s,
-                    %(training_samples)s, %(test_samples)s, %(train_score)s, %(test_score)s, %(model_config)s,
-                    %(selection_metadata)s, %(evaluation_metrics)s, %(is_active)s, %(created_at)s, %(updated_at)s
-                )
-                """
-                
-                cursor.execute(insert_model_sql, model_record)
-                model_id = cursor.lastrowid
-                
-                self._log_info('Model record saved', 
-                               model_id=model_id, 
-                               model_name=model_name, 
-                               version=model_version)
-                
-                # Insert selected features with their importances
-                for rank, feature_name in enumerate(selected_features, 1):
-                    importance_from_selection = feature_importances.get(feature_name, 0.0)
-                    importance_from_final = model_results['feature_importances'].get(feature_name, 0.0)
-                    
-                    # Calculate final ranking based on final importance
-                    final_ranking = sorted(model_results['feature_importances'].items(), 
-                                         key=lambda x: x[1], reverse=True)
-                    try:
-                        rank_final = next(i for i, (fname, _) in enumerate(final_ranking, 1) 
-                                        if fname == feature_name)
-                    except StopIteration:
-                        rank_final = rank
-                    
-                    feature_record = {
-                        'model_id': model_id,
-                        'feature_name': feature_name,
-                        'selection_importance': importance_from_selection,
-                        'final_importance': importance_from_final,
-                        'rank_selection': rank,
-                        'rank_final': rank_final,
-                        'created_at': timestamp
-                    }
-                    
-                    insert_feature_sql = """
-                    INSERT INTO model_features (
-                        model_id, feature_name, selection_importance, final_importance,
-                        rank_selection, rank_final, created_at
-                    ) VALUES (
-                        %(model_id)s, %(feature_name)s, %(selection_importance)s, %(final_importance)s,
-                        %(rank_selection)s, %(rank_final)s, %(created_at)s
-                    )
-                    """
-                    
-                    cursor.execute(insert_feature_sql, feature_record)
-                
-                # Insert detailed metrics
-                metrics_saved = 0
-                for metric_name, metric_value in evaluation_results.items():
-                    if isinstance(metric_value, (int, float)) and np.isfinite(metric_value):
-                        metric_record = {
-                            'model_id': model_id,
-                            'metric_name': metric_name,
-                            'metric_value': float(metric_value),
-                            'metric_category': self._get_metric_category(metric_name),
-                            'created_at': timestamp
-                        }
-                        
-                        insert_metric_sql = """
-                        INSERT INTO model_metrics (
-                            model_id, metric_name, metric_value, metric_category, created_at
-                        ) VALUES (
-                            %(model_id)s, %(metric_name)s, %(metric_value)s, %(metric_category)s, %(created_at)s
-                        )
-                        """
-                        
-                        cursor.execute(insert_metric_sql, metric_record)
-                        metrics_saved += 1
-                
-                conn.commit()
-                
-                self._log_info('Results saved to database successfully', 
-                               model_id=model_id,
-                               model_name=model_name,
-                               features_saved=len(selected_features),
-                               metrics_saved=metrics_saved)
-                
-                return model_id
-                
-        except Exception as e:
-            self._log_error('Failed to save results to database', 
-                           error=str(e), 
-                           traceback=_tb.format_exc())
-            raise
+    def _extract_frac_diff_details(self, X_df, selected_features: List[str]) -> Dict[str, Any]:
+        """Extract fractional differentiation metadata for selected features."""
+        details: Dict[str, Any] = {}
 
-    def _get_next_model_version(self, symbol: str, timeframe: str) -> int:
-        """Get the next version number for this symbol/timeframe combination."""
-        try:
-            with self.db_handler.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT COALESCE(MAX(model_version), 0) + 1 FROM final_models WHERE symbol = %s AND timeframe = %s",
-                    (symbol, timeframe)
-                )
-                result = cursor.fetchone()
-                return result[0] if result else 1
-        except Exception as e:
-            self._log_warn('Failed to get next model version; using 1', error=str(e))
-            return 1
+        if X_df is None or not hasattr(X_df, 'columns'):
+            return details
 
-    def _get_metric_category(self, metric_name: str) -> str:
-        """Categorize metrics for better organization."""
-        if 'train_' in metric_name:
-            return 'training'
-        elif 'test_' in metric_name:
-            return 'testing'
-        elif 'skill' in metric_name.lower():
-            return 'trading'
-        elif 'information_coefficient' in metric_name.lower() or 'ic_' in metric_name.lower():
-            return 'trading'
-        elif 'diebold' in metric_name.lower():
-            return 'statistical'
-        elif any(x in metric_name.lower() for x in ['r2', 'mse', 'mae', 'rmse']):
-            return 'regression'
-        elif any(x in metric_name.lower() for x in ['accuracy', 'precision', 'recall', 'f1', 'auc']):
-            return 'classification'
-        else:
-            return 'other'
+        for feature in selected_features:
+            if not feature or 'frac_diff' not in feature:
+                continue
 
-    def _create_database_tables(self, cursor):
-        """Create database tables if they don't exist."""
-        
-        # Main models table with model naming and versioning
-        create_models_table = """
-        CREATE TABLE IF NOT EXISTS final_models (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            model_name VARCHAR(100) NOT NULL,
-            model_version INT NOT NULL DEFAULT 1,
-            symbol VARCHAR(20) NOT NULL,
-            timeframe VARCHAR(10) NOT NULL,
-            task_type VARCHAR(20) NOT NULL,
-            feature_count INT NOT NULL,
-            training_samples INT NOT NULL,
-            test_samples INT NOT NULL,
-            train_score FLOAT NOT NULL,
-            test_score FLOAT NOT NULL,
-            model_config TEXT,
-            selection_metadata TEXT,
-            evaluation_metrics TEXT,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY unique_model_version (symbol, timeframe, model_version),
-            INDEX idx_model_name (model_name),
-            INDEX idx_symbol_timeframe (symbol, timeframe),
-            INDEX idx_created_at (created_at),
-            INDEX idx_test_score (test_score),
-            INDEX idx_is_active (is_active)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """
-        
-        # Features table
-        create_features_table = """
-        CREATE TABLE IF NOT EXISTS model_features (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            model_id INT NOT NULL,
-            feature_name VARCHAR(255) NOT NULL,
-            selection_importance FLOAT NOT NULL,
-            final_importance FLOAT NOT NULL,
-            rank_selection INT NOT NULL,
-            rank_final INT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (model_id) REFERENCES final_models(id) ON DELETE CASCADE,
-            INDEX idx_model_id (model_id),
-            INDEX idx_feature_name (feature_name),
-            INDEX idx_final_importance (final_importance),
-            INDEX idx_rank_final (rank_final)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """
-        
-        # Metrics table with categorization
-        create_metrics_table = """
-        CREATE TABLE IF NOT EXISTS model_metrics (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            model_id INT NOT NULL,
-            metric_name VARCHAR(100) NOT NULL,
-            metric_value FLOAT NOT NULL,
-            metric_category VARCHAR(50) DEFAULT 'other',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (model_id) REFERENCES final_models(id) ON DELETE CASCADE,
-            INDEX idx_model_id (model_id),
-            INDEX idx_metric_name (metric_name),
-            INDEX idx_metric_value (metric_value),
-            INDEX idx_metric_category (metric_category)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """
-        
-        # Model performance summary view (optional)
-        create_summary_view = """
-        CREATE OR REPLACE VIEW model_performance_summary AS
-        SELECT 
-            m.id,
-            m.model_name,
-            m.model_version,
-            m.symbol,
-            m.timeframe,
-            m.task_type,
-            m.feature_count,
-            m.test_score,
-            m.is_active,
-            m.created_at,
-            GROUP_CONCAT(DISTINCT f.feature_name ORDER BY f.rank_final LIMIT 10) as top_features,
-            (SELECT metric_value FROM model_metrics WHERE model_id = m.id AND metric_name = 'test_r2' LIMIT 1) as test_r2,
-            (SELECT metric_value FROM model_metrics WHERE model_id = m.id AND metric_name = 'test_skill_score' LIMIT 1) as test_skill_score,
-            (SELECT metric_value FROM model_metrics WHERE model_id = m.id AND metric_name = 'test_information_coefficient' LIMIT 1) as test_ic
-        FROM final_models m
-        LEFT JOIN model_features f ON m.id = f.model_id
-        GROUP BY m.id, m.model_name, m.model_version, m.symbol, m.timeframe, m.task_type, m.feature_count, m.test_score, m.is_active, m.created_at
-        """
-        
-        try:
-            cursor.execute(create_models_table)
-            cursor.execute(create_features_table)
-            cursor.execute(create_metrics_table)
-            cursor.execute(create_summary_view)
-            
-            self._log_info('Database tables and views created/verified successfully')
-            
-        except Exception as e:
-            # If view creation fails, continue without it
-            if 'view' not in str(e).lower():
-                raise
-            self._log_warn('Failed to create summary view; continuing without it', error=str(e))
+            d_column = f"{feature}_d"
+            if d_column not in X_df.columns:
+                continue
+
+            try:
+                d_series = X_df[d_column].dropna()
+                if len(d_series) == 0:
+                    continue
+
+                first_value = d_series.iloc[0]
+                d_value = float(first_value)
+
+                unique_values: List[float] = []
+                try:
+                    uniques = d_series.unique()
+                    if hasattr(uniques, 'to_pandas'):
+                        uniques = uniques.to_pandas()
+                    unique_values = [float(v) for v in list(uniques) if v is not None]
+                except Exception:
+                    unique_values = [d_value]
+
+                details[feature] = {
+                    'd': d_value,
+                    'd_column': d_column,
+                    'unique_d_values': unique_values,
+                }
+            except Exception as err:
+                self._log_warn('Failed to extract frac_diff value for feature',
+                               feature=feature,
+                               error=str(err))
+
+        return details
+
+    # Database methods removed - using JSON metadata in R2 instead
     
     def _upload_model_to_r2(self,
                            symbol: str,
@@ -1155,8 +890,7 @@ class FinalModelTrainer:
                            feature_importances: Dict[str, float],
                            model_results: Dict[str, Any],
                            evaluation_results: Dict[str, Any],
-                           task_type: str,
-                           db_record_id: int) -> bool:
+                           task_type: str) -> bool:
         """
         Upload the trained model to R2 cloud storage with metadata and cleanup.
         
@@ -1168,7 +902,6 @@ class FinalModelTrainer:
             model_results: Model training results
             evaluation_results: Model evaluation results
             task_type: 'regression' or 'classification'
-            db_record_id: Database record ID
             
         Returns:
             bool: True if upload successful, False otherwise
@@ -1176,15 +909,15 @@ class FinalModelTrainer:
         try:
             self._log_info('Starting model upload to R2', 
                           symbol=symbol, 
-                          timeframe=timeframe,
-                          db_record_id=db_record_id)
+                          timeframe=timeframe)
             
             # 1. Resolve naming components
             resolved_timeframe = self._resolve_output_timeframe(timeframe)
             symbol_upper = str(symbol or '').upper()
             symbol_lower = symbol_upper.lower()
             model_name_base = f"catboost_{symbol_lower}_{resolved_timeframe}"
-            model_version = self._get_next_model_version(symbol, timeframe)
+            # Simple version using timestamp since no database tracking
+            model_version = int(datetime.now().timestamp()) % 10000  # Simple version number
             
             # 2. Save model to temporary file
             import tempfile
@@ -1211,7 +944,6 @@ class FinalModelTrainer:
                 'symbol': symbol_upper,
                 'timeframe': resolved_timeframe,
                 'task_type': task_type,
-                'db_record_id': db_record_id,
                 'created_at': datetime.now().isoformat(),
                 
                 # Training configuration
