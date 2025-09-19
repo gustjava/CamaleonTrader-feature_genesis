@@ -24,13 +24,13 @@
 - **`gpus_per_worker`**: GPUs por worker (padrão: 1)
 - **`threads_per_worker`**: Threads por worker (padrão: 1)
 - **`memory_limit`**: Limite fixo de RAM por worker (padrão: 0GB - desabilitado)
-- **`memory_limit_fraction`**: Fração da RAM do sistema por worker (padrão: 0.25 = 25%)
+- **`memory_limit_fraction`**: Fração da RAM do sistema por worker (padrão: 0.70 = 70%)
 - **`rmm_pool_fraction`**: Fração da GPU para pool RMM (padrão: 0.0 - desabilitado)
 - **`rmm_initial_pool_fraction`**: Fração inicial do pool RMM (padrão: 0.0)
 - **`spilling_enabled`**: Habilita spill para RAM (padrão: true)
 - **`spilling_target`**: Alvo de utilização antes do spill (padrão: 0.9)
 - **`memory_target_fraction`**: Alvo de utilização de RAM (padrão: 0.8)
-- **`protocol`**: Protocolo de rede (tcp/ucx, padrão: tcp)
+- **`protocol`**: Protocolo de rede (tcp/ucx, padrão atual: ucx)
 - **`enable_nvlink`**: Habilita NVLink (padrão: false)
 
 ### 1.4 Configurações de Feature Engineering (`features`)
@@ -44,16 +44,17 @@
   - `p/q`: Ordem do modelo GARCH (padrão: 1,1)
   - `max_iter`: Máximo de iterações (padrão: 1000)
   - `max_samples`: Máximo de amostras (padrão: 10000)
-- **`selection_target_column`**: Coluna alvo para seleção (padrão: y_ret_fwd_15m)
+- **`selection_target_column`**: Coluna alvo para seleção (padrão: y_ret_fwd_60m)
 - **`dcor_top_k`**: Top K features por correlação de distância (padrão: 50)
-- **`stage1_rolling_enabled`**: Habilita correlação móvel (padrão: true)
 - **`force_gpu_usage`**: Força uso de GPU (padrão: true)
 
 ### 1.5 Configurações de Pipeline (`pipeline.engines`)
-- **`stationarization`**: Engine de estacionarização (ordem: 1)
-- **`feature_engineering`**: Engine de feature engineering (ordem: 2)
-- **`garch_models`**: Engine de modelos GARCH (ordem: 3)
-- **`statistical_tests`**: Engine de testes estatísticos (ordem: 4)
+- Ordem funcional atual:
+  - `signal_processing` (EMD)
+  - `stationarization`
+  - `feature_engineering`
+  - `garch_models`
+  - `statistical_tests`
 
 ### 1.6 Configurações de Desenvolvimento (`development`)
 - **`debug_mode`**: Modo de debug (padrão: false)
@@ -61,10 +62,22 @@
 - **`force_reprocessing`**: Força reprocessamento (padrão: false)
 - **`log_memory_usage`**: Log de uso de memória (padrão: true)
 
+### 1.7 CatBoost Final (Stage 3)
+- `stage3_catboost_iterations`: 750
+- `stage3_catboost_learning_rate`: 0.025
+- `stage3_catboost_depth`: 6
+- `stage3_catboost_l2_leaf_reg`: 10
+- `stage3_catboost_bootstrap_type`: Bernoulli
+- `stage3_catboost_subsample`: 0.7
+- `stage3_catboost_task_type`: GPU, `stage3_catboost_devices`: "0"
+- `stage3_catboost_thread_count`: 1
+- `stage3_catboost_loss_regression`: RMSE
+- `stage3_catboost_early_stopping_rounds`: 100
+- `stage3_catboost_use_full_dataset`: true
+
 ## 2. Tecnologias e Algoritmos por Passo
 
-
-[1 tool called]
+> Observação: seções obsoletas de ferramentas externas foram removidas; a análise reflete apenas o que está ativo em `config/config.yaml` e `config/unified_config.py`.
 
 ### 2.1 Inicialização e Configuração
 **Tecnologias:**
@@ -96,6 +109,7 @@
 - **Diferenciação Fracionária**: Algoritmo para tornar séries não-estacionárias em estacionárias
 - **Convolução GPU**: Operações de convolução aceleradas por GPU
 - **FFT (Fast Fourier Transform)**: Transformada rápida de Fourier para kernels grandes
+- **cuSignal**: backend FFT para frac_diff em GPU (instalado no deploy)
 - **Z-Score Rolling**: Normalização estatística móvel
 
 **Algoritmos:**
