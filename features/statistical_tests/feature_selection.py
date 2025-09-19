@@ -10,9 +10,13 @@ import numpy as np
 import cupy as cp
 import cudf
 import traceback as _tb
+import warnings
 from typing import List, Dict, Any, Tuple
 from .utils import _hermitian_pinv_gpu
 from utils.logging_utils import get_logger
+
+# Suppress GPU memory warnings globally for this module
+warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
 
 logger = get_logger(__name__, "features.statistical_tests.feature_selection")
 
@@ -66,7 +70,7 @@ class FeatureSelection:
             if not enable_vol_scaling:
                 return y_series, None, {'method': 'none', 'enabled': False}
             
-            vol_method = str(getattr(self, 'vol_scaling_method', 'garch')).lower()
+            vol_method = str(getattr(self, 'vol_scaling_method', 'rolling')).lower()
             self._log_info('Applying volatility scaling', method=vol_method, y_shape=y_series.shape)
             
             # Convert to numpy for processing
@@ -78,45 +82,7 @@ class FeatureSelection:
             vol_weights = None
             scaling_info = {'method': vol_method, 'enabled': True}
             
-            if vol_method == 'garch':
-                try:
-                    # Simple GARCH(1,1) approximation using rolling volatility
-                    # Convert to pandas if needed for rolling operations
-                    import pandas as pd
-                    if hasattr(y_series, 'to_pandas'):
-                        y_pd = y_series.to_pandas()
-                    else:
-                        y_pd = pd.Series(y_np)
-                    
-                    # Compute rolling volatility (GARCH approximation)
-                    window = int(getattr(self, 'vol_scaling_window', 50))
-                    vol_est = y_pd.rolling(window=window, min_periods=10).std()
-                    
-                    # Fill initial NAs with expanding std
-                    vol_est = vol_est.fillna(y_pd.expanding(min_periods=1).std())
-                    
-                    # Ensure positive volatility with minimum threshold
-                    min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
-                    vol_est = np.maximum(vol_est.values, min_vol)
-                    
-                    # Apply vol-scaling: ỹ = y / σ̂_t
-                    y_scaled = y_np / vol_est
-                    vol_weights = 1.0 / vol_est
-                    
-                    scaling_info.update({
-                        'window': window,
-                        'min_vol': min_vol,
-                        'mean_vol': float(np.mean(vol_est)),
-                        'vol_range': [float(np.min(vol_est)), float(np.max(vol_est))]
-                    })
-                    
-                    self._log_info('GARCH vol-scaling applied', 
-                                   mean_vol=scaling_info['mean_vol'],
-                                   vol_range=scaling_info['vol_range'])
-                    
-                except Exception as garch_err:
-                    self._log_warn('GARCH vol-scaling failed; using rolling std', error=str(garch_err))
-                    vol_method = 'rolling'  # Fallback
+            # GARCH method removed - using rolling as default
             
             if vol_method == 'rolling' or vol_method == 'realized':
                 try:
@@ -148,7 +114,7 @@ class FeatureSelection:
                     self._log_warn('Rolling vol-scaling failed; using constant', error=str(rolling_err))
                     vol_method = 'constant'
             
-            if vol_method == 'constant' or vol_method not in ['garch', 'rolling', 'realized']:
+            if vol_method == 'constant' or vol_method not in ['rolling', 'realized']:
                 # Fallback: constant volatility (standard deviation of full series)
                 vol_const = float(np.std(y_np))
                 min_vol = float(getattr(self, 'vol_scaling_min_vol', 1e-6))
@@ -779,6 +745,7 @@ class FeatureSelection:
 
         # Build model with enhanced parameters
         from catboost import CatBoostClassifier, CatBoostRegressor, Pool as _Pool
+        import warnings
         
         # Enhanced parameters from config
         l2_leaf_reg = float(getattr(self, 'stage3_catboost_l2_leaf_reg', 10.0))
@@ -790,38 +757,46 @@ class FeatureSelection:
             is_binary = len(unique_y) == 2
             loss_function = 'Logloss' if is_binary else 'MultiClass'
             eval_metric = 'AUC' if is_binary else 'Accuracy'
-            model = CatBoostClassifier(
-                iterations=iterations,
-                learning_rate=learning_rate,
-                depth=depth if depth > 0 else 6,
-                random_seed=random_state,
-                task_type=task_type,
-                devices=devices,
-                loss_function=loss_function,
-                eval_metric=eval_metric,
-                verbose=0,
-                thread_count=thread_count,
-                l2_leaf_reg=l2_leaf_reg,
-                bootstrap_type=bootstrap_type,
-                subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-            )
+            
+            # Suppress GPU memory warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                model = CatBoostClassifier(
+                    iterations=iterations,
+                    learning_rate=learning_rate,
+                    depth=depth if depth > 0 else 6,
+                    random_seed=random_state,
+                    task_type=task_type,
+                    devices=devices,
+                    loss_function=loss_function,
+                    eval_metric=eval_metric,
+                    verbose=0,
+                    thread_count=thread_count,
+                    l2_leaf_reg=l2_leaf_reg,
+                    bootstrap_type=bootstrap_type,
+                    subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                )
         else:
             loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
-            model = CatBoostRegressor(
-                iterations=iterations,
-                learning_rate=learning_rate,
-                depth=depth if depth > 0 else 6,
-                random_seed=random_state,
-                task_type=task_type,
-                devices=devices,
-                loss_function=loss_fn,
-                eval_metric=loss_fn,
-                verbose=0,
-                thread_count=thread_count,
-                l2_leaf_reg=l2_leaf_reg,
-                bootstrap_type=bootstrap_type,
-                subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-            )
+            
+            # Suppress GPU memory warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                model = CatBoostRegressor(
+                    iterations=iterations,
+                    learning_rate=learning_rate,
+                    depth=depth if depth > 0 else 6,
+                    random_seed=random_state,
+                    task_type=task_type,
+                    devices=devices,
+                    loss_function=loss_fn,
+                    eval_metric=loss_fn,
+                    verbose=0,
+                    thread_count=thread_count,
+                    l2_leaf_reg=l2_leaf_reg,
+                    bootstrap_type=bootstrap_type,
+                    subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                )
 
         # Early stopping + CV setup
         esr = int(getattr(self, 'stage3_catboost_early_stopping_rounds', 0))
@@ -839,7 +814,10 @@ class FeatureSelection:
                         fit_kwargs.update({'use_best_model': True, 'early_stopping_rounds': esr})
                     try:
                         self._log_info('CatBoost fit start (with validation)', train_size=len(tr_idx), valid_size=len(va_idx))
-                        model.fit(train_pool, **fit_kwargs)
+                        # Suppress GPU memory warnings during training
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                            model.fit(train_pool, **fit_kwargs)
                         self._log_info('CatBoost fit successful (with validation)')
                     except Exception as fit_err:
                         # Log detailed traceback and re-raise
@@ -861,7 +839,10 @@ class FeatureSelection:
                     train_pool = _Pool(X_fit, y_fit, feature_names=feat_names)
                     try:
                         self._log_info('CatBoost fit start (no validation)', train_size=len(X_fit))
-                        model.fit(train_pool)
+                        # Suppress GPU memory warnings during training
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                            model.fit(train_pool)
                         self._log_info('CatBoost fit successful (no validation)')
                     except Exception as fit_err:
                         tb = _tb.format_exc()
@@ -1192,43 +1173,52 @@ class FeatureSelection:
                 if X_selected.shape[1] > 0:
                     # Use same model configuration but with selected features
                     if task == 'classification':
-                        model_selected = CatBoostClassifier(
-                            iterations=min(iterations, 200),  # Faster validation
-                            learning_rate=learning_rate,
-                            depth=depth if depth > 0 else 6,
-                            random_seed=random_state,
-                            task_type=task_type,
-                            devices=devices,
-                            loss_function=loss_function,
-                            eval_metric=eval_metric,
-                            verbose=0,
-                            thread_count=thread_count,
-                            l2_leaf_reg=l2_leaf_reg,
-                            bootstrap_type=bootstrap_type,
-                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                        )
+                        # Suppress GPU memory warnings
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                            model_selected = CatBoostClassifier(
+                                iterations=min(iterations, 200),  # Faster validation
+                                learning_rate=learning_rate,
+                                depth=depth if depth > 0 else 6,
+                                random_seed=random_state,
+                                task_type=task_type,
+                                devices=devices,
+                                loss_function=loss_function,
+                                eval_metric=eval_metric,
+                                verbose=0,
+                                thread_count=thread_count,
+                                l2_leaf_reg=l2_leaf_reg,
+                                bootstrap_type=bootstrap_type,
+                                subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                            )
                     else:
-                        model_selected = CatBoostRegressor(
-                            iterations=min(iterations, 200),  # Faster validation
-                            learning_rate=learning_rate,
-                            depth=depth if depth > 0 else 6,
-                            random_seed=random_state,
-                            task_type=task_type,
-                            devices=devices,
-                            loss_function=loss_fn,
-                            eval_metric=loss_fn,
-                            verbose=0,
-                            thread_count=thread_count,
-                            l2_leaf_reg=l2_leaf_reg,
-                            bootstrap_type=bootstrap_type,
-                            subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                        )
+                        # Suppress GPU memory warnings
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                            model_selected = CatBoostRegressor(
+                                iterations=min(iterations, 200),  # Faster validation
+                                learning_rate=learning_rate,
+                                depth=depth if depth > 0 else 6,
+                                random_seed=random_state,
+                                task_type=task_type,
+                                devices=devices,
+                                loss_function=loss_fn,
+                                eval_metric=loss_fn,
+                                verbose=0,
+                                thread_count=thread_count,
+                                l2_leaf_reg=l2_leaf_reg,
+                                bootstrap_type=bootstrap_type,
+                                subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                            )
                     
                     # Create pools with selected features
                     pool_selected = _Pool(X_selected, y, feature_names=selected_candidates)
                     
                     # Train with selected features
-                    model_selected.fit(pool_selected)
+                    # Suppress GPU memory warnings during training
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                        model_selected.fit(pool_selected)
                     
                     # Predict and calculate metrics
                     pred_selected = model_selected.predict(pool_selected)

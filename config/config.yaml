@@ -578,9 +578,9 @@ development:
 pipeline:
   engines:
     signal_processing:
-      enabled: true
+      enabled: false
       order: 1
-      description: "Signal processing (EMD decomposition)"
+      description: "Signal processing (EMD decomposition) - DISABLED"
     stationarization:
       enabled: true
       order: 2
@@ -594,9 +594,9 @@ pipeline:
       timeout: 300
       retry_count: 3
     garch_models:
-      enabled: true
+      enabled: false
       order: 4
-      description: "GARCH volatility modeling"
+      description: "GARCH volatility modeling - DISABLED"
       timeout: 300
       retry_count: 3
     statistical_tests:

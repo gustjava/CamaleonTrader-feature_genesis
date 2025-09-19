@@ -10,9 +10,13 @@ import numpy as np
 import cupy as cp
 import cudf
 import json
+import warnings
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import traceback as _tb
+
+# Suppress GPU memory warnings globally for this module
+warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
 
 from utils.logging_utils import get_logger
 from utils.trading_metrics import TradingMetrics, GPUPostTrainingMetrics
@@ -205,13 +209,17 @@ class FinalModelTrainer:
                 train_test_split, task_type, selected_features
             )
             
+            # Capture frac_diff details before converting to numpy
+            frac_diff_details = self._extract_frac_diff_details(X_clean, selected_features)
+
             # 5. Comprehensive evaluation
             evaluation_results = self._comprehensive_evaluation(
                 model_results,
                 train_test_split,
                 task_type,
                 symbol=symbol,
-                timeframe=timeframe
+                timeframe=timeframe,
+                frac_diff_details=frac_diff_details
             )
             
             # 6. Upload model to R2 cloud storage (skip database - using JSON metadata)
@@ -242,7 +250,6 @@ class FinalModelTrainer:
             }
             
             self._log_info('Final model training completed successfully', 
-                           database_id=db_record_id,
                            train_score=evaluation_results.get('train_primary_metric', 0.0),
                            test_score=evaluation_results.get('test_primary_metric', 0.0))
             
@@ -331,6 +338,7 @@ class FinalModelTrainer:
         """Train the final CatBoost model with optimized parameters."""
         
         from catboost import CatBoostClassifier, CatBoostRegressor, Pool
+        import warnings
         
         # Get enhanced parameters from config
         iterations = int(getattr(self.config.features, 'stage3_catboost_iterations', 750))
@@ -373,37 +381,43 @@ class FinalModelTrainer:
                 loss_function = 'Logloss' if is_binary else 'MultiClass'
                 eval_metric = 'AUC' if is_binary else 'Accuracy'
                 
-                model = CatBoostClassifier(
-                    iterations=iterations,
-                    learning_rate=learning_rate,
-                    depth=depth,
-                    random_seed=random_state,
-                    task_type=task_type_gpu,
-                    devices=devices,
-                    loss_function=loss_function,
-                    eval_metric=eval_metric,
-                    verbose=100,  # Progress logging
-                    l2_leaf_reg=l2_leaf_reg,
-                    bootstrap_type=bootstrap_type,
-                    subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                )
+                # Suppress GPU memory warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                    model = CatBoostClassifier(
+                        iterations=iterations,
+                        learning_rate=learning_rate,
+                        depth=depth,
+                        random_seed=random_state,
+                        task_type=task_type_gpu,
+                        devices=devices,
+                        loss_function=loss_function,
+                        eval_metric=eval_metric,
+                        verbose=100,  # Progress logging
+                        l2_leaf_reg=l2_leaf_reg,
+                        bootstrap_type=bootstrap_type,
+                        subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                    )
             else:
                 loss_fn = str(getattr(self.config.features, 'stage3_catboost_loss_regression', 'RMSE'))
                 
-                model = CatBoostRegressor(
-                    iterations=iterations,
-                    learning_rate=learning_rate,
-                    depth=depth,
-                    random_seed=random_state,
-                    task_type=task_type_gpu,
-                    devices=devices,
-                    loss_function=loss_fn,
-                    eval_metric=loss_fn,
-                    verbose=100,  # Progress logging
-                    l2_leaf_reg=l2_leaf_reg,
-                    bootstrap_type=bootstrap_type,
-                    subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
-                )
+                # Suppress GPU memory warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                    model = CatBoostRegressor(
+                        iterations=iterations,
+                        learning_rate=learning_rate,
+                        depth=depth,
+                        random_seed=random_state,
+                        task_type=task_type_gpu,
+                        devices=devices,
+                        loss_function=loss_fn,
+                        eval_metric=loss_fn,
+                        verbose=100,  # Progress logging
+                        l2_leaf_reg=l2_leaf_reg,
+                        bootstrap_type=bootstrap_type,
+                        subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                    )
             
             # Training with validation
             fit_kwargs = {
@@ -414,7 +428,10 @@ class FinalModelTrainer:
             }
             
             self._log_info('Starting CatBoost training')
-            model.fit(train_pool, **fit_kwargs)
+            # Suppress GPU memory warnings during training
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                model.fit(train_pool, **fit_kwargs)
             
             # Get predictions
             train_pred = model.predict(train_pool)
@@ -483,7 +500,8 @@ class FinalModelTrainer:
         train_test_split: Dict[str, Any],
         task_type: str,
         symbol: Optional[str] = None,
-        timeframe: Optional[str] = None
+        timeframe: Optional[str] = None,
+        frac_diff_details: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Perform comprehensive evaluation using both standard and trading metrics."""
         
@@ -618,20 +636,6 @@ class FinalModelTrainer:
                     evaluation_results['train_primary_metric'] = evaluation_results['train_r2']
                     evaluation_results['test_primary_metric'] = evaluation_results['test_r2']
 
-                # Capture frac_diff configuration for selected features (if available)
-                try:
-                    frac_diff_details = self._extract_frac_diff_details(X_df, selected_features)
-                    if frac_diff_details:
-                        evaluation_results['frac_diff_details'] = frac_diff_details
-                        self._log_info('Recorded frac_diff details for selected features',
-                                       symbol=symbol_upper, timeframe=timeframe_lower,
-                                       frac_diff_features=len(frac_diff_details))
-                except Exception as frac_err:
-                    self._log_warn('Failed to record frac_diff details',
-                                   error=str(frac_err),
-                                   symbol=symbol_upper,
-                                   timeframe=timeframe_lower)
-
                 try:
                     self._log_info('Starting GPU post-training metrics calculation',
                                   symbol=symbol_upper, timeframe=timeframe_lower)
@@ -736,7 +740,10 @@ class FinalModelTrainer:
                 'test_target_mean': float(np.mean(y_test)),
                 'test_target_std': float(np.std(y_test))
             })
-            
+
+            if frac_diff_details:
+                evaluation_results['frac_diff_details'] = frac_diff_details
+
             self._log_info('Comprehensive evaluation completed', 
                            train_primary=evaluation_results['train_primary_metric'],
                            test_primary=evaluation_results['test_primary_metric'])

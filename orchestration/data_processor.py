@@ -9,12 +9,16 @@ import sys
 import os
 import time
 import traceback
+import warnings
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
 import cudf
 import cupy as cp
 import dask
+
+# Suppress GPU memory warnings globally for this module
+warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
 
 from config.unified_config import get_unified_config as get_settings
 from dask.distributed import Client, wait
@@ -23,10 +27,8 @@ from data_io.local_loader import LocalDataLoader
 from features import (
     StationarizationEngine,
     StatisticalTests,
-    GARCHModels,
     FeatureEngineeringEngine,
 )
-from features.signal_processing import apply_emd_to_series
 from features.base_engine import CriticalPipelineError
 from features.final_model import FinalModelTrainer
 from utils.trading_metrics import GPUPostTrainingMetrics
@@ -162,7 +164,6 @@ class DataProcessor:
         self.station = StationarizationEngine(self.settings, client)  # Engine 1: Estacionarização
         self.stats = StatisticalTests(self.settings, client)  # Engine 4: Testes estatísticos (estágios 1-4)
         self.feng = FeatureEngineeringEngine(self.settings, client)  # Engine 2: Feature engineering (BK filter)
-        self.garch = GARCHModels(self.settings, client)  # Engine 3: Modelos GARCH
         # Transparency helpers
         self._metrics = EngineMetrics()
     
@@ -331,7 +332,7 @@ class DataProcessor:
     
     def _get_required_columns(self) -> list:
         """Get the list of required columns for processing."""
-        return ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        return ['timestamp', 'y_open', 'y_high', 'y_low', 'y_close', 'y_volume']
 
     def _drop_denied_columns(self, df):
         """Drop columns that must never enter any stage.
@@ -523,42 +524,11 @@ class DataProcessor:
             elif engine_name == 'statistical_tests':
                 return self.stats.process_cudf(gdf)
             elif engine_name == 'signal_processing':
-                # Apply EMD on 'close' (if available) and concatenate IMFs
-                try:
-                    emd_cfg = getattr(self.settings.features, 'emd', {})
-                    max_imfs = int(emd_cfg.get('max_imfs', getattr(self.settings.features, 'emd_max_imfs', 10)))
-                    rolling_enable = bool(emd_cfg.get('rolling_enable', getattr(self.settings.features, 'emd_rolling_enable', False)))
-                    window_size = int(emd_cfg.get('rolling_window', getattr(self.settings.features, 'emd_rolling_window', 500)))
-                    step_size = int(emd_cfg.get('rolling_step', getattr(self.settings.features, 'emd_rolling_step', 50)))
-                    embargo = int(emd_cfg.get('rolling_embargo', getattr(self.settings.features, 'emd_rolling_embargo', 0)))
-                except Exception:
-                    max_imfs = getattr(self.settings.features, 'emd_max_imfs', 10)
-                    rolling_enable = getattr(self.settings.features, 'emd_rolling_enable', False)
-                    window_size = getattr(self.settings.features, 'emd_rolling_window', 500)
-                    step_size = getattr(self.settings.features, 'emd_rolling_step', 50)
-                    embargo = getattr(self.settings.features, 'emd_rolling_embargo', 0)
-
-                if 'close' not in gdf.columns:
-                    logger.warning("Coluna 'close' ausente; pulando EMD (signal_processing)")
-                    return gdf
-                try:
-                    if rolling_enable:
-                        from features.signal_processing import apply_rolling_emd
-                        imfs = apply_rolling_emd(gdf['close'], max_imfs=max_imfs,
-                                                 window_size=window_size, step_size=step_size,
-                                                 embargo=embargo)
-                    else:
-                        imfs = apply_emd_to_series(gdf['close'], max_imfs=max_imfs)
-                    # Prefix with 'emd_' to namespace features
-                    imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
-                    gdf = cudf.concat([gdf, imfs], axis=1)
-                    logger.info(f"EMD gerou {imfs.shape[1]} IMFs; novas colunas adicionadas")
-                    return gdf
-                except Exception as e:
-                    logger.warning(f"Falha ao aplicar EMD: {e}; mantendo DataFrame inalterado")
-                    return gdf
+                logger.info("Signal processing (EMD) disabled - skipping")
+                return gdf
             elif engine_name == 'garch_models':
-                return self.garch.process_cudf(gdf)
+                logger.info("GARCH models disabled - skipping")
+                return gdf
             else:
                 logger.warning(f"⚠️ Unknown engine: {engine_name}")
                 return gdf
@@ -578,57 +548,11 @@ class DataProcessor:
                 # Orchestrate StatisticalTests as explicit sub-stages for visibility
                 return self._run_statistical_tests_stages(ddf)
             elif engine_name == 'signal_processing':
-                # Compute EMD on worker by materializing a small cuDF subset and merge back by 'timestamp'.
-                try:
-                    import dask_cudf as _dask_cudf
-                except Exception:
-                    logger.info("dask_cudf indisponível; mantendo pass-through")
-                    return ddf
-
-                if 'close' not in ddf.columns or 'timestamp' not in ddf.columns:
-                    logger.warning("Colunas necessárias ('timestamp','close') ausentes; pulando EMD (Dask)")
-                    return ddf
-
-                try:
-                    emd_cfg = getattr(self.settings.features, 'emd', {})
-                    max_imfs = int(emd_cfg.get('max_imfs', getattr(self.settings.features, 'emd_max_imfs', 10)))
-                    rolling_enable = bool(emd_cfg.get('rolling_enable', getattr(self.settings.features, 'emd_rolling_enable', False)))
-                    window_size = int(emd_cfg.get('rolling_window', getattr(self.settings.features, 'emd_rolling_window', 500)))
-                    step_size = int(emd_cfg.get('rolling_step', getattr(self.settings.features, 'emd_rolling_step', 50)))
-                    embargo = int(emd_cfg.get('rolling_embargo', getattr(self.settings.features, 'emd_rolling_embargo', 0)))
-                except Exception:
-                    max_imfs = getattr(self.settings.features, 'emd_max_imfs', 10)
-                    rolling_enable = getattr(self.settings.features, 'emd_rolling_enable', False)
-                    window_size = getattr(self.settings.features, 'emd_rolling_window', 500)
-                    step_size = getattr(self.settings.features, 'emd_rolling_step', 50)
-                    embargo = getattr(self.settings.features, 'emd_rolling_embargo', 0)
-
-                # Materialize minimal columns on this worker
-                try:
-                    subset = ddf[['timestamp', 'close']].compute()
-                    subset = subset.sort_values('timestamp')
-                    if rolling_enable:
-                        from features.signal_processing import apply_rolling_emd
-                        imfs = apply_rolling_emd(subset['close'], max_imfs=max_imfs,
-                                                 window_size=window_size, step_size=step_size,
-                                                 embargo=embargo)
-                    else:
-                        imfs = apply_emd_to_series(subset['close'], max_imfs=max_imfs)
-                    # Prefix and add key for merge
-                    imfs = imfs.rename(columns={c: f"emd_{c}" for c in imfs.columns})
-                    imfs = imfs.reset_index(drop=True)
-                    subset = subset.reset_index(drop=True)
-                    imf_gdf = cudf.concat([subset[['timestamp']], imfs], axis=1)
-                    imf_ddf = _dask_cudf.from_cudf(imf_gdf, npartitions=max(1, ddf.npartitions))
-                    # Merge by timestamp to align back to the distributed frame
-                    ddf = ddf.merge(imf_ddf, on='timestamp', how='left')
-                    logger.info(f"EMD (Dask) gerou {imfs.shape[1]} IMFs; colunas adicionadas via merge")
-                    return ddf
-                except Exception as e:
-                    logger.warning(f"Falha ao aplicar EMD (Dask): {e}; mantendo pass-through")
-                    return ddf
+                logger.info("Signal processing (EMD) disabled - skipping")
+                return ddf
             elif engine_name == 'garch_models':
-                return self.garch.process(ddf)
+                logger.info("GARCH models disabled - skipping")
+                return ddf
             else:
                 logger.warning(f"⚠️ Unknown engine: {engine_name}")
                 return ddf
@@ -873,7 +797,15 @@ class DataProcessor:
                                 return
                             
                             # Simple CatBoost training based on test_catboost_simple.py
-                            X_train, X_test, y_train, y_test = train_test_split(X_clean.to_pandas(), y_clean.to_pandas(), test_size=0.2)
+                            rng = np.random.default_rng()
+                            split_seed = int(rng.integers(0, 2**32 - 1))
+                            X_train, X_test, y_train, y_test = train_test_split(
+                                X_clean.to_pandas(),
+                                y_clean.to_pandas(),
+                                test_size=0.2,
+                                random_state=split_seed,
+                                shuffle=True
+                            )
                             train_pool = Pool(X_train, y_train)
                             
                             # Suppress only the specific GPU memory warning
@@ -887,10 +819,14 @@ class DataProcessor:
                                     iterations=1000,
                                     learning_rate=0.03,
                                     depth=6,
+                                    random_seed=split_seed,
                                     task_type='GPU',
                                     verbose=200
                                 )
-                            model.fit(train_pool)
+                            # Suppress GPU memory warnings during training
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+                                model.fit(train_pool)
                             y_pred = model.predict(X_test)
                             mse = mean_squared_error(y_test, y_pred)
                             importances = model.get_feature_importance(train_pool)
@@ -1508,7 +1444,7 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                         self.db_handler.update_task_status(task_id, 'RUNNING')
                         # Attach context to engines for metrics/artifacts
                         try:
-                            for eng in (self.station, self.stats, self.garch, self.feng):
+                            for eng in (self.station, self.stats, self.feng):
                                 if hasattr(eng, 'set_task_context'):
                                     eng.set_task_context(self.run_id, task_id, self.db_handler)
                         except Exception:
@@ -1662,11 +1598,9 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
                     except Exception:
                         ddf = ddf.persist()
                     logger.info(f"Persist returned: {engine_name}")
-                    # Longer timeout for heavy engines (statistical_tests and garch_models)
+                    # Longer timeout for heavy engines (statistical_tests)
                     if engine_name == 'statistical_tests':
                         timeout_s = 600
-                    elif engine_name == 'garch_models':
-                        timeout_s = 180
                     else:
                         timeout_s = 60
                     logger.info(f"Waiting for {engine_name} computation to complete (timeout: {timeout_s}s)...")

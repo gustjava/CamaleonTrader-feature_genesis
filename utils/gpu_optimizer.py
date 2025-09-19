@@ -398,6 +398,8 @@ class GPUOptimizer:
         return cp.abs(diff)
     
     def optimize_garch_likelihood(self, returns: cp.ndarray, params: cp.ndarray) -> float:
+        # GARCH optimization disabled - not used in pipeline
+        return 0.0
         """
         Optimized GARCH log-likelihood calculation for GPU.
         

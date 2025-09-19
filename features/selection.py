@@ -1,8 +1,12 @@
 import logging
+import warnings
 from typing import List
 
 import cudf
 import cupy as cp
+
+# Suppress GPU memory warnings globally for this module
+warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
 
 from utils.logging_utils import get_logger
 
@@ -62,22 +66,29 @@ def select_features_with_catboost(
     # Lazy import to avoid hard dependency at module import time
     try:
         from catboost import CatBoostClassifier
+        import warnings
     except ModuleNotFoundError as e:
         logger.error("CatBoost não está instalado. Instale 'catboost' no ambiente antes de usar esta função.")
         raise
 
     # CatBoost GPU classifier
-    cat = CatBoostClassifier(
-        iterations=200,
-        learning_rate=0.05,
-        random_seed=42,
-        verbose=0,
-        task_type='GPU'
+    # Suppress GPU memory warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+        cat = CatBoostClassifier(
+            iterations=200,
+            learning_rate=0.05,
+            random_seed=42,
+            verbose=0,
+            task_type='GPU'
     )
 
     logger.info("Treinando o modelo CatBoost na GPU para avaliação de features...")
     try:
-        cat.fit(X_gpu, y_gpu)
+        # Suppress GPU memory warnings during training
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*less than 75% GPU memory available.*')
+            cat.fit(X_gpu, y_gpu)
     except Exception as gpu_err:
         # CPU fallback explicitamente desabilitado neste projeto
         logger.error(
