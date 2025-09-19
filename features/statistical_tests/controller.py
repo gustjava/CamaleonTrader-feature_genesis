@@ -137,24 +137,13 @@ class StatisticalTests(BaseFeatureEngine):
             self.debug_write_artifacts = bool(getattr(uc.features, 'debug_write_artifacts', True))
             self.artifacts_dir = str(getattr(uc.features, 'artifacts_dir', 'artifacts'))
             
-            # Stage 3 LightGBM params
+            # Stage 3 CatBoost Configuration (hardcoded backend)
             self.stage3_task = str(getattr(uc.features, 'stage3_task', 'auto'))
             self.stage3_random_state = int(getattr(uc.features, 'stage3_random_state', 42))
-            self.stage3_lgbm_enabled = bool(getattr(uc.features, 'stage3_lgbm_enabled', True))
-            self.stage3_lgbm_num_leaves = int(getattr(uc.features, 'stage3_lgbm_num_leaves', 31))
-            self.stage3_lgbm_max_depth = int(getattr(uc.features, 'stage3_lgbm_max_depth', -1))
-            self.stage3_lgbm_n_estimators = int(getattr(uc.features, 'stage3_lgbm_n_estimators', 200))
-            self.stage3_lgbm_learning_rate = float(getattr(uc.features, 'stage3_lgbm_learning_rate', 0.05))
-            self.stage3_lgbm_feature_fraction = float(getattr(uc.features, 'stage3_lgbm_feature_fraction', 0.8))
-            self.stage3_lgbm_bagging_fraction = float(getattr(uc.features, 'stage3_lgbm_bagging_fraction', 0.8))
-            self.stage3_lgbm_bagging_freq = int(getattr(uc.features, 'stage3_lgbm_bagging_freq', 0))
-            self.stage3_lgbm_early_stopping_rounds = int(getattr(uc.features, 'stage3_lgbm_early_stopping_rounds', 0))
-            # Stage 3 CatBoost (explicit) with fallback to LGBM fields
-            self.stage3_catboost_iterations = int(getattr(uc.features, 'stage3_catboost_iterations', self.stage3_lgbm_n_estimators))
-            self.stage3_catboost_learning_rate = float(getattr(uc.features, 'stage3_catboost_learning_rate', self.stage3_lgbm_learning_rate))
-            # If lgbm_max_depth == -1 (auto), use 6 as CatBoost default depth
-            _cb_depth_default = 6 if int(self.stage3_lgbm_max_depth) == -1 else int(self.stage3_lgbm_max_depth)
-            self.stage3_catboost_depth = int(getattr(uc.features, 'stage3_catboost_depth', _cb_depth_default))
+            # CatBoost parameters with defaults
+            self.stage3_catboost_iterations = int(getattr(uc.features, 'stage3_catboost_iterations', 1000))
+            self.stage3_catboost_learning_rate = float(getattr(uc.features, 'stage3_catboost_learning_rate', 0.015))
+            self.stage3_catboost_depth = int(getattr(uc.features, 'stage3_catboost_depth', 8))
             self.stage3_catboost_devices = str(getattr(uc.features, 'stage3_catboost_devices', '0'))
             self.stage3_catboost_task_type = str(getattr(uc.features, 'stage3_catboost_task_type', 'GPU'))
             self.stage3_catboost_thread_count = int(getattr(uc.features, 'stage3_catboost_thread_count', 1))
@@ -163,8 +152,9 @@ class StatisticalTests(BaseFeatureEngine):
             # Temporal CV / early stopping
             self.stage3_cv_splits = int(getattr(uc.features, 'stage3_cv_splits', 3))
             self.stage3_cv_min_train = int(getattr(uc.features, 'stage3_cv_min_train', 200))
-            self.stage3_catboost_early_stopping_rounds = int(getattr(uc.features, 'stage3_catboost_early_stopping_rounds', self.stage3_lgbm_early_stopping_rounds))
+            self.stage3_catboost_early_stopping_rounds = int(getattr(uc.features, 'stage3_catboost_early_stopping_rounds', 200))
             self.stage3_catboost_use_full_dataset = bool(getattr(uc.features, 'stage3_catboost_use_full_dataset', False))
+            self.stage3_catboost_gpu_ram_part = float(getattr(uc.features, 'stage3_catboost_gpu_ram_part', 0.8))
             # Additional Stage 3 knobs (not always present in dataclass; read via getattr)
             self.stage3_importance_threshold = getattr(uc.features, 'stage3_importance_threshold', 'median')
             self.stage3_stratified_sampling = bool(getattr(uc.features, 'stage3_stratified_sampling', True))

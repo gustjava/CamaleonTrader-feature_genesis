@@ -1253,12 +1253,12 @@ def _noop_ctx():
             db_config = self.settings.database
             logger.info(f"[FinalModel] 🗄️  Database: {db_config.host}:{db_config.port}/{db_config.database}")
             
-            # Log top features from final model
+            # Log all features from final model
             final_importances = final_results['model_results']['feature_importances']
-            top_features = sorted(final_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+            all_features = sorted(final_importances.items(), key=lambda x: x[1], reverse=True)
             
-            logger.info(f"[FinalModel] 🏆 Top 10 most important features in final model:")
-            for i, (feature, importance) in enumerate(top_features, 1):
+            logger.info(f"[FinalModel] 🏆 All feature importances in final model:")
+            for i, (feature, importance) in enumerate(all_features, 1):
                 logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
             
             # Log query commands for easy access
@@ -1987,8 +1987,8 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
 
             # Log feature importances summary
             if feature_importances:
-                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
-                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+                logger.info(f"[FinalModel] 📊 All feature importances:")
+                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)
                 for i, (feature, importance) in enumerate(sorted_features, 1):
                     logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
 
@@ -2059,8 +2059,8 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
 
             # Log feature importances summary
             if feature_importances:
-                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
-                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+                logger.info(f"[FinalModel] 📊 All feature importances:")
+                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)
                 for i, (feature, importance) in enumerate(sorted_features, 1):
                     logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
 
@@ -2256,8 +2256,8 @@ def process_currency_pair_dask_worker(currency_pair: str, r2_path: str) -> bool:
             
             # Log feature importances summary
             if feature_importances:
-                logger.info(f"[FinalModel] 📊 Top 10 feature importances:")
-                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:10]
+                logger.info(f"[FinalModel] 📊 All feature importances:")
+                sorted_features = sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)
                 for i, (feature, importance) in enumerate(sorted_features, 1):
                     logger.info(f"[FinalModel]   {i:2d}. {feature}: {importance:.6f}")
             

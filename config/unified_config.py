@@ -169,17 +169,6 @@ class FeatureConfig:
     # Stage 3 wrappers (LightGBM tuning)
     stage3_task: str = "auto"  # auto|regression|classification
     stage3_random_state: int = 42
-    stage3_lgbm_enabled: bool = True
-    stage3_lgbm_num_leaves: int = 31
-    stage3_lgbm_max_depth: int = -1
-    stage3_lgbm_n_estimators: int = 200
-    stage3_lgbm_learning_rate: float = 0.05
-    stage3_lgbm_feature_fraction: float = 0.8
-    stage3_lgbm_bagging_fraction: float = 0.8
-    stage3_lgbm_bagging_freq: int = 0
-    stage3_lgbm_early_stopping_rounds: int = 0
-    stage3_use_gpu: bool = True
-    stage3_wrapper_backend: str = "xgb_gpu"  # lgbm|xgb_gpu
     # Stage 3 CatBoost (new explicit keys; fall back to LGBM keys if not provided)
     stage3_catboost_iterations: int = 200
     stage3_catboost_learning_rate: float = 0.05
@@ -199,6 +188,7 @@ class FeatureConfig:
     stage3_catboost_early_stopping_rounds: int = 0  # Overrides lgbm early stopping if > 0
     # Data usage control for embedded stage
     stage3_catboost_use_full_dataset: bool = False   # If true, do not sample selection_max_rows for Stage 3
+    stage3_catboost_gpu_ram_part: float = 0.8  # Use 80% of GPU memory (RTX 5090 optimized)
     # Post-validation: Re-train with selected features for real performance metrics
     stage3_enable_post_validation: bool = True       # Enable post-selection validation
     # Volatility scaling for targets
@@ -400,21 +390,8 @@ class ProcessingConfig:
 
 @dataclass
 class ValidationConfig:
-    """Data validation configuration (input/output/series quality)."""
-    validate_input_data: bool = True
-    required_columns: List[str] = field(default_factory=lambda: ["timestamp", "open", "high", "low", "close", "volume"])
-    expected_dtypes: Dict[str, str] = field(default_factory=lambda: {
-        "timestamp": "datetime64[ns]",
-        "open": "float32",
-        "high": "float32",
-        "low": "float32",
-        "close": "float32",
-        "volume": "float32",
-    })
-    validate_output_data: bool = True
-    max_nan_percentage: float = 50.0
-    check_infinite_values: bool = True
-    # Series-quality thresholds used by StationarizationEngine
+    """Data validation configuration (series quality thresholds used by StationarizationEngine)."""
+    # Series Quality Thresholds (used by stationarization engine)
     min_rows: int = 100
     max_missing_percentage: float = 20.0
     outlier_threshold: float = 3.0

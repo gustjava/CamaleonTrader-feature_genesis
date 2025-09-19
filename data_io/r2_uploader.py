@@ -152,12 +152,7 @@ class R2ModelUploader:
             "features": {
                 "selected_features": features,
                 "num_features": len(features),
-                "feature_importances": feature_importances,
-                "top_10_features": sorted(
-                    feature_importances.items(),
-                    key=lambda x: x[1],
-                    reverse=True
-                )[:10]
+                "feature_importances": feature_importances
             },
             
             # Model performance

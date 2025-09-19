@@ -751,6 +751,7 @@ class FeatureSelection:
         l2_leaf_reg = float(getattr(self, 'stage3_catboost_l2_leaf_reg', 20.0))
         bootstrap_type = str(getattr(self, 'stage3_catboost_bootstrap_type', 'Bernoulli'))
         subsample = float(getattr(self, 'stage3_catboost_subsample', 0.7))
+        gpu_ram_part = float(getattr(self, 'stage3_catboost_gpu_ram_part', 0.8))
         
         if task == 'classification':
             unique_y = np.unique(y)
@@ -775,6 +776,7 @@ class FeatureSelection:
                     l2_leaf_reg=l2_leaf_reg,
                     bootstrap_type=bootstrap_type,
                     subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                    gpu_ram_part=gpu_ram_part,
                 )
         else:
             loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
@@ -796,6 +798,7 @@ class FeatureSelection:
                     l2_leaf_reg=l2_leaf_reg,
                     bootstrap_type=bootstrap_type,
                     subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
+                    gpu_ram_part=gpu_ram_part,
                 )
 
         # Early stopping + CV setup

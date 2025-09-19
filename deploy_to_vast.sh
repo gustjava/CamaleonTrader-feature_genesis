@@ -10,6 +10,9 @@ set -euo pipefail
 # 3. Sincronizar seu código local para a instância remota.
 # 4. Sincronizar os dados do R2 para a instância remota.
 # 5. Executar o pipeline de features.
+#
+# TEMPORARY NOTE: This script is currently configured to sync only EURUSD parquet files
+# from R2 storage. This is a temporary filter for testing purposes.
 # ====================================================================================
 
 # ----------------------------- CONFIGURAÇÕES GERAIS ---------------------------------
@@ -299,7 +302,13 @@ $REMOTE_ENV_EXPORTS
 mkdir -p \"$REMOTE_DATA_DIR\"
 
 # Sync data from R2
-rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress
+# TEMPORARY EURUSD FILTER - COMMENT OUT WHEN DONE TESTING
+# Filter to only sync EURUSD parquet files
+echo '--- [REMOTO] TEMPORARY FILTER: Syncing only EURUSD parquet files...'
+rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress --include \"*EURUSD*.parquet\"
+# END TEMPORARY FILTER
+# Original command (commented out):
+# rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress
 
 # Check what files were synced
 echo '--- [REMOTO] Verificando arquivos sincronizados...'
