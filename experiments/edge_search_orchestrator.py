@@ -229,7 +229,7 @@ class ExperimentOrchestrator:
             )
             
             # Create labels
-            labels_df = labeler.create_labels(price_series, use_gpu=True)
+            labels_df = labeler.create_labels(price_series, use_gpu=False)
             analysis = labeler.analyze_labels(labels_df)
             
             # Calculate key metrics

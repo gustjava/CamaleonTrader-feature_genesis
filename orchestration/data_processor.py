@@ -9,28 +9,35 @@ import sys
 import os
 import time
 import traceback
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 
-import cudf
-import cupy as cp
+# CuDF and CuPy imports moved to functions to avoid early CUDA context creation
+# import cudf
+# import cupy as cp
 import dask
+
+# Import for type checking only
+if TYPE_CHECKING:
+    import cudf
+    import cupy as cp
 
 from config.unified_config import get_unified_config as get_settings
 from dask.distributed import Client, wait
 from data_io.db_handler_no_mysql import NoDatabaseHandler as DatabaseHandler
 from data_io.local_loader import LocalDataLoader
-from features import (
-    StationarizationEngine,
-    StatisticalTests,
-    GARCHModels,
-    FeatureEngineeringEngine,
-)
-from features.signal_processing import apply_emd_to_series
-from features.base_engine import CriticalPipelineError
-from features.final_model import FinalModelTrainer
+# Lazy imports to avoid early CUDA context creation
+# from features import (
+#     StationarizationEngine,
+#     StatisticalTests,
+#     GARCHModels,
+#     FeatureEngineeringEngine,
+# )
+# from features.signal_processing import apply_emd_to_series
+# from features.base_engine import CriticalPipelineError
+# from features.final_model import FinalModelTrainer
 from utils.logging_utils import get_logger, set_currency_pair_context
-from features.engine_metrics import EngineMetrics
+# from features.engine_metrics import EngineMetrics
 
 logger = get_logger(__name__, "orchestration.processor")
 
@@ -49,6 +56,15 @@ class DataProcessor:
     
     def __init__(self, client: Optional[Client] = None, run_id: Optional[int] = None):
         """Initialize the data processor."""
+        # Import feature engines here to avoid early CUDA context creation
+        from features import (
+            StationarizationEngine,
+            StatisticalTests,
+            GARCHModels,
+            FeatureEngineeringEngine,
+        )
+        from features.engine_metrics import EngineMetrics
+        
         self.settings = get_settings()
         self.loader = LocalDataLoader()
         self.db_handler = DatabaseHandler()
@@ -75,6 +91,11 @@ class DataProcessor:
         Returns:
             bool: True if processing was successful, False otherwise
         """
+        # Import CUDA libraries here to avoid early context creation
+        global cudf, cp
+        import cudf
+        import cupy as cp
+        
         try:
             # Set currency pair context for all subsequent logs
             set_currency_pair_context(currency_pair)
@@ -153,7 +174,7 @@ class DataProcessor:
                 except Exception:
                     pass
     
-    def _load_currency_pair_data(self, r2_path: str) -> Optional[cudf.DataFrame]:
+    def _load_currency_pair_data(self, r2_path: str) -> Optional[Any]:
         """
         Load currency pair data from the specified path.
         
@@ -189,7 +210,7 @@ class DataProcessor:
             logger.error(f"Error loading data from {r2_path}: {e}", exc_info=True)
             return None
     
-    def _validate_initial_data(self, gdf: cudf.DataFrame, currency_pair: str) -> bool:
+    def _validate_initial_data(self, gdf: Any, currency_pair: str) -> bool:
         """
         Validate the initial data before processing.
         
@@ -294,7 +315,7 @@ class DataProcessor:
             logger.warning(f"Could not drop denied columns: {e}")
         return df
     
-    def _apply_feature_engines(self, gdf: cudf.DataFrame, currency_pair: str) -> Optional[cudf.DataFrame]:
+    def _apply_feature_engines(self, gdf: Any, currency_pair: str) -> Optional[Any]:
         """
         Apply all feature engineering engines in the correct order.
         
@@ -450,7 +471,7 @@ class DataProcessor:
             logger.error(f"Error applying feature engines for {currency_pair}: {e}", exc_info=True)
             return None
     
-    def _execute_engine(self, engine_name: str, gdf: cudf.DataFrame) -> Optional[cudf.DataFrame]:
+    def _execute_engine(self, engine_name: str, gdf: Any) -> Optional[Any]:
         """
         Execute a specific feature engineering engine.
         
@@ -550,7 +571,7 @@ class DataProcessor:
             logger.error(f"Error executing engine {engine_name}: {e}", exc_info=True)
             return None
 
-    def _execute_engine_dask(self, engine_name: str, ddf) -> Optional["dask_cudf.DataFrame"]:
+    def _execute_engine_dask(self, engine_name: str, ddf) -> Optional[Any]:
         """Execute a specific feature engineering engine on a dask_cudf DataFrame."""
         try:
             if engine_name == 'stationarization':
@@ -1024,7 +1045,7 @@ class DataProcessor:
 
         return ddf
 
-    def _log_statistical_tests_plan_cudf(self, gdf: cudf.DataFrame) -> None:
+    def _log_statistical_tests_plan_cudf(self, gdf: Any) -> None:
         """Emit a step-by-step plan for the statistical_tests engine when using cuDF.
 
         The plan is inferred from settings.features and current DataFrame columns.
@@ -1861,7 +1882,7 @@ def _process_currency_pair_dask_impl(self: "DataProcessor", currency_pair: str, 
         _register_task_failure(self, currency_pair, r2_path, str(e))
         return False
     
-    def _validate_intermediate_data(self, gdf: cudf.DataFrame, currency_pair: str, engine_name: str) -> bool:
+    def _validate_intermediate_data(self, gdf: Any, currency_pair: str, engine_name: str) -> bool:
         """
         Validate data after each engine execution.
         
@@ -1955,6 +1976,10 @@ def process_currency_pair_dask_worker(currency_pair: str, r2_path: str, run_id: 
     Worker function that processes a single currency pair using the Dask path (dask_cudf),
     constraining all inner tasks to the current worker (one GPU per pair).
     """
+    # Import CUDA libraries here to avoid early context creation in workers
+    import cudf
+    import cupy as cp
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'

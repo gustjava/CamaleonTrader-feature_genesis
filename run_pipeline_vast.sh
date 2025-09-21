@@ -216,6 +216,7 @@ echo -e "\n🚀  Executando pipeline remotamente com monitoramento dual..."
 REMOTE_ENV_EXPORTS=$(cat <<EOF
 export LOG_LEVEL=INFO
 export DEBUG=false
+export CUDA_VISIBLE_DEVICES=0
 export R2_ACCOUNT_ID=ac68ac775ba99b267edee7f9b4b3bc4e
 export R2_ACCESS_KEY=0e315105695707ca4fe1e5f83a38f807
 export R2_SECRET_KEY=5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515

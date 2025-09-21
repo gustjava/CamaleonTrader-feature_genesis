@@ -20,7 +20,8 @@ from dask_cuda import LocalCUDACluster
 from config.unified_config import get_unified_config as get_settings
 from data_io.db_handler_no_mysql import NoDatabaseHandler as DatabaseHandler
 from data_io.local_loader import LocalDataLoader
-from features.base_engine import CriticalPipelineError
+# Lazy import to avoid early CUDA context creation
+# from features.base_engine import CriticalPipelineError
 from orchestration.data_processor import DataProcessor, process_currency_pair_dask_worker
 from utils.logging_utils import get_logger, set_currency_pair_context
 from utils.pipeline_visualizer import PipelineVisualizer
@@ -282,6 +283,9 @@ class PipelineOrchestrator:
         Process tasks sequentially on the driver, leveraging Dask-CUDA within each task
         to use all GPUs for a single currency pair. Fail-fast on first error.
         """
+        # Import here to avoid early CUDA context creation
+        from features.base_engine import CriticalPipelineError
+        
         logger.info("Starting driver-side processing (multi-GPU per task)")
 
         processor = DataProcessor(client, run_id=self.current_run_id)

@@ -17,9 +17,9 @@ optuna:
   pruner: hyperband            # Hyperband for better early stopping (was median)
   hyperband_max_resource: 100  # Maximum resource for hyperband
   hyperband_min_resource: 10   # Minimum resource for hyperband
-  # Parallel execution control
-  max_concurrent_trials: 12    # Maximum concurrent trials (0 = use all workers)
-  use_dask_parallelization: true  # Enable/disable Dask parallelization
+  # Parallel execution control - DISABLED for single-GPU run
+  max_concurrent_trials: 1
+  use_dask_parallelization: false
 
 # Output artifacts for the handoff between Study A -> Study B.
 outputs:

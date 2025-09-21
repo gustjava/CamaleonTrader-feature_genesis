@@ -52,7 +52,7 @@ class TripleBarrierLabeler:
     def create_labels(
         self, 
         prices: pd.Series,
-        use_gpu: bool = True
+        use_gpu: bool = False
     ) -> pd.DataFrame:
         """
         Cria labels usando o método Triple-Barrier
@@ -342,7 +342,7 @@ def demo_triple_barrier():
         )
         
         # Create labels
-        labels_df = labeler.create_labels(price_series, use_gpu=True)
+        labels_df = labeler.create_labels(price_series, use_gpu=False)
         
         # Analyze results
         analysis = labeler.analyze_labels(labels_df)

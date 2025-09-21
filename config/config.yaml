@@ -40,19 +40,19 @@ r2:
 dask:
   # Worker Configuration - Optimized for Optuna parallel experiments
   gpus_per_worker: 1                      # One GPU per worker (optimal isolation for trials)
-  threads_per_worker: 4                   # Increased for Optuna parallelization (was 2)
+  threads_per_worker: 2                   # Lower threads to reduce contention
   workers_per_gpu: 1                      # Single worker per GPU for maximum memory per trial
   memory_limit: "0GB"                     # Disabled - use memory_limit_fraction instead
-  memory_limit_fraction: 0.80             # Use 80% of total RAM for more aggressive processing
+  memory_limit_fraction: 0.60             # Use 60% of total RAM for more conservative processing
   
   # RMM (RAPIDS Memory Manager) Configuration - Conservative settings for various GPU sizes
   # GPU memory pool management for efficient memory allocation
-  rmm_pool_size: "0GB"                    # Disabled - use rmm_pool_fraction
-  rmm_initial_pool_size: "0GB"            # Disabled - use rmm_initial_pool_fraction
-  rmm_maximum_pool_size: "0GB"            # Disabled - use rmm_maximum_pool_fraction
-  rmm_pool_fraction: 0.50                 # Use 50% of GPU memory for RMM pool (conservative)
-  rmm_initial_pool_fraction: 0.25         # Initialize with 25% of GPU memory (conservative)
-  rmm_maximum_pool_fraction: 0.70         # Maximum 70% of GPU memory for pool (conservative)
+  rmm_pool_size: "8GB"                    # Moderate fixed pool per worker
+  rmm_initial_pool_size: "4GB"            # Initial pool to reduce allocator churn
+  rmm_maximum_pool_size: "12GB"           # Cap to avoid over-commit
+  rmm_pool_fraction: 0.0                  # Fractions disabled when fixed sizes set
+  rmm_initial_pool_fraction: 0.0
+  rmm_maximum_pool_fraction: 0.0
   spilling_enabled: true                  # Enable spill to RAM when GPU memory is full
   spilling_target: 0.60                   # Start spilling when GPU reaches 60% usage (conservative)
   spilling_max_spill: "8GB"               # Maximum spill amount allowed (conservative)
@@ -63,8 +63,8 @@ dask:
   local_directory: "/tmp/dask-worker-space"  # Directory for data spill
   
   # Network Protocol Settings
-  protocol: "ucx"                         # Use UCX for GPU↔GPU/host transfers
-  enable_tcp_over_ucx: true               # Enable TCP over UCX
+  protocol: "tcp"                         # Use TCP for stability on single host
+  enable_tcp_over_ucx: false              # Not used with TCP protocol
   enable_infiniband: false                # Disable InfiniBand
   enable_nvlink: false                    # Disable NVLink (RTX 5090 may not have it)
 

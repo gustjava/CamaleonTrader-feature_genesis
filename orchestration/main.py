@@ -85,8 +85,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from dask_cuda import LocalCUDACluster
     from dask.distributed import Client
-    import cupy as cp
-    import cudf
+    # CuPy and CuDF imports moved to functions to avoid early CUDA context creation
 except ImportError as e:
     print(f"Error importing Dask-CUDA libraries: {e}")
     print("Make sure the GPU environment is properly set up.")
@@ -96,7 +95,8 @@ from config.unified_config import get_unified_config
 from monitoring.dask_plugins import PipelineWorkerPlugin
 from orchestration.pipeline_orchestrator import PipelineOrchestrator
 from orchestration.objectives import objective_study_a, objective_study_b
-from features.base_engine import CriticalPipelineError
+# Lazy import to avoid early CUDA context creation
+# from features.base_engine import CriticalPipelineError
 from utils.logging_utils import (
     get_logger,
 )
@@ -178,12 +178,34 @@ class DaskClusterManager:
         sys.exit(0)
 
     def _get_gpu_count(self) -> int:
-        """Get the number of available GPUs."""
+        """Get the number of available GPUs without initializing CUDA on the driver.
+
+        Priority:
+        1) CUDA_VISIBLE_DEVICES env var (comma-separated list)
+        2) nvidia-smi -L line count
+        3) Fallback: 1
+        """
         try:
-            return cp.cuda.runtime.getDeviceCount()
+            # 1) Respect CUDA_VISIBLE_DEVICES when set
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if cvd is not None and len(cvd.strip()) > 0:
+                # Handle forms like "0,1,2" or ":" (empty means disable)
+                devs = [d for d in cvd.split(',') if d.strip() != '']
+                if len(devs) > 0:
+                    return max(1, len(devs))
+                # If explicitly set to empty string, treat as 0 -> fallback to 1
+            # 2) Query nvidia-smi if available
+            try:
+                import subprocess
+                out = subprocess.check_output(["nvidia-smi", "-L"], stderr=subprocess.DEVNULL)
+                lines = [ln for ln in out.decode("utf-8", "ignore").splitlines() if ln.strip()]
+                if lines:
+                    return max(1, len(lines))
+            except Exception:
+                pass
         except Exception as e:
-            logger.warning(f"Could not detect GPU count: {e}")
-            return 1
+            logger.warning(f"GPU count detection fallback due to: {e}")
+        return 1
 
     def _get_system_memory_gb(self) -> float:
         """Get total system memory in GB."""
@@ -208,9 +230,11 @@ class DaskClusterManager:
                 total_memory_to_use = system_memory_gb * memory_fraction
                 memory_per_worker_gb = total_memory_to_use / gpu_count
                 
-                # Apply safety limits
-                min_memory_gb = 0.5  # Minimum 500MB per worker
-                memory_per_worker_gb = max(min_memory_gb, memory_per_worker_gb)
+                # Apply safety limits - be more conservative
+                min_memory_gb = 1.0  # Minimum 1GB per worker
+                # Allow larger per-worker memory to accommodate dataset loads
+                max_memory_gb = min(24.0, system_memory_gb * 0.25)  # Max 24GB or 25% of system RAM per worker
+                memory_per_worker_gb = max(min_memory_gb, min(max_memory_gb, memory_per_worker_gb))
                 
                 total_memory_usage = memory_per_worker_gb * gpu_count
                 actual_fraction = total_memory_usage / system_memory_gb
@@ -227,101 +251,14 @@ class DaskClusterManager:
             logger.warning(f"Could not calculate memory limit: {e}")
             return "2GB"  # Safe fallback
 
-    def _configure_rmm(self):
-        """Configure RMM (RAPIDS Memory Manager) for optimal memory management."""
-        try:
-            from rmm import reinitialize
-            
-            def parse_size_gb(val: str) -> float:
-                v = str(val).strip().upper()
-                if v.endswith('GB'):
-                    return float(v[:-2])
-                if v.endswith('MB'):
-                    return float(v[:-2]) / 1024.0
-                return float(v)
+    def _configure_rmm(self) -> None:
+        """Intentionally avoid driver-side RMM/CUDA initialization.
 
-            try:
-                free_b, total_b = cp.cuda.runtime.memGetInfo()
-                free_gb = free_b / (1024 ** 3)
-                total_gb = total_b / (1024 ** 3)
-            except Exception:
-                # Conservative defaults if we cannot query memory
-                free_gb = 4.0
-                total_gb = 8.0
-
-            pool_frac = float(getattr(self.config.dask, 'rmm_pool_fraction', 0.0) or 0.0)
-            init_frac = float(getattr(self.config.dask, 'rmm_initial_pool_fraction', 0.0) or 0.0)
-            max_frac = float(getattr(self.config.dask, 'rmm_maximum_pool_fraction', 0.0) or 0.0)
-
-            if pool_frac > 0.0:
-                desired_pool_gb = max(0.25, total_gb * pool_frac)
-            else:
-                desired_pool_gb = parse_size_gb(self.config.dask.rmm_pool_size)
-
-            if init_frac > 0.0:
-                desired_init_gb = max(0.25, total_gb * init_frac)
-            else:
-                desired_init_gb = parse_size_gb(self.config.dask.rmm_initial_pool_size)
-
-            if max_frac > 0.0:
-                cap_gb = max(0.25, total_gb * max_frac)
-            else:
-                cap_gb = max(0.25, total_gb * 0.60)
-
-            # New: also cap by currently free memory with headroom to avoid init failures
-            free_headroom = 0.85  # keep some free space for context/UCX/cublas etc.
-            max_pool_by_free = max(0.25, free_gb * free_headroom)
-            safe_pool_gb = max(0.25, min(desired_pool_gb, cap_gb, max_pool_by_free))
-
-            # Initial pool should be smaller; also obey free memory headroom (tighter bound)
-            max_init_by_free = max(0.25, free_gb * 0.50)
-            safe_init_gb = max(0.25, min(desired_init_gb, safe_pool_gb * 0.90, max_init_by_free))
-
-            # Ensure initial does not exceed pool size
-            if safe_init_gb > safe_pool_gb:
-                safe_init_gb = max(0.25, min(safe_pool_gb * 0.90, max_init_by_free))
-
-            self._safe_rmm_pool_size_str = f"{safe_pool_gb:.2f}GB"
-            self._safe_rmm_initial_pool_size_str = f"{safe_init_gb:.2f}GB"
-
-            # Compute initial pool size (bytes) and align to 256-byte boundary as required by RMM
-            bytes_per_gb = 1024 ** 3
-            raw_init_bytes = int(safe_init_gb * bytes_per_gb)
-            # Ensure alignment to 256 bytes and non-zero
-            def _align_256(n: int) -> int:
-                if n <= 0:
-                    return 256
-                return max(256, (n // 256) * 256)
-            initial_pool_size = _align_256(raw_init_bytes)
-            # Cap initial pool to not exceed intended pool size
-            try:
-                pool_cap_bytes = int(safe_pool_gb * bytes_per_gb)
-                if initial_pool_size > pool_cap_bytes:
-                    initial_pool_size = _align_256(pool_cap_bytes)
-            except Exception as e:
-                logger.error(f"Failed to adjust initial pool size: {e}")
-                pass
-
-            try:
-                reinitialize(
-                    pool_allocator=True,
-                    initial_pool_size=initial_pool_size,
-                    managed_memory=False
-                )
-                logger.info(
-                    f"RMM configured (pool): initial={initial_pool_size/bytes_per_gb:.2f}GB, "
-                    f"pool={safe_pool_gb:.2f}GB, cap={cap_gb:.2f}GB, total={total_gb:.2f}GB, free={free_gb:.2f}GB"
-                )
-            except Exception as e_pool:
-                logger.warning(f"RMM pool init failed; falling back to default CUDA allocator: {e_pool}")
-                os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
-            
-        except ImportError:
-            logger.warning("RMM not available, using default CUDA management")
-            os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
-        except Exception as e:
-            logger.error(f"Failed to configure RMM: {e}")
-            os.environ.setdefault("RMM_ALLOCATOR", "cuda_malloc")
+        We don't touch CuPy/RMM here to prevent creating a CUDA context on the driver
+        before workers are spawned. RMM is configured on workers via LocalCUDACluster
+        kwargs (rmm_pool_size, rmm_async) and, if needed, post-start hooks.
+        """
+        logger.debug("Skipping driver-side RMM configuration to avoid early CUDA context.")
 
     def _check_port_availability(self, port: int) -> bool:
         """Check if a port is available for use."""
@@ -392,7 +329,8 @@ class DaskClusterManager:
             gpu_count = max(1, int(self._get_gpu_count()))
             logger.info(f"Detected GPU(s): {gpu_count}")
 
-            self._configure_rmm()
+            # IMPORTANT: Do not configure RMM on the driver to avoid early CUDA context
+            # creation. RMM settings will be applied to workers via LocalCUDACluster kwargs.
 
             try:
                 import dask
@@ -600,15 +538,31 @@ class DaskClusterManager:
             logger.info(f"Monitoring workers for failures: {self.initial_worker_count} initial workers")
             
             def monitor_workers():
+                consecutive_below_threshold = 0
+                threshold = max(1, int(self.initial_worker_count * 0.75))  # allow up to 25% transient loss
+                check_interval = 5
+                required_consecutive = 6  # ~30s sustained drop
                 while True:
                     try:
                         current_workers = len(self.client.scheduler_info()["workers"])
-                        if current_workers < self.initial_worker_count:
-                            logger.critical(f"Worker death detected: {current_workers} current, {self.initial_worker_count} initial")
-                            logger.critical("Stopping pipeline immediately due to worker loss")
-                            EMERGENCY_SHUTDOWN.set()
-                            break
-                        time.sleep(5)
+                        if current_workers < threshold:
+                            consecutive_below_threshold += 1
+                            logger.warning(
+                                f"Worker drop detected ({current_workers}/{self.initial_worker_count}); "
+                                f"{consecutive_below_threshold}/{required_consecutive}"
+                            )
+                            if consecutive_below_threshold >= required_consecutive:
+                                logger.critical(
+                                    f"Sustained worker loss detected for ~{check_interval * required_consecutive}s: "
+                                    f"{current_workers}/{self.initial_worker_count}. Triggering emergency shutdown."
+                                )
+                                EMERGENCY_SHUTDOWN.set()
+                                break
+                        else:
+                            if consecutive_below_threshold > 0:
+                                logger.info("Worker count recovered; resetting monitor counters")
+                            consecutive_below_threshold = 0
+                        time.sleep(check_interval)
                     except Exception as e:
                         logger.error(f"Error in worker monitoring: {e}")
                         break
@@ -1281,8 +1235,8 @@ def _run_study_preprocess(cfg: DictConfig) -> None:
     trial_callback = _create_trial_callback(cfg, outputs)
     
     # Check if parallelization is enabled
-    use_parallelization = getattr(study_cfg.optuna, 'use_dask_parallelization', True)
-    max_concurrent_trials = getattr(study_cfg.optuna, 'max_concurrent_trials', 8)
+    use_parallelization = bool(getattr(study_cfg.optuna, 'use_dask_parallelization', True))
+    max_concurrent_trials = int(getattr(study_cfg.optuna, 'max_concurrent_trials', 8) or 8)
     
     # Get the Dask client from the global cluster manager if available
     if use_parallelization:
@@ -1295,13 +1249,9 @@ def _run_study_preprocess(cfg: DictConfig) -> None:
             # Nested wrapper ships with task, and reloads objectives on the worker to avoid stale code
             cfg_container = OmegaConf.to_container(cfg, resolve=True)
             def _objective_remote(trial):  # type: ignore
-                import importlib
+                # Avoid reloading module each trial to preserve per-worker dataset cache
                 from omegaconf import OmegaConf as _OC
                 import orchestration.objectives as _obj
-                try:
-                    _obj = importlib.reload(_obj)
-                except Exception:
-                    pass
                 cfg_built = _OC.create(cfg_container)
                 return _obj.objective_study_a(trial, cfg_built)
             
@@ -1354,7 +1304,7 @@ def _run_study_preprocess(cfg: DictConfig) -> None:
                             active_futures = [(t, f) for t, f in active_futures if f != future]
                 
         except Exception as e:
-            logger.warning(f"Could not use Dask client, falling back to sequential: {e}")
+            logger.warning(f"Could not use Dask client for parallel trials, falling back to sequential: {e}")
             study.optimize(
                 lambda trial: objective_study_a(trial, cfg), 
                 n_trials=n_trials, 
@@ -1591,12 +1541,16 @@ if hydra is not None:
 
         mode = str(cfg.study.mode)
         if mode == "preprocess_selection":
-            # Ensure a Dask cluster is available for Optuna parallelization
-            try:
-                with managed_dask_cluster():
+            # Only start Dask cluster if parallelization is enabled
+            if bool(getattr(cfg.study.optuna, 'use_dask_parallelization', False)):
+                try:
+                    with managed_dask_cluster():
+                        _run_study_preprocess(cfg)
+                except Exception as e:
+                    logger.warning(f"Could not start Dask cluster for Study A (fallback to sequential): {e}")
                     _run_study_preprocess(cfg)
-            except Exception as e:
-                logger.warning(f"Could not start Dask cluster for Study A (fallback to sequential): {e}")
+            else:
+                logger.info("Study A: Dask parallelization disabled; running sequentially without cluster")
                 _run_study_preprocess(cfg)
         elif mode == "modeling":
             # Ensure a Dask cluster is available for Optuna parallelization

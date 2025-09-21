@@ -208,6 +208,35 @@ def _auto_discover_dataset_path(dataset_cfg: Dict[str, Any]) -> Optional[Path]:
     return None
 
 
+def _fast_parquet_rowcount(dataset_path: Path) -> Optional[int]:
+    """Quickly estimate total number of rows in a Parquet file or directory.
+
+    Uses pyarrow metadata to sum row groups without materializing data. Returns
+    None if pyarrow is unavailable or on error.
+    """
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+        total = 0
+        if dataset_path.is_dir():
+            any_file = False
+            for fp in dataset_path.rglob('*.parquet'):
+                try:
+                    pf = pq.ParquetFile(str(fp))
+                    meta = pf.metadata
+                    if meta is not None:
+                        total += meta.num_rows
+                        any_file = True
+                except Exception:
+                    continue
+            return total if any_file else None
+        else:
+            pf = pq.ParquetFile(str(dataset_path))
+            meta = pf.metadata
+            return meta.num_rows if meta is not None else None
+    except Exception:
+        return None
+
+
 def _load_dataset(dataset_cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.Series]:
     if not dataset_cfg.get('path'):
         discovered = _auto_discover_dataset_path(dataset_cfg)
@@ -224,11 +253,36 @@ def _load_dataset(dataset_cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.Series]
     dataset_path = _resolve_path(dataset_cfg['path'])
     fmt = str(dataset_cfg.get('format', 'parquet')).lower()
 
-    # Read raw frame first to resolve a valid target column if needed
+    # Read raw frame (with optional sampling) to resolve target and reduce memory pressure
+    max_rows = int(dataset_cfg.get('sample_rows', 0) or 0)
     if fmt == 'parquet':
-        df = pd.read_parquet(dataset_path)
+        if max_rows > 0:
+            try:
+                import dask.dataframe as dd  # type: ignore
+                # Lazily read and pull only up to available rows to avoid head() warning
+                ddf = dd.read_parquet(str(dataset_path), engine='pyarrow', gather_statistics=False)
+                # Try a fast rowcount using pyarrow metadata first
+                total_rows = _fast_parquet_rowcount(dataset_path)
+                n = max_rows
+                if total_rows is None:
+                    # Cheap-ish fallback: sum partition lengths
+                    try:
+                        total_rows = int(ddf.map_partitions(len).sum().compute())
+                    except Exception:
+                        total_rows = None
+                if isinstance(total_rows, int) and total_rows >= 0:
+                    n = min(max_rows, total_rows)
+                df = ddf.head(n, compute=True)
+            except Exception:
+                # Fallback to full read if dask path fails
+                df = pd.read_parquet(dataset_path)
+        else:
+            df = pd.read_parquet(dataset_path)
     elif fmt in {'csv', 'txt'}:
-        df = pd.read_csv(dataset_path)
+        if max_rows > 0:
+            df = pd.read_csv(dataset_path, nrows=max_rows)
+        else:
+            df = pd.read_csv(dataset_path)
     else:
         raise ValueError(f"Unsupported dataset format: {fmt}")
 
@@ -288,6 +342,14 @@ def _load_dataset(dataset_cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.Series]
     df = df[numeric_cols]
 
     df = df.dropna(subset=[target_col]).copy()
+    # If sampling requested, apply deterministic head to control memory
+    if max_rows > 0 and len(df) > max_rows:
+        df = df.head(max_rows).copy()
+
+    # PRESERVE TARGET BEFORE DENYLIST FILTERING
+    # Extract target values before removing features - target is NOT a feature for training
+    y_target = df[target_col].astype(float).copy()
+    print(f"    🎯 Target '{target_col}' preserved: {len(y_target)} samples")
 
     # --- COMPREHENSIVE DENYLIST ENFORCEMENT - CRITICAL FOR DATA LEAKAGE PREVENTION ---
     # This is a HARD BARRIER against data leakage - removes ALL problematic features
@@ -365,9 +427,12 @@ def _load_dataset(dataset_cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.Series]
     sample_rows = dataset_cfg.get('sample_rows')
     if sample_rows and sample_rows > 0 and len(df) > sample_rows:
         df = df.tail(sample_rows)
+        # Also apply sampling to target
+        y_target = y_target.tail(sample_rows)
 
-    y = df[target_col].astype(float)
-    X = df.drop(columns=[target_col]).astype(float)
+    # Features are everything except the target (which was already extracted)
+    X = df.drop(columns=[target_col], errors='ignore').astype(float)  # errors='ignore' in case target was already removed by denylist
+    y = y_target  # Use the preserved target
 
     DATASET_CACHE[key] = (X.copy(), y.copy())
     return X, y
