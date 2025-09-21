@@ -33,8 +33,8 @@ class ConfigValidator:
     def validate_pipeline_config(self, config: Any) -> ValidationResult:
         res = ValidationResult(is_valid=True)
         try:
-            # Required top-level sections
-            for section in ['database', 'r2', 'dask', 'features', 'pipeline', 'output']:
+            # Required top-level sections (database removed - no longer needed)
+            for section in ['r2', 'dask', 'features', 'pipeline', 'output']:
                 if not hasattr(config, section):
                     res.add('ERROR', f"Missing section: {section}", path=section)
 

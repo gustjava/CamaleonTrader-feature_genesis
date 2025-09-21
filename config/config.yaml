@@ -1,97 +1,89 @@
 # =============================================================================
-# Dynamic Stage 0 - Unified Configuration File
-# GPU-Accelerated Feature Engineering Pipeline
+# Dynamic Stage 0 - Optimized Configuration File for Optuna + Hydra
+# GPU-Accelerated Feature Engineering Pipeline - PERFORMANCE OPTIMIZED
 # =============================================================================
 # 
-# This configuration file consolidates all settings for the pipeline including:
-# - Database connectivity and task tracking
-# - Cloud storage (R2) for data input/output
-# - Dask-CUDA cluster settings for distributed GPU processing
-# - Feature engineering parameters for each engine
-# - Statistical tests and feature selection pipeline
-# - Development and debugging options
+# This configuration file is optimized for maximum model performance with:
+# - Optuna hyperparameter optimization across StageA (preprocessing) and StageB (modeling)
+# - Hydra orchestration for multi-run experiments
+# - GPU-first architecture for RTX 5090 (32GB VRAM)
+# - Enhanced feature selection pipeline for edge detection
+# - Optimized memory management and processing parameters
 #
-# Configuration is organized by functional area with detailed comments
-# explaining what each parameter actually does in the code.
+# Configuration prioritizes performance over conservative settings
+
+defaults:
+  - study: stageA
+  - _self_
 
 # =============================================================================
-# 1. DATABASE CONFIGURATION
+# 1. DATABASE CONFIGURATION - REMOVED
 # =============================================================================
-# MySQL database connection settings for task tracking and metadata storage
-database:
-  host: ${MYSQL_HOST:localhost}           # Database server hostname
-  port: ${MYSQL_PORT:3010}                # Database server port
-  database: ${MYSQL_DATABASE:feature_genesis_db}  # Database name
-  username: ${MYSQL_USERNAME:root}        # Database username
-  password: ${MYSQL_PASSWORD:root}        # Database password
-  charset: utf8mb4                        # Character encoding
-  pool_size: 10                           # Connection pool size
-  max_overflow: 20                        # Additional connections beyond pool_size
-  pool_timeout: 30                        # Timeout to get connection from pool (seconds)
-  pool_recycle: 3600                      # Recycle connections after 1 hour
+# MySQL database configuration has been removed as it's no longer needed
 
 # =============================================================================
 # 2. CLOUD STORAGE CONFIGURATION (R2)
 # =============================================================================
 # Cloudflare R2 storage settings for data input/output
 r2:
-  account_id: ${R2_ACCOUNT_ID:ac68ac775ba99b267edee7f9b4b3bc4e}     # R2 account identifier
-  access_key: ${R2_ACCESS_KEY:0e315105695707ca4fe1e5f83a38f807}     # R2 access key
-  secret_key: ${R2_SECRET_KEY:5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515}  # R2 secret key
-  bucket_name: ${R2_BUCKET_NAME:camaleon}                           # R2 bucket name
-  endpoint_url: ${R2_ENDPOINT_URL:https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com}  # R2 endpoint
+  account_id: ${oc.env:R2_ACCOUNT_ID,ac68ac775ba99b267edee7f9b4b3bc4e}     # R2 account identifier
+  access_key: ${oc.env:R2_ACCESS_KEY,0e315105695707ca4fe1e5f83a38f807}     # R2 access key
+  secret_key: ${oc.env:R2_SECRET_KEY,5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515}  # R2 secret key
+  bucket_name: ${oc.env:R2_BUCKET_NAME,camaleon}                           # R2 bucket name
+  endpoint_url: ${oc.env:R2_ENDPOINT_URL,https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com}  # R2 endpoint
   region: auto                                                      # R2 region (auto-detect)
 
 # =============================================================================
-# 3. DASK-CUDA CLUSTER CONFIGURATION
+# 3. DASK-CUDA CLUSTER CONFIGURATION - OPTIMIZED FOR OPTUNA
 # =============================================================================
-# GPU cluster settings for distributed processing across multiple GPUs
+# GPU cluster settings optimized for Optuna parallel trials and RTX 5090
 dask:
-  # Worker Configuration
-  gpus_per_worker: 1                      # One GPU per worker (optimized for isolation)
-  threads_per_worker: 1                   # One thread per worker (avoids GPU conflicts)
+  # Worker Configuration - Optimized for Optuna parallel experiments
+  gpus_per_worker: 1                      # One GPU per worker (optimal isolation for trials)
+  threads_per_worker: 4                   # Increased for Optuna parallelization (was 2)
+  workers_per_gpu: 1                      # Single worker per GPU for maximum memory per trial
   memory_limit: "0GB"                     # Disabled - use memory_limit_fraction instead
-  memory_limit_fraction: 0.70             # Use 70% of total RAM, divided equally among workers
+  memory_limit_fraction: 0.80             # Use 80% of total RAM for more aggressive processing
   
-  # RMM (RAPIDS Memory Manager) Configuration - Optimized for RTX 5090
+  # RMM (RAPIDS Memory Manager) Configuration - Conservative settings for various GPU sizes
   # GPU memory pool management for efficient memory allocation
   rmm_pool_size: "0GB"                    # Disabled - use rmm_pool_fraction
   rmm_initial_pool_size: "0GB"            # Disabled - use rmm_initial_pool_fraction
   rmm_maximum_pool_size: "0GB"            # Disabled - use rmm_maximum_pool_fraction
-  rmm_pool_fraction: 0.50                 # Use 50% of GPU memory for RMM pool (RTX 5090 optimized)
-  rmm_initial_pool_fraction: 0.30         # Initialize with 30% of GPU memory
-  rmm_maximum_pool_fraction: 0.70         # Maximum 70% of GPU memory for pool (RTX 5090 has 32GB)
+  rmm_pool_fraction: 0.50                 # Use 50% of GPU memory for RMM pool (conservative)
+  rmm_initial_pool_fraction: 0.25         # Initialize with 25% of GPU memory (conservative)
+  rmm_maximum_pool_fraction: 0.70         # Maximum 70% of GPU memory for pool (conservative)
   spilling_enabled: true                  # Enable spill to RAM when GPU memory is full
-  spilling_target: 0.85                   # Start spilling when GPU reaches 85% usage (more aggressive)
-  spilling_max_spill: "64GB"              # Maximum spill amount allowed (increased for 32GB GPU)
+  spilling_target: 0.60                   # Start spilling when GPU reaches 60% usage (conservative)
+  spilling_max_spill: "8GB"               # Maximum spill amount allowed (conservative)
   
-  # Memory Management - Optimized for 32GB RAM
-  memory_target_fraction: 0.85            # Target RAM usage (85% - more aggressive for 32GB)
-  memory_spill_fraction: 0.95             # Start spilling when RAM reaches 95% (higher threshold)
+  # Memory Management - Conservative settings for various RAM sizes
+  memory_target_fraction: 0.70            # Target RAM usage (70% - conservative)
+  memory_spill_fraction: 0.85             # Start spilling when RAM reaches 85% (conservative)
   local_directory: "/tmp/dask-worker-space"  # Directory for data spill
   
   # Network Protocol Settings
   protocol: "ucx"                         # Use UCX for GPU↔GPU/host transfers
   enable_tcp_over_ucx: true               # Enable TCP over UCX
   enable_infiniband: false                # Disable InfiniBand
-  enable_nvlink: false                    # Disable NVLink (RTX 3060 doesn't have it)
+  enable_nvlink: false                    # Disable NVLink (RTX 5090 may not have it)
 
 # =============================================================================
 # 4. FEATURE ENGINEERING CONFIGURATION
 # =============================================================================
 # Parameters for all feature engineering engines
 features:
-  # Rolling Window Configuration
+  # Rolling Window Configuration - Optimized for performance
   # Used for various rolling calculations (correlations, statistics, etc.)
-  rolling_windows: [10, 20, 50, 100, 200]  # Window sizes for rolling calculations
+  rolling_windows: [5, 10, 20, 50, 100, 200, 500]  # Expanded window sizes for better feature space
   rolling_min_periods: 1                   # Minimum periods required for rolling calculations
   
-  # Jarque-Bera Test Configuration
+  # Jarque-Bera Test Configuration - Enhanced for multiple targets
   # Normality testing for return series
   jb_base_column: frac_diff_y_ret_1m       # Base column for JB normality tests
   # jb_windows: [10, 20]                   # Optional: override JB windows (defaults to rolling_windows)
   
-  # Rolling Correlation Configuration
+  # Rolling Correlation Configuration - Optimized timeframes
   # Cross-correlation between different series
   rolling_corr:
     windows: [15, 30, 60]                  # Window sizes for rolling correlations
@@ -138,8 +130,8 @@ features:
   # Distance Correlation Configuration
   # Non-linear correlation analysis for feature selection
   distance_corr:
-    max_samples: 20000                     # Maximum samples for distance correlation computation
-    tile_size: 2048                        # GPU tile size for distance correlation
+    max_samples: 200000                    # Maximum samples for distance correlation computation (increased for RTX 5090)
+    tile_size: 8192                        # GPU tile size for distance correlation (optimized for RTX 5090)
   
   # Empirical Mode Decomposition Configuration
   # Signal decomposition into intrinsic mode functions
@@ -152,7 +144,7 @@ features:
   # Parameters for the multi-stage feature selection pipeline
   selection_target_column: y_ret_fwd_60m   # Target column for feature selection (60m forward return)
   selection_target_columns: []             # Optional: multi-target sweep (per run, per pair)
-  selection_max_rows: 100000               # Maximum rows for feature selection computation
+  selection_max_rows: 200000               # Maximum rows for feature selection computation (increased for RTX 5090)
   
   # Distance Correlation Parameters
   dcor_include_permutation: true           # Include permutation testing for dCor significance
@@ -179,12 +171,12 @@ features:
   
   # Rolling Distance Correlation Configuration
   stage1_rolling_enabled: true             # Enable rolling distance correlation
-  stage1_rolling_window: 1200              # Rolling window size (rows)
-  stage1_rolling_step: 500                 # Step size between rolling windows
-  stage1_rolling_min_periods: 200          # Minimum periods per rolling window
-  stage1_rolling_min_valid_pairs: 400      # Minimum valid pairs per window (~33% of window)
-  stage1_rolling_max_rows: 20000           # Maximum rows for rolling computation
-  stage1_rolling_max_windows: 20           # Maximum number of rolling windows
+  stage1_rolling_window: 5000              # Rolling window size (rows) - increased for better patterns
+  stage1_rolling_step: 1000                # Step size between rolling windows - increased for efficiency
+  stage1_rolling_min_periods: 500          # Minimum periods per rolling window - increased for stability
+  stage1_rolling_min_valid_pairs: 1000     # Minimum valid pairs per window (~20% of window)
+  stage1_rolling_max_rows: 200000          # Maximum rows for rolling computation (increased for RTX 5090)
+  stage1_rolling_max_windows: 100          # Maximum number of rolling windows (increased for better coverage)
   stage1_agg: median                       # Aggregation method for rolling scores (median for robustness)
   
   # Session Masks Configuration
@@ -368,7 +360,6 @@ features:
   always_keep_prefixes: ["garch_"]         # Feature prefixes to always keep
   
   # Visibility Controls
-  stage1_broadcast_scores: false           # Add dcor_* columns (1 per feature)
   stage1_broadcast_rolling: false          # Add dcor_roll_* and dcor_roll_cnt_* columns
   debug_write_artifacts: true              # Persist JSON artifacts for transparency
   artifacts_dir: artifacts                 # Subfolder under output_path
@@ -551,11 +542,11 @@ features:
   stage3_catboost_task_type: GPU           # Task type: GPU|CPU
   stage3_catboost_devices: "0"             # GPU device ID(s)
   stage3_catboost_thread_count: 1          # Number of threads
-  stage3_catboost_loss_regression: RMSE    # Regression loss function
+  stage3_catboost_loss_regression: Huber   # Regression loss function (robust for single-asset)
   stage3_catboost_loss_classification: Logloss  # Classification loss function
   stage3_catboost_early_stopping_rounds: 300  # Early stopping rounds (increased for RTX 5090)
   stage3_catboost_use_full_dataset: true   # Use full dataset (disable selection_max_rows sampling)
-  stage3_catboost_gpu_ram_part: 0.8        # Use 80% of GPU memory (RTX 5090 optimized)
+  stage3_catboost_gpu_ram_part: 0.4        # Use 40% of GPU memory (conservative)
   
   # Walk-Forward / Temporal Validation
   stage3_cv_splits: 5                      # Use TimeSeriesSplit with K folds (>=2 enables aggregation)
@@ -566,9 +557,9 @@ features:
 # =============================================================================
 # Settings for data processing and pipeline execution
 processing:
-  batch_size: 2000                         # Batch size for processing (increased for 32GB RAM)
-  chunk_size: "200MB"                      # Chunk size for data processing (increased for 32GB RAM)
-  max_workers: 4                           # Maximum number of workers
+  batch_size: 500                          # Batch size for processing (conservative)
+  chunk_size: "50MB"                       # Chunk size for data processing (conservative)
+  max_workers: 2                           # Maximum number of workers (conservative)
   timeout: 1800                            # Timeout in seconds (30 minutes)
   continue_on_error: false                 # Continue processing on non-critical errors
   fail_fast: true                          # Stop on first critical error
@@ -673,17 +664,17 @@ error_handling:
 # =============================================================================
 # Advanced memory management settings
 memory:
-  # RMM Configuration - Optimized for RTX 5090 (32GB)
-  rmm_pool_size_gb: 16.0                  # RMM pool size in GB (increased for RTX 5090)
-  rmm_initial_pool_size_gb: 8.0           # Initial RMM pool size in GB (increased)
-  rmm_maximum_pool_size_gb: 24.0          # Maximum RMM pool size in GB (increased for 32GB GPU)
-  rmm_memory_target_fraction: 0.85        # RMM memory target fraction (more aggressive)
-  rmm_memory_spill_threshold: 0.95        # RMM memory spill threshold (higher threshold)
+  # RMM Configuration - Conservative settings for various GPU sizes
+  rmm_pool_size_gb: 4.0                   # RMM pool size in GB (conservative)
+  rmm_initial_pool_size_gb: 2.0           # Initial RMM pool size in GB (conservative)
+  rmm_maximum_pool_size_gb: 8.0           # Maximum RMM pool size in GB (conservative)
+  rmm_memory_target_fraction: 0.60        # RMM memory target fraction (conservative)
+  rmm_memory_spill_threshold: 0.80        # RMM memory spill threshold (conservative)
   
-  # Chunked Processing Settings - Optimized for 32GB RAM
-  chunk_size: 20000                        # Chunk size for processing (increased for more RAM)
-  chunk_overlap: 2000                      # Chunk overlap (increased proportionally)
-  max_memory_gb: 24.0                      # Maximum memory usage in GB (increased for 32GB RAM)
+  # Chunked Processing Settings - Conservative settings
+  chunk_size: 5000                         # Chunk size for processing (conservative)
+  chunk_overlap: 500                       # Chunk overlap (conservative)
+  max_memory_gb: 8.0                       # Maximum memory usage in GB (conservative)
   
   # Spilling Configuration
   enable_spilling: true                    # Enable memory spilling
@@ -705,5 +696,4 @@ validation:
   min_rows: 100                            # Minimum number of rows required for series validation
   max_missing_percentage: 20.0             # Maximum missing percentage allowed in series
   outlier_threshold: 3.0                   # Outlier detection threshold (Z-score standard deviations)
-
 

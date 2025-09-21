@@ -84,8 +84,7 @@ tail -f pipeline.log
 # 5. COMANDOS PARA TÚNEIS SSH (se necessário)
 # ====================================================================================
 
-# Criar túnel SSH reverso para MySQL (do local para remoto)
-ssh -R 3010:127.0.0.1:3010 -p PORTA root@HOST
+# MySQL tunnel removed - no longer needed
 
 # Verificar se túnel está funcionando
 netstat -tlnp | grep 3010

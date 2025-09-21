@@ -110,7 +110,7 @@ if [ -n "$ENV_NAME" ]; then
     pip install --no-cache-dir \
         pyyaml python-dotenv click \
         structlog rich python-json-logger psutil \
-        sqlalchemy pymysql cryptography \
+        cryptography \
         boto3 s3fs pyarrow \
         statsmodels arch \
         dcor emd memory-profiler gputil \

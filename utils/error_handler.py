@@ -175,8 +175,8 @@ class ErrorHandler:
         if any(term in error_message for term in ['network', 'connection', 'timeout', 'http']):
             return ErrorCategory.NETWORK
         
-        # Database errors
-        if any(term in error_message for term in ['database', 'sql', 'mysql', 'connection']):
+        # Database errors (MySQL removed - no longer needed)
+        if any(term in error_message for term in ['database', 'sql', 'connection']):
             return ErrorCategory.DATABASE
         
         # Data validation errors

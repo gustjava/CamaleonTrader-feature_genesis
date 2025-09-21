@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Este script automatiza o processo de:
 # 1. Conectar-se a uma instância JÁ EXISTENTE na vast.ai.
-# 2. Criar um túnel SSH reverso para seu banco de dados MySQL local.
+# 2. Conectar-se à instância remota.
 # 3. Sincronizar seu código local para a instância remota.
 # 4. Sincronizar os dados do R2 para a instância remota.
 # 5. Executar o pipeline de features.
@@ -25,9 +25,7 @@ REMOTE_DATA_DIR="/data" # Diretório para os parquets na instância remota
 SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/id_ed25519}"
 SSH_USER="root"
 
-# Configurações do Túnel MySQL
-LOCAL_MYSQL_PORT="3010"
-REMOTE_MYSQL_PORT="3010"
+# MySQL tunnel removed - no longer needed
 
 
 # -------------------------- FUNÇÕES AUXILIARES/VERIFICAÇÕES -------------------------
@@ -64,7 +62,7 @@ echo "--------------------------------------------------------------------------
 # Seleciona a primeira instância em execução por padrão, caso o usuário apenas pressione Enter
 FIRST_INSTANCE_ID="$(echo "$INSTANCES_RAW" | jq -r '[.[] | select(.actual_status=="running")][0].id // empty')"
 if [[ -z "$FIRST_INSTANCE_ID" ]]; then
-  echo "❌ Nenhuma instância em execução encontrada."
+  echo "[ERROR] Nenhuma instância em execução encontrada."
   exit 1
 fi
 
@@ -79,7 +77,7 @@ fi
 INSTANCE_ID="${INSTANCE_ID:-$FIRST_INSTANCE_ID}"
 [[ -z "${INSTANCE_ID}" ]] && { echo "Erro: ID da instância vazio."; exit 1; }
 
-echo "✅ Instância selecionada: $INSTANCE_ID"
+echo "[OK] Instância selecionada: $INSTANCE_ID"
 
 echo "Aguardando SSH da instância $INSTANCE_ID ficar disponível..."
 SSH_HOST=""; SSH_PORT=""
@@ -91,7 +89,7 @@ for i in {1..120}; do
     SSH_PORT=$(echo "$INSTANCE_INFO" | jq -r '.ssh_port' 2>/dev/null || echo "")
     if [[ -n "$SSH_HOST" && -n "$SSH_PORT" && "$SSH_HOST" != "null" && "$SSH_PORT" != "null" ]]; then
       if nc -z -w5 "$SSH_HOST" "$SSH_PORT"; then
-        echo "✅ SSH pronto em $SSH_HOST:$SSH_PORT"
+        echo "[OK] SSH pronto em $SSH_HOST:$SSH_PORT"
         break
       fi
     fi
@@ -104,47 +102,14 @@ echo ""
 
 # --- SINCRONIZAÇÃO E EXECUÇÃO ---
 SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i $SSH_KEY_PATH"
-SSH_TUNNEL_OPTS="-R $REMOTE_MYSQL_PORT:127.0.0.1:$LOCAL_MYSQL_PORT"
+# SSH tunnel options removed - no longer needed
 
 # **CORREÇÃO**: Garantir que o diretório de destino existe na instância remota
-echo -e "\n🔄  Preparando diretório remoto..."
+echo -e "\n[PREPARANDO] Preparando diretório remoto..."
 ssh $SSH_OPTS "root@$SSH_HOST" "mkdir -p $REMOTE_PROJECT_DIR"
-echo "✅ Diretório remoto pronto."
+echo "[OK] Diretório remoto pronto."
 
-# --- CRIAR TÚNEL PERSISTENTE COM NOHUP ---
-echo -e "\n🔗  Criando túnel SSH persistente com nohup..."
-TUNNEL_PID_FILE="/tmp/vast_tunnel_${INSTANCE_ID}.pid"
-
-# Mata qualquer túnel anterior para esta instância
-if [[ -f "$TUNNEL_PID_FILE" ]]; then
-    OLD_PID=$(cat "$TUNNEL_PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Matando túnel anterior (PID: $OLD_PID)..."
-        kill "$OLD_PID"
-        sleep 2
-    fi
-    rm -f "$TUNNEL_PID_FILE"
-fi
-
-# Cria o túnel em background com nohup
-nohup ssh $SSH_OPTS $SSH_TUNNEL_OPTS -N "root@$SSH_HOST" > /tmp/vast_tunnel_${INSTANCE_ID}.log 2>&1 &
-TUNNEL_PID=$!
-echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
-
-# Aguarda um pouco para o túnel se estabelecer
-echo "Aguardando túnel se estabelecer..."
-sleep 3
-
-# Verifica se o túnel está funcionando
-if ! nc -z -w5 127.0.0.1 "$LOCAL_MYSQL_PORT"; then
-    echo "❌ Erro: Túnel não conseguiu se estabelecer. Verificando logs..."
-    cat "/tmp/vast_tunnel_${INSTANCE_ID}.log"
-    exit 1
-fi
-
-echo "✅ Túnel SSH persistente criado (PID: $TUNNEL_PID)"
-echo "📝 Logs do túnel: /tmp/vast_tunnel_${INSTANCE_ID}.log"
-echo "💡 Para parar o túnel: kill \$(cat $TUNNEL_PID_FILE)"
+# MySQL tunnel removed - no longer needed
 
 # --- CRIAR TÚNEL PARA DASHBOARD DASK ---
 echo -e "\n🔗  Criando túnel SSH para dashboard Dask..."
@@ -165,10 +130,10 @@ fi
 
 # Verifica se a porta local já está em uso
 if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
-    echo "⚠️  Porta $DASHBOARD_LOCAL_PORT já está em uso. Tentando porta 8889..."
+    echo "[WARNING]  Porta $DASHBOARD_LOCAL_PORT já está em uso. Tentando porta 8889..."
     DASHBOARD_LOCAL_PORT="8889"
     if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
-        echo "⚠️  Porta $DASHBOARD_LOCAL_PORT também está em uso. Tentando porta 8890..."
+        echo "[WARNING]  Porta $DASHBOARD_LOCAL_PORT também está em uso. Tentando porta 8890..."
         DASHBOARD_LOCAL_PORT="8890"
     fi
 fi
@@ -184,21 +149,43 @@ sleep 3
 
 # Verifica se o túnel do dashboard está funcionando
 if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
-    echo "✅ Túnel SSH para dashboard Dask criado (PID: $DASHBOARD_TUNNEL_PID)"
-    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
-    echo "🌐 Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
+    echo "[OK] Túnel SSH para dashboard Dask criado (PID: $DASHBOARD_TUNNEL_PID)"
+    echo "[LOG] Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    echo "[WEB] Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
 else
-    echo "⚠️  Túnel do dashboard não conseguiu se estabelecer, mas continuando..."
-    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    echo "[WARNING]  Túnel do dashboard não conseguiu se estabelecer, mas continuando..."
+    echo "[LOG] Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
 fi
 
-echo -e "\n🔄  Sincronizando código local com a instância remota via rsync..."
+echo -e "\n[SYNC]  Sincronizando código local com a instância remota via rsync..."
+echo "[DEBUG] Diretório local: $LOCAL_PROJECT_DIR"
+echo "[DEBUG] Diretório remoto: $REMOTE_PROJECT_DIR"
+echo "[DEBUG] Verificando se orchestration/ existe localmente..."
+ls -la "$LOCAL_PROJECT_DIR/orchestration/" || echo "[WARNING] orchestration/ não encontrado localmente"
+
 rsync -avz --delete -e "ssh $SSH_OPTS" \
   --exclude='.git/' --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
   "$LOCAL_PROJECT_DIR/" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
-echo "✅ Sincronização de código completa."
 
-# Variáveis de ambiente para R2 e MySQL a serem usadas no comando remoto
+echo "[DEBUG] Verificando sincronização remota..."
+ssh $SSH_OPTS "root@$SSH_HOST" "ls -la $REMOTE_PROJECT_DIR/orchestration/" || echo "[ERROR] orchestration/ não encontrado no remoto"
+
+echo "[OK] Sincronização de código completa."
+
+# Remover arquivo db_handler.py antigo se existir
+echo "[CLEANUP] Removendo arquivo db_handler.py antigo..."
+ssh $SSH_OPTS "root@$SSH_HOST" "rm -f $REMOTE_PROJECT_DIR/data_io/db_handler.py" || true
+
+# Verificar se db_handler_no_mysql.py existe
+echo "[VERIFY] Verificando arquivo db_handler_no_mysql.py..."
+if ssh $SSH_OPTS "root@$SSH_HOST" "test -f $REMOTE_PROJECT_DIR/data_io/db_handler_no_mysql.py"; then
+    echo "[OK] db_handler_no_mysql.py encontrado no remoto"
+else
+    echo "[ERROR] db_handler_no_mysql.py não encontrado no remoto!"
+    exit 1
+fi
+
+# Variáveis de ambiente para R2 a serem usadas no comando remoto
 REMOTE_ENV_EXPORTS=$(cat <<EOF
 export R2_ACCOUNT_ID=ac68ac775ba99b267edee7f9b4b3bc4e
 export R2_ACCESS_KEY=0e315105695707ca4fe1e5f83a38f807
@@ -206,11 +193,6 @@ export R2_SECRET_KEY=5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47
 export R2_BUCKET_NAME=camaleon
 export R2_ENDPOINT_URL=https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com
 export R2_REGION=auto
-export MYSQL_HOST=127.0.0.1
-export MYSQL_PORT=${REMOTE_MYSQL_PORT}
-export MYSQL_DATABASE=dynamic_stage0_db
-export MYSQL_USERNAME=root
-export MYSQL_PASSWORD=root
 export LOG_LEVEL=INFO
 export DEBUG=false
 # Configurações CUDA para evitar warnings deprecated
@@ -220,13 +202,13 @@ export CUDF_USE_NEW_CUDA_BINDINGS=1
 EOF
 )
 
-echo -e "\n🚀  Executando o pipeline remotamente (com túnel para MySQL local)..."
+echo -e "\n[EXECUTANDO] Executando o pipeline remotamente..."
 
 # Comando final, agora incluindo a sincronização de dados
 REMOTE_EXEC_CMD="
 set -e
 echo '--- [REMOTO] Configurando ambiente...'
-cd $REMOTE_PROJECT_DIR
+cd \$REMOTE_PROJECT_DIR
 source /opt/conda/etc/profile.d/conda.sh
 
 # Verificar recursos do sistema
@@ -240,27 +222,60 @@ echo '--- [REMOTO] Verificando ambiente conda...'
 
 echo '--- [REMOTO] Verificando ambiente conda...'
 if conda env list | grep -q 'dynamic-stage0'; then
-    echo '✅ Ambiente dynamic-stage0 encontrado, ativando...'
+    echo '[OK] Ambiente dynamic-stage0 encontrado, ativando...'
     conda activate dynamic-stage0
 elif conda env list | grep -q 'feature-genesis'; then
-    echo '✅ Ambiente feature-genesis encontrado, ativando...'
+    echo '[OK] Ambiente feature-genesis encontrado, ativando...'
     conda activate feature-genesis
 else
-    echo '⚠️  Nenhum dos ambientes esperados (dynamic-stage0/feature-genesis) encontrado!'
+    echo '[WARNING]  Nenhum dos ambientes esperados (dynamic-stage0/feature-genesis) encontrado!'
     echo 'Usando ambiente base (RAPIDS já instalado, se aplicável)...'
     # Não ativar nenhum ambiente específico, usar o base
 fi
 
 # --- Garantir bibliotecas de seleção (CatBoost/LightGBM) instaladas ---
 echo '--- [REMOTO] Instalando dependências adicionais (CatBoost/LightGBM para seleção de features)...'
-conda install -y lightgbm || true
-conda install -c conda-forge -y catboost || true
+# Instalar uma por vez para evitar conflitos
+conda install -c conda-forge -y lightgbm || pip install --no-cache-dir lightgbm || true
+conda install -c conda-forge -y catboost || pip install --no-cache-dir catboost || true
 
 echo '--- [REMOTO] Instalando dependências adicionais para Stage 3/4...'
-# LightGBM (árvores), scikit-learn (LassoCV/TSS), XGBoost (GPU opcional), matplotlib (plots Stage 4)
-conda install -c conda-forge -y \
-  sqlalchemy pymysql cryptography \
-  scikit-learn lightgbm catboost xgboost matplotlib || true
+# Instalar dependências uma por vez para melhor controle de erros
+for pkg in cryptography scikit-learn xgboost matplotlib; do
+    echo \"Instalando \$pkg...\"
+    conda install -c conda-forge -y \"\$pkg\" || pip install --no-cache-dir \"\$pkg\" || {
+        echo \"[WARNING]  Falha ao instalar \$pkg, continuando...\"
+    }
+done
+
+echo '--- [REMOTO] Instalando dependências para Optuna e Hydra...'
+# Instalar Optuna e Hydra para estudos de otimização
+for pkg in optuna hydra-core omegaconf; do
+    echo \"Instalando \$pkg...\"
+    conda install -c conda-forge -y \"\$pkg\" || pip install --no-cache-dir \"\$pkg\" || {
+        echo \"[WARNING]  Falha ao instalar \$pkg, continuando...\"
+    }
+done
+
+echo '--- [REMOTO] Instalando dependências completas do requirements.txt...'
+# Instalar todas as dependências do projeto
+if [ -f requirements.txt ]; then
+    echo \"Instalando requirements.txt...\"
+    pip install --no-cache-dir -r requirements.txt || {
+        echo \"[WARNING]  Algumas dependências do requirements.txt falharam, continuando...\"
+    }
+else
+    echo \"[WARNING]  requirements.txt não encontrado, continuando com instalação manual...\"
+fi
+
+echo '--- [REMOTO] Verificando dependências específicas do Optuna...'
+# Garantir que as dependências críticas do Optuna estão instaladas
+for pkg in sqlalchemy alembic plotly; do
+    echo \"Verificando/instalando \$pkg para Optuna...\"
+    pip install --no-cache-dir \"\$pkg\" || {
+        echo \"[WARNING]  Falha ao instalar \$pkg, continuando...\"
+    }
+done
 
 echo '--- [REMOTO] Instalando boto3 para R2 upload...'
 pip install --no-cache-dir boto3 || true
@@ -268,19 +283,34 @@ pip install --no-cache-dir boto3 || true
 echo '--- [REMOTO] Garantindo instalação da biblioteca EMD (signal processing)...'
 pip install --no-cache-dir emd || true
 
-echo '--- [REMOTO] Atualizando cuDF para versão com qcut() para trading metrics...'
-# Atualizar cuDF para versão mais recente que tem qcut()
-# RAPIDS 23.08+ tem cudf.qcut() 
-conda install -c rapidsai -c conda-forge -c nvidia cudf=23.08 || \
-pip install --no-cache-dir --upgrade cudf-cu11==23.08.* || \
-pip install --no-cache-dir --upgrade cudf-cu12==23.08.* || true
+echo '--- [REMOTO] Verificando cuDF e RAPIDS stack...'
+# Verificar se RAPIDS já está instalado e funcionando
+if python -c \"import cudf; print(f'cuDF version: {cudf.__version__}')\" 2>/dev/null; then
+    echo '[OK] cuDF já está instalado e funcionando'
+else
+    echo '[WARNING]  cuDF não está disponível. Tentando instalar RAPIDS stack...'
+    # Instalar RAPIDS stack completo via conda (mais confiável)
+    conda install -c rapidsai -c conda-forge -c nvidia -y rapids=23.08 python=3.11 || {
+        echo '[ERROR] Falha ao instalar RAPIDS via conda. Tentando via pip...'
+        pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com cudf-cu11==23.08.* || \
+        pip install --no-cache-dir --extra-index-url https://pypi.nvidia.com cudf-cu12==23.08.* || {
+            echo '[WARNING]  Não foi possível instalar cuDF. Continuando sem GPU acceleration...'
+        }
+    }
+fi
 
 echo '--- [REMOTO] Verificando se rclone está instalado...'
 if ! command -v rclone &> /dev/null; then
     echo 'rclone não encontrado, instalando...'
-    curl https://rclone.org/install.sh | bash
+    curl -s https://rclone.org/install.sh | bash || {
+        echo '[ERROR] Falha ao instalar rclone via script. Tentando via conda...'
+        conda install -c conda-forge -y rclone || {
+            echo '[ERROR] Falha ao instalar rclone. Continuando sem sincronização R2...'
+            echo '[WARNING]  AVISO: Dados não serão sincronizados do R2!'
+        }
+    }
 else
-    echo 'rclone já está instalado'
+    echo '[OK] rclone já está instalado'
 fi
 
 echo '--- [REMOTO] Configurando rclone com credenciais seguras...'
@@ -296,66 +326,129 @@ endpoint = https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com
 EOF
 
 echo '--- [REMOTO] Sincronizando dados do R2...'
-$REMOTE_ENV_EXPORTS
+
+# Configurar variáveis de ambiente para R2 diretamente no contexto remoto
+export R2_ACCOUNT_ID=ac68ac775ba99b267edee7f9b4b3bc4e
+export R2_ACCESS_KEY=0e315105695707ca4fe1e5f83a38f807
+export R2_SECRET_KEY=5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515
+export R2_BUCKET_NAME=camaleon
+export R2_ENDPOINT_URL=https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com
+export R2_REGION=auto
+
+# Definir diretório de dados remoto
+REMOTE_DATA_DIR=\"/data\"
 
 # Criar diretório de dados se não existir
-mkdir -p \"$REMOTE_DATA_DIR\"
+mkdir -p \"\$REMOTE_DATA_DIR\"
 
-# Sync data from R2
-# TEMPORARY EURUSD FILTER - COMMENT OUT WHEN DONE TESTING
-# Filter to only sync EURUSD parquet files
-echo '--- [REMOTO] TEMPORARY FILTER: Syncing only EURUSD parquet files...'
-rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress --include \"*EURUSD*.parquet\"
-# END TEMPORARY FILTER
-# Original command (commented out):
-# rclone sync \"R2:\$R2_BUCKET_NAME\" \"$REMOTE_DATA_DIR\" --progress
+# Verificar se rclone está disponível antes de tentar sincronizar
+if command -v rclone &> /dev/null; then
+    # Sync data from R2
+    # TEMPORARY EURUSD FILTER - COMMENT OUT WHEN DONE TESTING
+    # Filter to only sync EURUSD parquet files
+    echo '--- [REMOTO] TEMPORARY FILTER: Syncing only EURUSD parquet files...'
+    if rclone sync \"R2:\$R2_BUCKET_NAME\" \"\$REMOTE_DATA_DIR\" --progress --include \"*EURUSD*.parquet\"; then
+        echo '[OK] Sincronização R2 concluída com sucesso'
+    else
+        echo '[ERROR] Falha na sincronização R2. Tentando sem filtro...'
+        rclone sync \"R2:\$R2_BUCKET_NAME\" \"\$REMOTE_DATA_DIR\" --progress || {
+            echo '[ERROR] Falha total na sincronização R2. Continuando sem dados...'
+        }
+    fi
+    # END TEMPORARY FILTER
+    # Original command (commented out):
+    # rclone sync \"R2:\$R2_BUCKET_NAME\" \"\$REMOTE_DATA_DIR\" --progress
+else
+    echo '[ERROR] rclone não está disponível. Pulando sincronização R2...'
+    echo '[WARNING]  AVISO: Dados não serão sincronizados do R2!'
+fi
 
 # Check what files were synced
 echo '--- [REMOTO] Verificando arquivos sincronizados...'
-ls -la \"$REMOTE_DATA_DIR\" || echo \"Diretório $REMOTE_DATA_DIR não existe\"
+ls -la \"\$REMOTE_DATA_DIR\" || echo \"Diretório \$REMOTE_DATA_DIR não existe\"
 
 # Check for master_features files specifically
 echo '--- [REMOTO] Verificando arquivos master_features...'
-find \"$REMOTE_DATA_DIR\" -name \"*_master_features.parquet\" -type f 2>/dev/null | head -10 || echo \"Nenhum arquivo master_features encontrado\"
+find \"\$REMOTE_DATA_DIR\" -name \"*_master_features.parquet\" -type f 2>/dev/null | head -10 || echo \"Nenhum arquivo master_features encontrado\"
 
 # If no master_features files found, try to find any parquet files
 echo '--- [REMOTO] Verificando outros arquivos parquet...'
-find \"$REMOTE_DATA_DIR\" -name \"*.parquet\" -type f 2>/dev/null | head -10 || echo \"Nenhum arquivo parquet encontrado\"
+find \"\$REMOTE_DATA_DIR\" -name \"*.parquet\" -type f 2>/dev/null | head -10 || echo \"Nenhum arquivo parquet encontrado\"
 
 # Simple check if directory has any data files
 echo '--- [REMOTO] Verificando se há arquivos de dados...'
-if ! ls \"$REMOTE_DATA_DIR\"/*.parquet 1>/dev/null 2>&1; then
-    echo \"⚠️  AVISO: Nenhum arquivo de dados encontrado. O pipeline pode falhar.\"
+if ! ls \"\$REMOTE_DATA_DIR\"/*.parquet 1>/dev/null 2>&1; then
+    echo \"[WARNING]  AVISO: Nenhum arquivo de dados encontrado. O pipeline pode falhar.\"
     echo \"   Verifique se o R2 bucket contém os arquivos necessários.\"
     echo \"   Arquivos esperados: *_master_features.parquet\"
 fi
 
 echo '--- [REMOTO] Verificando processos existentes...'
-EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | awk '{print \$1}')
-if [ -n \"\$EXISTING_PIDS\" ]; then
-    COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w)
-    echo \"⚠️  ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
+EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | awk '{print \$1}' || true)
+if [ -n \"\${EXISTING_PIDS:-}\" ]; then
+    COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w || true)
+    echo '[WARNING]  ATENÇÃO: '\$COUNT' PROCESSO\\(S\\) EXISTENTE\\(S\\) DETECTADO\\(S\\)!'
     ps -fp \$EXISTING_PIDS 2>/dev/null || true
-    echo \"⚠️  Processos existentes detectados. Verifique se deseja continuar.\"
-    echo \"Aguardando 10 segundos antes de continuar...\"
+    echo '[WARNING]  Processos existentes detectados. Verifique se deseja continuar.'
+    echo 'Aguardando 10 segundos antes de continuar...'
     sleep 10
 else
-    echo '✅ Nenhum processo do pipeline detectado.'
+    echo '[OK] Nenhum processo do pipeline detectado.'
 fi
 
-echo '--- [REMOTO] Iniciando pipeline...'
-python orchestration/main.py
+# Verificação final antes de iniciar o pipeline
+echo '--- [REMOTO] Verificação final do ambiente...'
+echo \"Python version: \$(python --version)\"
+echo \"Working directory: \$(pwd)\"
+echo \"Available memory: \$(free -h | grep Mem | awk '{print \$7}')\"
+echo \"Available disk space: \$(df -h / | tail -1 | awk '{print \$4}')\"
+
+echo '--- [REMOTO] Validando dependencias criticas do Optuna...'
+# Validar se as bibliotecas criticas estao funcionando
+python -c '
+import sys
+try:
+    import optuna
+    import hydra
+    import omegaconf
+    import catboost
+    import sqlalchemy
+except ImportError as e:
+    sys.exit(1)
+' || {
+    echo '[ERROR] Dependencias criticas nao estao disponiveis. Abortando...'
+    exit 1
+}
+
+# Verificar se o diretório orchestration foi sincronizado
+echo '--- [REMOTO] Verificando sincronização do código...'
+echo \"Estrutura do diretório atual: \$(pwd)\"
+echo \"Conteúdo do diretório: \$(ls -la)\"
+echo \"Verificando se orchestration/ existe: \$(ls -la orchestration/ 2>/dev/null || echo 'NÃO ENCONTRADO')\"
+
+# Verificar se o arquivo main.py existe
+if [ ! -f "orchestration/main.py" ]; then
+    echo '[ERROR] ERRO: arquivo orchestration/main.py nao encontrado!'
+    echo 'Verificando estrutura do diretorio:'
+    ls -la orchestration/ || echo 'Diretorio orchestration nao existe'
+    echo 'Tentando recriar estrutura...'
+    mkdir -p orchestration/ || echo 'Falha ao criar diretorio orchestration'
+    exit 1
+fi
+
+echo '--- [REMOTO] Deploy concluído com sucesso!'
+echo '✅ Código sincronizado'
+echo '✅ Dependências instaladas'
+echo '✅ Dados sincronizados do R2'
+echo ''
+echo '🚀 Para executar o pipeline, use: ./run_pipeline_vast.sh'
 "
 
 # Executa o comando final via SSH (túnel já está rodando em background)
 ssh $SSH_OPTS "root@$SSH_HOST" "$REMOTE_EXEC_CMD"
 
-echo -e "\n✅ Sessão de desenvolvimento finalizada."
+echo -e "\n[OK] Sessão de desenvolvimento finalizada."
 echo -e "\n📋 RESUMO:"
-echo "   • Túnel SSH MySQL: ATIVO (PID: $TUNNEL_PID)"
-echo "   • Arquivo PID MySQL: $TUNNEL_PID_FILE"
-echo "   • Logs do túnel MySQL: /tmp/vast_tunnel_${INSTANCE_ID}.log"
-echo "   • Porta local MySQL: $LOCAL_MYSQL_PORT → Porta remota: $REMOTE_MYSQL_PORT"
 if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE" 2>/dev/null || echo "N/A")
     echo "   • Túnel SSH Dashboard: ATIVO (PID: $DASHBOARD_PID)"
@@ -364,16 +457,14 @@ if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     echo "   • Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
 fi
 echo ""
-echo "💡 COMANDOS ÚTEIS:"
+echo "[TIP] COMANDOS ÚTEIS:"
 echo "   • Verificar se túneis estão ativos: ps aux | grep 'ssh.*$SSH_HOST'"
-echo "   • Parar túnel MySQL: kill \$(cat $TUNNEL_PID_FILE)"
 if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     echo "   • Parar túnel Dashboard: kill \$(cat $DASHBOARD_TUNNEL_PID_FILE)"
-fi
-echo "   • Ver logs do túnel MySQL: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
-if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     echo "   • Ver logs do túnel Dashboard: tail -f /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
 fi
 echo "   • Gerenciar túneis: ./manage_tunnels.sh list|stop|stop-all"
 echo ""
-echo "⚠️  IMPORTANTE: Os túneis continuarão rodando mesmo após fechar esta sessão!"
+if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+    echo "[WARNING]  IMPORTANTE: O túnel do dashboard continuará rodando mesmo após fechar esta sessão!"
+fi

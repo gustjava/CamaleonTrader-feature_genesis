@@ -17,26 +17,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class DatabaseConfig:
-    """Database connection configuration."""
-    host: str = "localhost"
-    port: int = 3306
-    database: str = "camaleon"
-    username: str = "root"
-    password: str = ""
-    charset: str = "utf8mb4"
-    pool_size: int = 10
-    max_overflow: int = 20
-    pool_timeout: int = 30
-    pool_recycle: int = 3600
-    
-    def get_url(self) -> str:
-        """Generate SQLAlchemy database URL."""
-        return (
-            f"mysql+pymysql://{self.username}:{self.password}@"
-            f"{self.host}:{self.port}/{self.database}?charset={self.charset}"
-        )
+# Database configuration removed - no longer needed
 
 
 @dataclass
@@ -64,6 +45,7 @@ class DaskConfig:
     """Dask-CUDA cluster configuration."""
     gpus_per_worker: int = 1
     threads_per_worker: int = 1
+    workers_per_gpu: int = 1                        # Number of workers per GPU (for Optuna parallelization)
     memory_limit: str = "0GB"  # Desabilitado - usar memory_limit_fraction
     # New: proportional memory sizing (fraction of system RAM). If > 0, this overrides fixed memory_limit.
     memory_limit_fraction: float = 0.70             # e.g., 0.70 -> 70% of system RAM per worker
@@ -124,7 +106,7 @@ class FeatureConfig:
         'log_price': True,
     })
     distance_corr: Dict[str, Any] = field(default_factory=lambda: {
-        'max_samples': 20000
+        'max_samples': 200000  # Increased for RTX 5090 optimization
     })
     emd: Dict[str, Any] = field(default_factory=lambda: {
         'max_imfs': 10,
@@ -149,15 +131,15 @@ class FeatureConfig:
     garch_min_price_rows: int = 200
     garch_min_return_rows: int = 100
     garch_log_price: bool = True
-    distance_corr_max_samples: int = 10000
-    distance_corr_tile_size: int = 2048
+    distance_corr_max_samples: int = 200000  # Increased for RTX 5090 optimization
+    distance_corr_tile_size: int = 8192      # Increased tile size for better GPU performance
     # Selection stage (Stage 1) and dCor extras
     selection_target_column: str = "y_ret_1m"
     selection_target_columns: List[str] = field(default_factory=list)
     dcor_top_k: int = 50
     dcor_include_permutation: bool = True
     dcor_permutations: int = 100
-    selection_max_rows: int = 100000
+    selection_max_rows: int = 200000  # Increased for RTX 5090 optimization
     vif_threshold: float = 5.0
     mi_threshold: float = 0.3
     mi_bins: int = 64
@@ -176,7 +158,7 @@ class FeatureConfig:
     stage3_catboost_devices: str = "0"
     stage3_catboost_task_type: str = "GPU"  # GPU|CPU
     stage3_catboost_thread_count: int = 1
-    stage3_catboost_loss_regression: str = "RMSE"
+    stage3_catboost_loss_regression: str = "Huber"
     stage3_catboost_loss_classification: str = "Logloss"  # or MultiClass automatically if needed
     # Enhanced CatBoost parameters for better performance
     stage3_catboost_l2_leaf_reg: float = 10.0            # L2 regularization
@@ -237,8 +219,8 @@ class FeatureConfig:
     stage1_rolling_min_periods: int = 200
     # New: minimum pairwise valid (non-NaN) observations required per rolling window
     stage1_rolling_min_valid_pairs: int = 200
-    stage1_rolling_max_rows: int = 20000
-    stage1_rolling_max_windows: int = 20
+    stage1_rolling_max_rows: int = 200000  # Increased for RTX 5090 optimization
+    stage1_rolling_max_windows: int = 100   # Increased for better coverage
     stage1_agg: str = "median"  # one of: mean, median, min, max, p25, p75
     stage1_use_rolling_scores: bool = True
     # If open fraction for candidate drivers in the Stage 1 sample falls below this,
@@ -511,7 +493,7 @@ class UnifiedConfig:
     """
     
     # Core configurations
-    database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    # database: DatabaseConfig = field(default_factory=DatabaseConfig)  # Removed - no longer needed
     r2: R2Config = field(default_factory=R2Config)
     dask: DaskConfig = field(default_factory=DaskConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
@@ -534,10 +516,7 @@ class UnifiedConfig:
             bool: True if configuration is valid, False otherwise
         """
         try:
-            # Validate database configuration
-            if not self.database.host or not self.database.database:
-                logger.error("Database host and database name are required")
-                return False
+            # Database validation removed - no longer needed
             
             # Validate R2 configuration
             if not self.r2.access_key or not self.r2.secret_key:
@@ -576,7 +555,7 @@ class UnifiedConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
         return {
-            'database': self.database.__dict__,
+            # 'database': self.database.__dict__,  # Removed - no longer needed
             'r2': self.r2.__dict__,
             'dask': self.dask.__dict__,
             'features': self.features.__dict__,
@@ -595,17 +574,31 @@ def substitute_environment_variables(value: Any) -> Any:
     """
     Recursively substitute environment variables in configuration values.
     
-    Supports the pattern ${VAR:default} where default is optional.
+    Supports multiple patterns:
+    - ${VAR:default} - Simple environment variable with default
+    - ${oc.env:VAR,default} - Hydra oc.env pattern with default
+    - ${oc.env:VAR} - Hydra oc.env pattern without default
     """
     if isinstance(value, str):
         # Handle ${VAR:default} pattern
         if value.startswith('${') and value.endswith('}'):
             var_part = value[2:-1]  # Remove ${ and }
-            if ':' in var_part:
+            
+            # Handle Hydra oc.env: pattern
+            if var_part.startswith('oc.env:'):
+                env_part = var_part[7:]  # Remove 'oc.env:'
+                if ',' in env_part:
+                    var_name, default = env_part.split(',', 1)
+                    return os.getenv(var_name.strip(), default.strip())
+                else:
+                    return os.getenv(env_part.strip(), '')
+            
+            # Handle simple ${VAR:default} pattern
+            elif ':' in var_part:
                 var_name, default = var_part.split(':', 1)
-                return os.getenv(var_name, default)
+                return os.getenv(var_name.strip(), default.strip())
             else:
-                return os.getenv(var_part, '')
+                return os.getenv(var_part.strip(), '')
         return value
     elif isinstance(value, dict):
         return {k: substitute_environment_variables(v) for k, v in value.items()}
@@ -629,7 +622,7 @@ def load_config_from_dict(config_dict: Dict[str, Any]) -> UnifiedConfig:
     config_dict = substitute_environment_variables(config_dict)
     
     # Create configuration objects
-    database = DatabaseConfig(**config_dict.get('database', {}))
+    # database = DatabaseConfig(**config_dict.get('database', {}))  # Removed - no longer needed
     r2 = R2Config(**config_dict.get('r2', {}))
     dask = DaskConfig(**config_dict.get('dask', {}))
     features = FeatureConfig(**config_dict.get('features', {}))
@@ -651,7 +644,7 @@ def load_config_from_dict(config_dict: Dict[str, Any]) -> UnifiedConfig:
     pipeline = PipelineConfig(engines=pipeline_engines)
     
     return UnifiedConfig(
-        database=database,
+        # database=database,  # Removed - no longer needed
         r2=r2,
         dask=dask,
         features=features,

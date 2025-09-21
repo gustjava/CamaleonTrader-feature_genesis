@@ -10,9 +10,18 @@ import os
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
-import dask_cudf
-import cudf
+try:
+    import dask_cudf
+    import cudf
+    CUDA_AVAILABLE = True
+except ImportError:
+    dask_cudf = None
+    cudf = None
+    CUDA_AVAILABLE = False
+
 from dask.distributed import Client, wait
+import pandas as pd
+import dask.dataframe as dd
 
 from config import get_config
 from config.unified_config import get_unified_config as get_settings
@@ -129,7 +138,7 @@ class R2DataLoader:
         currency_pair: str, 
         base_path: str,
         client: Optional[Client] = None
-    ) -> Optional[dask_cudf.DataFrame]:
+    ) -> Optional[Any]:
         """
         Load currency pair data from R2 to GPU memory.
         
@@ -139,7 +148,7 @@ class R2DataLoader:
             client: Optional Dask client for distributed loading
             
         Returns:
-            Optional[dask_cudf.DataFrame]: Loaded data as dask_cudf DataFrame, None if failed
+            Optional[Any]: Loaded data as dask_cudf DataFrame (if CUDA available) or dask.dataframe (fallback), None if failed
         """
         try:
             logger.info(f"Loading data for currency pair: {currency_pair}")
@@ -160,17 +169,31 @@ class R2DataLoader:
             logger.info(f"Starting data loading for {currency_pair}...")
             
             try:
-                df = dask_cudf.read_parquet(
-                    r2_path,
-                    **read_params
-                )
+                if CUDA_AVAILABLE:
+                    df = dask_cudf.read_parquet(
+                        r2_path,
+                        **read_params
+                    )
+                else:
+                    # Fallback to dask.dataframe when CUDA is not available
+                    logger.warning("CUDA not available, using dask.dataframe fallback")
+                    df = dd.read_parquet(
+                        r2_path,
+                        **read_params
+                    )
             except TypeError:
                 # Fallback for older dask_cudf without chunksize support
                 rp = {k: v for k, v in read_params.items() if k != 'chunksize'}
-                df = dask_cudf.read_parquet(
-                    r2_path,
-                    **rp
-                )
+                if CUDA_AVAILABLE:
+                    df = dask_cudf.read_parquet(
+                        r2_path,
+                        **rp
+                    )
+                else:
+                    df = dd.read_parquet(
+                        r2_path,
+                        **rp
+                    )
             
             # Trigger computation to verify data is accessible
             # This will also distribute data across GPU workers
@@ -199,7 +222,7 @@ class R2DataLoader:
         self, 
         currency_pair: str, 
         base_path: str
-    ) -> Optional[cudf.DataFrame]:
+    ) -> Optional[Any]:
         """
         Load currency pair data synchronously (for smaller datasets or testing).
         
@@ -208,7 +231,7 @@ class R2DataLoader:
             base_path: The base path in R2
             
         Returns:
-            Optional[cudf.DataFrame]: Loaded data as cudf DataFrame, None if failed
+            Optional[Any]: Loaded data as cudf DataFrame (if CUDA available) or pandas DataFrame (fallback), None if failed
         """
         try:
             logger.info(f"Loading data synchronously for currency pair: {currency_pair}")
@@ -322,7 +345,7 @@ def load_currency_pair_data(
     currency_pair: str, 
     base_path: str,
     client: Optional[Client] = None
-) -> Optional[dask_cudf.DataFrame]:
+) -> Optional[Any]:
     """
     Convenience function to load currency pair data from R2.
     
@@ -332,7 +355,7 @@ def load_currency_pair_data(
         client: Optional Dask client
         
     Returns:
-        Optional[dask_cudf.DataFrame]: Loaded data
+        Optional[Any]: Loaded data as dask_cudf DataFrame (if CUDA available) or dask.dataframe (fallback)
     """
     loader = R2DataLoader()
     return loader.load_currency_pair_data(currency_pair, base_path, client)
@@ -341,7 +364,7 @@ def load_currency_pair_data(
 def load_currency_pair_data_sync(
     currency_pair: str, 
     base_path: str
-) -> Optional[cudf.DataFrame]:
+) -> Optional[Any]:
     """
     Convenience function to load currency pair data synchronously.
     
@@ -350,7 +373,7 @@ def load_currency_pair_data_sync(
         base_path: The base path in R2
         
     Returns:
-        Optional[cudf.DataFrame]: Loaded data
+        Optional[Any]: Loaded data as cudf DataFrame (if CUDA available) or pandas DataFrame (fallback)
     """
     loader = R2DataLoader()
     return loader.load_currency_pair_data_sync(currency_pair, base_path)

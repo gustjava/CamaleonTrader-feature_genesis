@@ -1,0 +1,130 @@
+package: /study
+
+# =============================================================================
+# Hydra Study Configuration - Stage B (Model Optimization)
+# =============================================================================
+
+mode: modeling
+name: stageB_modeling
+
+# Multi-objective Optuna configuration dedicated to model hyperparameters.
+optuna:
+  directions: [maximize, maximize, minimize]
+  n_trials: 300                   # Increased for EURUSD model optimization
+  timeout: null
+  seed: 31415
+  sampler: partial_fixed          # Uses PartialFixedSampler on top of TPE
+  base_sampler: tpe
+  pruner: hyperband
+  hyperband_max_resource: 200     # Increased for better model training
+  hyperband_min_resource: 50      # Increased minimum
+  hyperband_reduction_factor: 3   # More aggressive pruning
+
+outputs:
+  dir: ${output.output_path}/optuna_stage
+  best_stage12_path: ${study.outputs.dir}/best_stage12.json
+  pareto_path: ${study.outputs.dir}/stageB_pareto.json
+  storage_db: ${study.outputs.dir}/study_b.sqlite
+
+fixed_params:
+  load_from: ${study.outputs.best_stage12_path}
+  strict: true                     # Fail fast if any expected key is missing
+
+# Search space only covers model-level hyperparameters; preprocessing is frozen.
+search_space:
+  model:
+    name:
+      choices: [catboost, lgbm]
+
+    catboost:
+      iterations:
+        low: 300                 # Lower bound for faster trials
+        high: 3000               # Higher bound for EURUSD complexity
+      learning_rate:
+        low: 0.005               # Lower learning rate for EURUSD
+        high: 0.2                # Reduced upper bound
+        log: true
+      depth:
+        low: 3                   # Lower depth for EURUSD
+        high: 10                 # Reduced upper bound
+      l2_leaf_reg:
+        low: 0.5                 # Lower regularization
+        high: 30.0               # Higher regularization for EURUSD
+      subsample:
+        low: 0.6                 # Higher minimum subsample
+        high: 1.0
+      random_strength:
+        low: 0.0
+        high: 3.0                # Higher random strength for EURUSD
+      border_count:
+        low: 64                  # Lower border count
+        high: 1024               # Higher border count for EURUSD
+      bagging_temperature:
+        low: 0.0
+        high: 1.5                # Higher bagging temperature
+      grow_policy:
+        choices: [SymmetricTree, Depthwise, Lossguide]  # Added Lossguide
+      bootstrap_type:
+        choices: [Bernoulli, Poisson, Bayesian]  # Added Bayesian
+      loss_function:
+        choices: [RMSE, MAE, Huber, Quantile]  # Added loss function options
+
+    lgbm:
+      learning_rate:
+        low: 0.003               # Lower learning rate for EURUSD
+        high: 0.15               # Reduced upper bound
+        log: true
+      num_leaves:
+        low: 8                   # Lower num_leaves for EURUSD
+        high: 200                # Higher upper bound
+      max_depth:
+        low: -1
+        high: 12                 # Reduced max_depth
+      min_child_samples:
+        low: 5                   # Lower min_child_samples
+        high: 300                # Higher upper bound for EURUSD
+      feature_fraction:
+        low: 0.3                 # Lower feature_fraction
+        high: 1.0
+      bagging_fraction:
+        low: 0.6                 # Higher minimum bagging_fraction
+        high: 1.0
+      bagging_freq:
+        low: 0
+        high: 15                 # Higher bagging_freq
+      lambda_l1:
+        low: 0.0
+        high: 10.0               # Higher L1 regularization
+      lambda_l2:
+        low: 0.0
+        high: 10.0               # Higher L2 regularization
+      min_gain_to_split:
+        low: 0.0
+        high: 2.0                # Higher min_gain_to_split
+      objective:
+        choices: [regression, huber, quantile]  # Added objective options
+      metric:
+        choices: [rmse, mae, huber]  # Added metric options
+
+storage:
+  backend: sqlite
+  url: sqlite:///${study.outputs.storage_db}
+  clean_on_start: false
+
+sampler_overrides:
+  partial_fixed:
+    warn_if_missing: true
+
+evaluation:
+  embargo: 180                    # Increased embargo for EURUSD (was 120)
+  cpcv_groups: 8                  # More groups for EURUSD (was 6)
+  cpcv_leave_out: 2
+  metrics: [icir_oos, sharpe_oos, turnover, max_drawdown, calmar_ratio]
+  
+# EURUSD-specific evaluation
+eurusd_evaluation:
+  directional_accuracy_weight: 0.4    # Weight for directional accuracy
+  sharpe_weight: 0.3                  # Weight for Sharpe ratio
+  turnover_penalty: 0.3               # Penalty for high turnover
+  regime_aware_validation: true       # Enable regime-aware validation
+  session_aware_validation: true      # Enable session-aware validation

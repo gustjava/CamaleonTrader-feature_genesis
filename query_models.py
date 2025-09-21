@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.unified_config import get_unified_config
-from data_io.db_handler import DatabaseHandler
+from data_io.db_handler_no_mysql import NoDatabaseHandler as DatabaseHandler
 
 
 class ModelDatabaseQuery:

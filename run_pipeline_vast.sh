@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 # ====================================================================================
 # SCRIPT PARA EXECUÇÃO DIRETA DO PIPELINE NA VAST.AI
 #
 # Este script automatiza o processo de:
 # 1. Conectar-se a uma instância JÁ EXISTENTE na vast.ai.
-# 2. Criar um túnel SSH reverso para seu banco de dados MySQL local.
+# 2. Conectar-se à instância remota.
 # 3. Sincronizar seu código local para a instância remota.
 # 4. Sincronizar os dados do R2 para a instância remota.
 # 5. Executar o pipeline de features.
@@ -21,9 +21,7 @@ REMOTE_DATA_DIR="/data" # Diretório para os parquets na instância remota
 # SSH
 SSH_KEY_PATH="${SSH_KEY_PATH:-$HOME/.ssh/id_ed25519}"
 
-# Configurações do Túnel MySQL
-LOCAL_MYSQL_PORT="3010"
-REMOTE_MYSQL_PORT="3010"
+# MySQL tunnel removed - no longer needed
 
 # -------------------------- FUNÇÕES AUXILIARES/VERIFICAÇÕES -------------------------
 need_cmd() { command -v "$1" &>/dev/null || { echo "Erro: '$1' não encontrado. Por favor, instale-o."; exit 1; }; }
@@ -97,46 +95,14 @@ fi
 
 # --- SINCRONIZAÇÃO E EXECUÇÃO ---
 SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o LogLevel=ERROR -i $SSH_KEY_PATH"
-SSH_TUNNEL_OPTS="-R $REMOTE_MYSQL_PORT:127.0.0.1:$LOCAL_MYSQL_PORT"
+# SSH tunnel options removed - no longer needed
 
 # Garantir que o diretório de destino existe na instância remota
 echo -e "\n🔄  Preparando diretório remoto..."
 ssh $SSH_OPTS "root@$SSH_HOST" "mkdir -p $REMOTE_PROJECT_DIR"
 echo "✅ Diretório remoto pronto."
 
-# --- CRIAR TÚNEL PERSISTENTE COM NOHUP ---
-echo -e "\n🔗  Criando túnel SSH persistente com nohup..."
-TUNNEL_PID_FILE="/tmp/vast_tunnel_${INSTANCE_ID}.pid"
-
-# Mata qualquer túnel anterior para esta instância
-if [[ -f "$TUNNEL_PID_FILE" ]]; then
-    OLD_PID=$(cat "$TUNNEL_PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Matando túnel anterior (PID: $OLD_PID)..."
-        kill "$OLD_PID"
-        sleep 2
-    fi
-    rm -f "$TUNNEL_PID_FILE"
-fi
-
-# Cria o túnel em background com nohup
-nohup ssh $SSH_OPTS $SSH_TUNNEL_OPTS -N "root@$SSH_HOST" > /tmp/vast_tunnel_${INSTANCE_ID}.log 2>&1 &
-TUNNEL_PID=$!
-echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
-
-# Aguarda um pouco para o túnel se estabelecer
-echo "Aguardando túnel se estabelecer..."
-sleep 3
-
-# Verifica se o túnel está funcionando
-if ! nc -z -w5 127.0.0.1 "$LOCAL_MYSQL_PORT"; then
-    echo "❌ Erro: Túnel não conseguiu se estabelecer. Verificando logs..."
-    cat "/tmp/vast_tunnel_${INSTANCE_ID}.log"
-    exit 1
-fi
-
-echo "✅ Túnel SSH persistente criado (PID: $TUNNEL_PID)"
-echo "📝 Logs do túnel: /tmp/vast_tunnel_${INSTANCE_ID}.log"
+# MySQL tunnel removed - no longer needed
 
 # --- CRIAR TÚNEL PARA DASHBOARD DASK ---
 echo -e "\n🔗  Criando túnel SSH para dashboard Dask..."
@@ -188,41 +154,221 @@ fi
 echo -e "\n🔄  Sincronizando código local com a instância remota via rsync..."
 rsync -avz --delete -e "ssh $SSH_OPTS" \
   --exclude='.git/' --exclude='__pycache__/' --exclude='data/' --exclude='logs/' \
+  --exclude='output/' --exclude='*.sqlite' --exclude='*.db' \
+  --exclude='trial_progress_*.json' --exclude='study_snapshot_*.json' \
   "$LOCAL_PROJECT_DIR/" "root@$SSH_HOST:$REMOTE_PROJECT_DIR/"
 echo "✅ Sincronização de código completa."
 
 # Arquivos de programa já sincronizados pelo rsync principal acima
 
+# --- LIMPEZA LOCAL DE PORTAS ---
+echo -e "\n🧹 Limpando portas locais antes de iniciar..."
+./clean_local_ports.sh
+
+# --- VERIFICAÇÃO DE PORTAS ANTES DE INICIAR ---
+echo -e "\n🔍 Verificando disponibilidade de portas no servidor remoto..."
+ssh $SSH_OPTS "root@$SSH_HOST" '
+echo "Verificando portas UCX no servidor remoto..."
+PORTS_FREE=true
+for port in 8888 8889 8890; do
+    if lsof -i:$port >/dev/null 2>&1; then
+        echo "❌ Porta $port está em uso:"
+        lsof -i:$port
+        PORTS_FREE=false
+    else
+        echo "✅ Porta $port está livre"
+    fi
+done
+
+if [ "$PORTS_FREE" = false ]; then
+    echo "⚠️  Algumas portas estão em uso. Executando limpeza..."
+    echo "🔪 Finalizando processos nas portas..."
+    for port in 8888 8889 8890; do
+        PIDS=$(lsof -ti:$port 2>/dev/null || true)
+        if [ -n "$PIDS" ]; then
+            echo "  Matando processos na porta $port: $PIDS"
+            echo "$PIDS" | xargs -r kill -9 2>/dev/null || true
+        fi
+    done
+    
+    echo "⏳ Aguardando portas ficarem livres..."
+    for port in 8888 8889 8890; do
+        for i in {1..10}; do
+            if ! lsof -i:$port >/dev/null 2>&1; then
+                echo "  ✅ Porta $port livre"
+                break
+            fi
+            if [ $i -eq 10 ]; then
+                echo "  ⚠️  Porta $port ainda em uso após 10 tentativas"
+            fi
+            sleep 1
+        done
+    done
+else
+    echo "✅ Todas as portas estão livres!"
+fi
+'
+
 # --- EXECUÇÃO DO PIPELINE COM TMUX DUAL TERMINAL ---
 echo -e "\n🚀  Executando pipeline remotamente com monitoramento dual..."
 
-# Variáveis de ambiente para MySQL
+# Environment variables for pipeline execution
 REMOTE_ENV_EXPORTS=$(cat <<EOF
-export MYSQL_HOST=127.0.0.1
-export MYSQL_PORT=${REMOTE_MYSQL_PORT}
-export MYSQL_DATABASE=dynamic_stage0_db
-export MYSQL_USERNAME=root
-export MYSQL_PASSWORD=root
 export LOG_LEVEL=INFO
 export DEBUG=false
+export R2_ACCOUNT_ID=ac68ac775ba99b267edee7f9b4b3bc4e
+export R2_ACCESS_KEY=0e315105695707ca4fe1e5f83a38f807
+export R2_SECRET_KEY=5fbf8a2121f48807fdd3abc1c63c28cae6b67424f01e8d20a9cc68b1d47ca515
+export R2_BUCKET_NAME=camaleon
+export R2_ENDPOINT_URL=https://ac68ac775ba99b267edee7f9b4b3bc4e.r2.cloudflarestorage.com
 EOF
 )
 
 # Comando de execução do pipeline
 PIPELINE_CMD="
 set -e
-echo '--- [REMOTO] Verificando processos existentes...'
-EXISTING_PIDS=\$(ps -eo pid,command | grep -E '(python .*orchestration/main\\.py|dask-worker|dask-scheduler)' | grep -v grep | sed -E 's/^[[:space:]]*([0-9]+).*/\1/')
-if [ -n \"\$EXISTING_PIDS\" ]; then
-    COUNT=\$(echo \"\$EXISTING_PIDS\" | wc -w)
-    echo \"⚠️  ATENÇÃO: \$COUNT PROCESSO(S) EXISTENTE(S) DETECTADO(S)!\"
-    ps -fp \$EXISTING_PIDS 2>/dev/null || true
-    echo \"⚠️  Processos existentes detectados. Verifique se deseja continuar.\"
-    echo \"Aguardando 10 segundos antes de continuar...\"
+echo '--- [REMOTO] LIMPEZA COMPLETA DE PROCESSOS E PORTAS...'
+
+# Função para aguardar com timeout
+wait_for_condition() {
+    local condition_cmd=\"\$1\"
+    local timeout_seconds=\"\$2\"
+    local description=\"\$3\"
+    local interval=2
+    
+    echo \"⏳ Aguardando: \$description (timeout: \${timeout_seconds}s)\"
+    
+    for ((i=0; i<timeout_seconds; i+=interval)); do
+        if eval \"\$condition_cmd\" 2>/dev/null; then
+            echo \"✅ \$description - OK\"
+            return 0
+        fi
+        echo -n \".\"
+        sleep \$interval
+    done
+    
+    echo \"❌ \$description - TIMEOUT após \${timeout_seconds}s\"
+    return 1
+}
+
+# Função para verificar se porta está livre
+check_port_free() {
+    local port=\"\$1\"
+    ! lsof -i:\$port >/dev/null 2>&1
+}
+
+echo '🔍 Verificando processos existentes...'
+EXISTING_PROCESSES=\$(ps aux | grep -E \"(python.*orchestration/main\\.py|dask-worker|dask-scheduler|python.*main\\.py)\" | grep -v grep | wc -l)
+if [ \$EXISTING_PROCESSES -gt 0 ]; then
+    echo \"⚠️  Encontrados \$EXISTING_PROCESSES processo(s) ativo(s)\"
+    ps aux | grep -E \"(python.*orchestration/main\\.py|dask-worker|dask-scheduler|python.*main\\.py)\" | grep -v grep
+    
+    # Verificar se há estudos Optuna ativos antes de matar processos
+    echo \"🔍 Verificando estudos Optuna ativos...\"
+    if [ -d \"\$REMOTE_PROJECT_DIR/output/optuna_stage\" ]; then
+        echo \"📊 Estudos Optuna encontrados. Preservando estado...\"
+        echo \"💡 Os estudos existentes serão continuados automaticamente.\"
+    else
+        echo \"📊 Nenhum estudo Optuna ativo encontrado.\"
+    fi
+    
+    echo \"🔪 Finalizando processos Python do pipeline...\"
+    pkill -TERM -f \"orchestration/main.py\" 2>/dev/null || true
+    pkill -TERM -f \"python.*main.py\" 2>/dev/null || true
+    
+    echo \"🔪 Finalizando processos Dask...\"
+    pkill -TERM -f \"dask-worker\" 2>/dev/null || true
+    pkill -TERM -f \"dask-scheduler\" 2>/dev/null || true
+    pkill -TERM -f \"distributed\" 2>/dev/null || true
+    
+    echo \"🔪 Finalizando processos CuDF/Rapids...\"
+    pkill -TERM -f \"cudf\" 2>/dev/null || true
+    pkill -TERM -f \"rapids\" 2>/dev/null || true
+    
+    echo \"⏳ Aguardando processos terminarem graciosamente (10s)...\"
     sleep 10
+    
+    echo \"🔪 Forçando término de processos remanescentes...\"
+    pkill -9 -f \"orchestration/main.py\" 2>/dev/null || true
+    pkill -9 -f \"python.*main.py\" 2>/dev/null || true
+    pkill -9 -f \"dask-worker\" 2>/dev/null || true
+    pkill -9 -f \"dask-scheduler\" 2>/dev/null || true
+    pkill -9 -f \"distributed\" 2>/dev/null || true
+    pkill -9 -f \"cudf\" 2>/dev/null || true
+    pkill -9 -f \"rapids\" 2>/dev/null || true
+    
+    echo \"🧹 Limpando portas UCX...\"
+    for port in 8888 8889 8890; do
+        PIDS=\$(lsof -ti:\$port 2>/dev/null || true)
+        if [ -n \"\$PIDS\" ]; then
+            echo \"  Matando processos na porta \$port: \$PIDS\"
+            echo \"\$PIDS\" | xargs -r kill -9 2>/dev/null || true
+        fi
+    done
+    
+    echo \"⏳ Aguardando portas ficarem livres...\"
+    for port in 8888 8889 8890; do
+        for i in {1..15}; do
+            if ! lsof -i:\$port >/dev/null 2>&1; then
+                echo \"  ✅ Porta \$port livre\"
+                break
+            fi
+            if [ \$i -eq 15 ]; then
+                echo \"  ⚠️  Porta \$port ainda em uso após 15 tentativas\"
+            fi
+            sleep 1
+        done
+    done
+    
+    echo \"🧹 Limpando memória GPU...\"
+    nvidia-smi --gpu-reset-ecc=0 2>/dev/null || true
+    
+    echo \"🧹 Limpando cache CUDA...\"
+    python3 -c \"
+import ctypes
+try:
+    libcudart = ctypes.CDLL('libcudart.so')
+    libcudart.cudaDeviceReset()
+    print('✅ Cache CUDA limpo')
+except:
+    print('⚠️  Não foi possível limpar cache CUDA')
+\" 2>/dev/null || true
+    
+    echo \"✅ Limpeza completa finalizada\"
 else
-    echo '✅ Nenhum processo do pipeline detectado. Continuando...'
+    echo '✅ Nenhum processo ativo encontrado'
 fi
+
+echo '🔍 Verificação final de limpeza...'
+echo \"📊 Processos Python restantes:\"
+REMAINING_PYTHON=\$(ps aux | grep python | grep -v grep | grep -v \"grep python\" || true)
+if [ -n \"\$REMAINING_PYTHON\" ]; then
+    echo \"\$REMAINING_PYTHON\"
+else
+    echo \"✅ Nenhum processo Python encontrado\"
+fi
+
+echo \"📊 Processos Dask restantes:\"
+REMAINING_DASK=\$(ps aux | grep dask | grep -v grep | grep -v \"grep dask\" || true)
+if [ -n \"\$REMAINING_DASK\" ]; then
+    echo \"\$REMAINING_DASK\"
+else
+    echo \"✅ Nenhum processo Dask encontrado\"
+fi
+
+echo \"📊 Portas UCX em uso:\"
+for port in 8888 8889 8890; do
+    PORT_USAGE=\$(lsof -i:\$port 2>/dev/null || true)
+    if [ -n \"\$PORT_USAGE\" ]; then
+        echo \"  Porta \$port:\"
+        echo \"\$PORT_USAGE\"
+    else
+        echo \"  ✅ Porta \$port livre\"
+    fi
+done
+
+echo \"📊 Status GPU:\"
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || echo \"⚠️  nvidia-smi não disponível\"
 
 echo '--- [REMOTO] Configurando ambiente...'
 cd $REMOTE_PROJECT_DIR
@@ -237,10 +383,63 @@ else
     # Não ativar nenhum ambiente específico, usar o base
 fi
 
-$REMOTE_ENV_EXPORTS
+eval "$REMOTE_ENV_EXPORTS"
 
-echo '--- [REMOTO] Iniciando pipeline...'
-python orchestration/main.py
+echo '--- [REMOTO] Iniciando ESTUDO OPTUNA (Stage A) com 1200 trials...'
+echo '🔬 Modo: stageA (preprocess_selection)'
+echo '📊 Trials: 1200 (configurado em stageA.yaml)'
+echo '🎯 Objetivo: Otimização de features para EURUSD'
+
+# Verificação final das portas antes de iniciar o pipeline
+echo '--- [REMOTO] Verificação final das portas antes de iniciar o pipeline...'
+PORTS_FREE=true
+for port in 8888 8889 8890; do
+    if lsof -i:\$port >/dev/null 2>&1; then
+        echo \"❌ Porta \$port ainda está em uso:\"
+        lsof -i:\$port
+        PORTS_FREE=false
+    else
+        echo \"✅ Porta \$port livre\"
+    fi
+done
+
+if [ \"\$PORTS_FREE\" = false ]; then
+    echo \"⚠️  ALGUMAS PORTAS AINDA ESTÃO EM USO! Tentando limpeza final...\"
+    for port in 8888 8889 8890; do
+        PIDS=\$(lsof -ti:\$port 2>/dev/null || true)
+        if [ -n \"\$PIDS\" ]; then
+            echo \"  Forçando limpeza da porta \$port: \$PIDS\"
+            echo \"\$PIDS\" | xargs -r kill -9 2>/dev/null || true
+            sleep 2
+        fi
+    done
+    
+    # Verificação final
+    echo \"🔍 Verificação final após limpeza forçada:\"
+    for port in 8888 8889 8890; do
+        if lsof -i:\$port >/dev/null 2>&1; then
+            echo \"❌ Porta \$port AINDA em uso após limpeza forçada!\"
+            lsof -i:\$port
+        else
+            echo \"✅ Porta \$port finalmente livre\"
+        fi
+    done
+else
+    echo \"✅ Todas as portas estão livres! Pronto para iniciar o pipeline.\"
+fi
+
+# Verificar estado do estudo Optuna
+echo '--- [REMOTO] Verificando estado do estudo Optuna...'
+if [ -f \"\$REMOTE_PROJECT_DIR/output/optuna_stage/study_a.sqlite\" ]; then
+    echo '📊 Banco de dados do estudo encontrado. Optuna continuará de onde parou.'
+    echo '💡 Para forçar um novo estudo, delete: output/optuna_stage/study_a.sqlite'
+else
+    echo '🆕 Nenhum estudo anterior encontrado. Iniciando novo estudo.'
+fi
+
+# Executar o estudo Optuna com debug completo
+echo '--- [REMOTO] Iniciando pipeline Python...'
+HYDRA_FULL_ERROR=1 python orchestration/main.py
 "
 
 # Criar arquivo de log para o pipeline
@@ -255,7 +454,7 @@ echo ""
 
 # Executa o pipeline e salva os logs
 ssh $SSH_OPTS "root@$SSH_HOST" "$PIPELINE_CMD" 2>&1 | tee "$PIPELINE_LOG_FILE"
-EXIT_CODE=${PIPEOF:-0}
+EXIT_CODE=${PIPESTATUS[0]:-0}
 echo ""
 echo "📋 RESULTADO FINAL:"
 if [ $EXIT_CODE -eq 0 ]; then
@@ -267,7 +466,6 @@ fi
 echo "📝 Logs completos salvos em: $PIPELINE_LOG_FILE"
 
 echo -e "\n🔗 TÚNEIS SSH ATIVOS:"
-echo "   • MySQL: localhost:$LOCAL_MYSQL_PORT → remoto:$REMOTE_MYSQL_PORT (PID: $TUNNEL_PID)"
 if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE" 2>/dev/null || echo "N/A")
     echo "   • Dashboard Dask: localhost:$DASHBOARD_LOCAL_PORT → remoto:$DASHBOARD_REMOTE_PORT (PID: $DASHBOARD_PID)"
@@ -278,11 +476,7 @@ fi
 
 echo -e "\n💡 COMANDOS ÚTEIS:"
 echo "   • Verificar túneis: ps aux | grep 'ssh.*$SSH_HOST'"
-echo "   • Parar túnel MySQL: kill \$(cat $TUNNEL_PID_FILE)"
 if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     echo "   • Parar túnel Dashboard: kill \$(cat $DASHBOARD_TUNNEL_PID_FILE)"
-fi
-echo "   • Ver logs MySQL: tail -f /tmp/vast_tunnel_${INSTANCE_ID}.log"
-if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     echo "   • Ver logs Dashboard: tail -f /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
 fi

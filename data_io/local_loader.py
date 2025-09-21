@@ -12,10 +12,20 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-import dask_cudf
-import cudf
+try:
+    import dask_cudf
+    import cudf
+    import cupy as cp
+    CUDA_AVAILABLE = True
+except ImportError:
+    dask_cudf = None
+    cudf = None
+    cp = None
+    CUDA_AVAILABLE = False
+
 from dask.distributed import Client, wait
-import cupy as cp
+import pandas as pd
+import dask.dataframe as dd
 
 from config.unified_config import get_unified_config as get_settings
 
@@ -74,7 +84,7 @@ class LocalDataLoader:
         self,
         currency_pair_path: str,
         client: Client
-    ) -> Optional[dask_cudf.DataFrame]:
+    ) -> Optional[Any]:
         """
         Load currency pair data from the local disk to GPU memory.
 
@@ -84,7 +94,7 @@ class LocalDataLoader:
             client: Dask client for distributed loading.
 
         Returns:
-            Optional[dask_cudf.DataFrame]: Loaded data as dask_cudf DataFrame, None if failed.
+            Optional[Any]: Loaded data as dask_cudf DataFrame (if CUDA available) or dask.dataframe (fallback), None if failed.
         """
         try:
             local_path = self._get_local_path(currency_pair_path)
@@ -119,11 +129,11 @@ class LocalDataLoader:
 
     def _process_cudf_in_chunks(
         self,
-        df: cudf.DataFrame,
+        df: Any,
         chunk_size: int = 10000,
         overlap: int = 1000,
         max_memory_gb: float = 8.0
-    ) -> cudf.DataFrame:
+    ) -> Any:
         """
         Process large cuDF DataFrames in chunks with overlap to avoid OOM.
         
@@ -195,7 +205,7 @@ class LocalDataLoader:
             logger.error(f"Error in chunked processing: {e}")
             return df
 
-    def load_currency_pair_data_sync(self, r2_path: str) -> Optional[cudf.DataFrame]:
+    def load_currency_pair_data_sync(self, r2_path: str) -> Optional[Any]:
         """
         Load currency pair data synchronously with chunked processing for large datasets.
         
@@ -401,7 +411,7 @@ class LocalDataLoader:
         self,
         currency_pair_path: str,
         client: Client
-    ) -> Optional[dask_cudf.DataFrame]:
+    ) -> Optional[Any]:
         """
         Load currency pair data from Feather v2 files to GPU memory.
 
@@ -411,7 +421,7 @@ class LocalDataLoader:
             client: Dask client for distributed loading.
 
         Returns:
-            Optional[dask_cudf.DataFrame]: Loaded data as dask_cudf DataFrame, None if failed.
+            Optional[Any]: Loaded data as dask_cudf DataFrame (if CUDA available) or dask.dataframe (fallback), None if failed.
         """
         try:
             local_path = self._get_local_path(currency_pair_path)
@@ -746,7 +756,7 @@ class LocalDataLoader:
 
 
 # Convenience functions
-def load_currency_pair_data(currency_pair_path: str, client: Client) -> Optional[dask_cudf.DataFrame]:
+def load_currency_pair_data(currency_pair_path: str, client: Client) -> Optional[Any]:
     """Convenience function to load currency pair data."""
     loader = LocalDataLoader()
     return loader.load_currency_pair_data(currency_pair_path, client)

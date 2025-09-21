@@ -147,7 +147,7 @@ class StatisticalTests(BaseFeatureEngine):
             self.stage3_catboost_devices = str(getattr(uc.features, 'stage3_catboost_devices', '0'))
             self.stage3_catboost_task_type = str(getattr(uc.features, 'stage3_catboost_task_type', 'GPU'))
             self.stage3_catboost_thread_count = int(getattr(uc.features, 'stage3_catboost_thread_count', 1))
-            self.stage3_catboost_loss_regression = str(getattr(uc.features, 'stage3_catboost_loss_regression', 'RMSE'))
+            self.stage3_catboost_loss_regression = str(getattr(uc.features, 'stage3_catboost_loss_regression', 'Huber'))
             self.stage3_catboost_loss_classification = str(getattr(uc.features, 'stage3_catboost_loss_classification', 'Logloss'))
             # Temporal CV / early stopping
             self.stage3_cv_splits = int(getattr(uc.features, 'stage3_cv_splits', 3))
@@ -749,8 +749,8 @@ class StatisticalTests(BaseFeatureEngine):
         Stores results in `self._last_dcor_scores` for downstream selection.
         """
         try:
-            # Build a tail sample across last partitions to represent recent behavior - Fixed 100k sample
-            sample_n = 100000
+            # Build a tail sample across last partitions to represent recent behavior - Configurable sample size
+            sample_n = getattr(self, 'dcor_max_samples', 200000)  # Use configurable size, default 200k
             sample = self._sample_tail_across_partitions(df, sample_n, max_parts=16)
             if sample is None or len(sample) == 0 or target not in sample.columns:
                 self._log_warn("dCor tail sample empty or missing target; trying head sample")

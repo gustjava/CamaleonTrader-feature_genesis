@@ -18,7 +18,7 @@ from dask.distributed import Client, as_completed
 from dask_cuda import LocalCUDACluster
 
 from config.unified_config import get_unified_config as get_settings
-from data_io.db_handler import DatabaseHandler
+from data_io.db_handler_no_mysql import NoDatabaseHandler as DatabaseHandler
 from data_io.local_loader import LocalDataLoader
 from features.base_engine import CriticalPipelineError
 from orchestration.data_processor import DataProcessor, process_currency_pair_dask_worker

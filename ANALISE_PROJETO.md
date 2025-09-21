@@ -3,11 +3,8 @@
 
 ## 1. Configurações Disponíveis e Suas Funções
 
-### 1.1 Configurações de Banco de Dados (`database`)
-- **`host`**: Endereço do servidor MySQL (padrão: localhost)
-- **`port`**: Porta do MySQL (padrão: 3010)
-- **`database`**: Nome do banco de dados (padrão: feature_genesis_db)
-- **`username/password`**: Credenciais de acesso
+### 1.1 Configurações de Banco de Dados (`database`) - REMOVIDO
+- **Nota**: Configurações de banco de dados MySQL foram removidas do projeto
 - **`pool_size`**: Tamanho do pool de conexões (padrão: 10)
 - **`max_overflow`**: Conexões extras permitidas (padrão: 20)
 - **`pool_timeout`**: Timeout para obter conexão (padrão: 30s)

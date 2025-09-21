@@ -779,7 +779,7 @@ class FeatureSelection:
                     gpu_ram_part=gpu_ram_part,
                 )
         else:
-            loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'RMSE'))
+            loss_fn = str(getattr(self, 'stage3_catboost_loss_regression', 'Huber'))
             
             # Suppress GPU memory warnings
             with warnings.catch_warnings():

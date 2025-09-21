@@ -1,0 +1,57 @@
+# =============================================================================
+# Configuração Otimizada para 12 GPUs - Performance Máxima
+# =============================================================================
+
+# Configuração do Dask para 12 GPUs
+dask:
+  # Worker Configuration - Otimizado para 12 GPUs
+  gpus_per_worker: 1                      # Uma GPU por worker
+  threads_per_worker: 6                   # Aumentado para 12 GPUs
+  workers_per_gpu: 1                      # Um worker por GPU
+  memory_limit: "0GB"                     # Desabilitado - usar memory_limit_fraction
+  memory_limit_fraction: 0.75             # 75% da RAM total (mais conservador para 12 GPUs)
+  
+  # RMM Configuration - Otimizado para múltiplas GPUs
+  rmm_pool_fraction: 0.60                 # 60% da memória GPU para pool
+  rmm_initial_pool_fraction: 0.30         # 30% inicial
+  rmm_maximum_pool_fraction: 0.80         # Máximo 80%
+  spilling_enabled: true                  # Habilitar spill para RAM
+  spilling_target: 0.70                   # Começar spill em 70%
+  spilling_max_spill: "16GB"              # Máximo 16GB de spill
+  
+  # Memory Management - Otimizado para 12 GPUs
+  memory_target_fraction: 0.65            # 65% da RAM como target
+  memory_spill_fraction: 0.80             # Começar spill em 80%
+  local_directory: "/tmp/dask-worker-space"
+  protocol: "ucx"                         # UCX para melhor performance multi-GPU
+  enable_tcp_over_ucx: true
+  enable_infiniband: false
+  enable_nvlink: true                     # Habilitar NVLink se disponível
+
+# Configuração do Optuna para 12 GPUs
+optuna:
+  direction: maximize
+  n_trials: 1200
+  timeout: null
+  seed: 42
+  sampler: tpe
+  pruner: hyperband
+  hyperband_max_resource: 100
+  hyperband_min_resource: 10
+  # Parallel execution control - Otimizado para 12 GPUs
+  max_concurrent_trials: 12               # Usar todas as 12 GPUs
+  use_dask_parallelization: true
+
+# Configuração de monitoramento
+monitoring:
+  dashboard_enabled: true
+  dashboard_port: 8888
+  smart_alerts_enabled: true
+  memory_monitoring_enabled: true
+  gpu_monitoring_enabled: true
+
+# Configuração de output
+output:
+  output_path: "/workspace/feature_genesis/output"
+  enable_r2_upload: true
+  cleanup_local_files: false

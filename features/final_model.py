@@ -399,7 +399,7 @@ class FinalModelTrainer:
                         subsample=subsample if bootstrap_type in ['Bernoulli', 'Poisson'] else None,
                     )
             else:
-                loss_fn = str(getattr(self.config.features, 'stage3_catboost_loss_regression', 'RMSE'))
+                loss_fn = str(getattr(self.config.features, 'stage3_catboost_loss_regression', 'Huber'))
                 
                 # Suppress GPU memory warnings
                 with warnings.catch_warnings():

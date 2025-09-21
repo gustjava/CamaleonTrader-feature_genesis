@@ -50,6 +50,14 @@ class R2ModelUploader:
             if self.r2_config is None:
                 raise RuntimeError("R2 configuration not available")
 
+            # Debug: Log configuration values (without secrets)
+            logger.debug(f"R2 Config - account_id: {getattr(self.r2_config, 'account_id', 'MISSING')}")
+            logger.debug(f"R2 Config - endpoint_url: {getattr(self.r2_config, 'endpoint_url', 'MISSING')}")
+            logger.debug(f"R2 Config - bucket_name: {getattr(self.r2_config, 'bucket_name', 'MISSING')}")
+            logger.debug(f"R2 Config - access_key: {'***' if getattr(self.r2_config, 'access_key', None) else 'MISSING'}")
+            logger.debug(f"R2 Config - secret_key: {'***' if getattr(self.r2_config, 'secret_key', None) else 'MISSING'}")
+            logger.debug(f"R2 Config - region: {getattr(self.r2_config, 'region', 'MISSING')}")
+
             self.s3_client = boto3.client(
                 's3',
                 endpoint_url=self.r2_config.endpoint_url,
@@ -481,3 +489,170 @@ class R2ModelUploader:
         except Exception as e:
             logger.error(f"Failed to delete model {model_name} from R2: {e}")
             return False
+
+    def upload_study_results(
+        self,
+        local_json_path: str,
+        study_name: str,
+        stage: str,
+        symbol: str = "EURUSD",
+        cleanup_local: bool = False
+    ) -> bool:
+        """
+        Upload Optuna study results JSON to R2 cloud storage.
+        
+        Args:
+            local_json_path: Path to the local JSON file
+            study_name: Name of the study (e.g., stageA_preprocess_selection)
+            stage: Stage identifier (e.g., "stageA", "stageB")
+            symbol: Currency pair symbol (default: EURUSD)
+            cleanup_local: Whether to delete local file after upload
+            
+        Returns:
+            bool: True if upload successful, False otherwise
+        """
+        try:
+            if not self._validate_r2_credentials():
+                logger.error("R2 credentials validation failed")
+                return False
+            
+            # Validate local file exists
+            if not os.path.exists(local_json_path):
+                logger.error(f"Local JSON file does not exist: {local_json_path}")
+                return False
+            
+            # Generate timestamp for versioning
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Construct R2 key for study results
+            # Format: studies/{symbol}/{stage}/{study_name}_{timestamp}.json
+            r2_key = f"studies/{symbol}/{stage}/{study_name}_{timestamp}.json"
+            
+            # Upload JSON to R2
+            logger.info(f"Uploading study results to R2: {r2_key}")
+            
+            bucket_name = self.r2_config.bucket_name
+            
+            # Upload with metadata
+            extra_args = {
+                'ContentType': 'application/json',
+                'Metadata': {
+                    'study_name': study_name,
+                    'stage': stage,
+                    'symbol': symbol,
+                    'upload_timestamp': timestamp,
+                    'file_type': 'optuna_study_results'
+                }
+            }
+            
+            self.s3_client.upload_file(
+                local_json_path,
+                bucket_name,
+                r2_key,
+                ExtraArgs=extra_args
+            )
+            
+            logger.info(f"✅ Successfully uploaded study results to R2: {r2_key}")
+            
+            # Also upload as latest (without timestamp for easy access)
+            latest_key = f"studies/{symbol}/{stage}/{study_name}_latest.json"
+            self.s3_client.upload_file(
+                local_json_path,
+                bucket_name,
+                latest_key,
+                ExtraArgs=extra_args
+            )
+            
+            logger.info(f"✅ Successfully uploaded latest study results to R2: {latest_key}")
+            
+            # Cleanup local file if requested
+            if cleanup_local:
+                try:
+                    os.remove(local_json_path)
+                    logger.info(f"🗑️ Cleaned up local file: {local_json_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup local file {local_json_path}: {e}")
+            
+            return True
+            
+        except ClientError as e:
+            logger.error(f"AWS/R2 client error uploading study results: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to upload study results to R2: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return False
+
+    def list_study_results(
+        self,
+        symbol: str = "EURUSD",
+        stage: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        List available study results in R2 storage.
+        
+        Args:
+            symbol: Currency pair symbol
+            stage: Optional stage filter ("stageA", "stageB")
+            
+        Returns:
+            List of dictionaries with study result information
+        """
+        try:
+            if not self._validate_r2_credentials():
+                return []
+            
+            bucket_name = self.r2_config.bucket_name
+            prefix = f"studies/{symbol}/"
+            
+            if stage:
+                prefix += f"{stage}/"
+            
+            response = self.s3_client.list_objects_v2(
+                Bucket=bucket_name,
+                Prefix=prefix
+            )
+            
+            study_results = []
+            
+            if 'Contents' in response:
+                for obj in response['Contents']:
+                    # Get metadata
+                    try:
+                        head_response = self.s3_client.head_object(
+                            Bucket=bucket_name,
+                            Key=obj['Key']
+                        )
+                        metadata = head_response.get('Metadata', {})
+                        
+                        study_info = {
+                            'key': obj['Key'],
+                            'size': obj['Size'],
+                            'last_modified': obj['LastModified'],
+                            'study_name': metadata.get('study_name', 'unknown'),
+                            'stage': metadata.get('stage', 'unknown'),
+                            'symbol': metadata.get('symbol', symbol),
+                            'upload_timestamp': metadata.get('upload_timestamp', 'unknown')
+                        }
+                        study_results.append(study_info)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to get metadata for {obj['Key']}: {e}")
+                        # Add basic info without metadata
+                        study_results.append({
+                            'key': obj['Key'],
+                            'size': obj['Size'],
+                            'last_modified': obj['LastModified'],
+                            'study_name': 'unknown',
+                            'stage': 'unknown',
+                            'symbol': symbol,
+                            'upload_timestamp': 'unknown'
+                        })
+            
+            logger.info(f"Found {len(study_results)} study results for {symbol}")
+            return study_results
+            
+        except Exception as e:
+            logger.error(f"Failed to list study results: {e}")
+            return []
