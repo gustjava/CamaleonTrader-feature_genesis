@@ -84,24 +84,24 @@ search_space:
 
   dcor:
     threshold:
-      low: 0.001               # Much more permissive threshold  
-      high: 0.2                # Lower upper bound
+      low: 0.1                 # More selective threshold  
+      high: 0.3                # Higher upper bound
     min_percentile:
       low: 0.0
       high: 0.1                # Much lower percentile
     top_k:
-      low: 50                  # Higher minimum to keep more features
-      high: 200                # Keep more features
+      low: 100                 # More selective minimum
+      high: 150                # More focused upper bound
 
   vif:
     threshold:
-      low: 2.0                 # Higher VIF threshold (less aggressive)
-      high: 20                 # Higher tolerance for multicollinearity
+      low: 5.0                 # More balanced VIF threshold
+      high: 15.0               # More focused tolerance for multicollinearity
 
   mi:
     threshold:
-      low: 0.0001              # Much lower MI threshold
-      high: 0.2                # Lower upper bound
+      low: 0.01                # More balanced MI threshold
+      high: 0.1                # Lower upper bound
     bins:
       choices: [8, 16, 32, 48, 64, 96]  # More bin options
     chunk_size:
@@ -109,8 +109,8 @@ search_space:
 
   stage3:
     top_n:
-      low: 30                  # Higher minimum to preserve more features
-      high: 150                # Much higher bound for EURUSD
+      low: 50                  # Balanced minimum to preserve features
+      high: 100                # More focused upper bound
     catboost_iterations:
       low: 100                 # Lower bound for faster trials
       high: 2000               # Higher bound for EURUSD complexity

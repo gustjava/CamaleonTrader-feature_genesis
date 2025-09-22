@@ -104,50 +104,59 @@ echo "✅ Diretório remoto pronto."
 
 # MySQL tunnel removed - no longer needed
 
-# --- CRIAR TÚNEL PARA DASHBOARD DASK ---
-echo -e "\n🔗  Criando túnel SSH para dashboard Dask..."
-DASHBOARD_TUNNEL_PID_FILE="/tmp/vast_dashboard_tunnel_${INSTANCE_ID}.pid"
-DASHBOARD_LOCAL_PORT="8888"
-DASHBOARD_REMOTE_PORT="8888"
-
-# Mata qualquer túnel de dashboard anterior para esta instância
-if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
-    OLD_DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE")
-    if kill -0 "$OLD_DASHBOARD_PID" 2>/dev/null; then
-        echo "Matando túnel de dashboard anterior (PID: $OLD_DASHBOARD_PID)..."
-        kill "$OLD_DASHBOARD_PID"
-        sleep 2
-    fi
-    rm -f "$DASHBOARD_TUNNEL_PID_FILE"
+# --- CRIAR TÚNEL PARA DASHBOARD DASK (apenas se paralelização estiver habilitada) ---
+USE_DASK="0"
+if grep -qiE '^\s*use_dask_parallelization\s*:\s*true' "$LOCAL_PROJECT_DIR/config/study/stageA.yaml" 2>/dev/null; then
+    USE_DASK="1"
 fi
 
-# Verifica se a porta local já está em uso
-if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
-    echo "⚠️  Porta $DASHBOARD_LOCAL_PORT já está em uso. Tentando porta 8889..."
-    DASHBOARD_LOCAL_PORT="8889"
+if [[ "$USE_DASK" == "1" ]]; then
+    echo -e "\n🔗  Criando túnel SSH para dashboard Dask..."
+    DASHBOARD_TUNNEL_PID_FILE="/tmp/vast_dashboard_tunnel_${INSTANCE_ID}.pid"
+    DASHBOARD_LOCAL_PORT="8888"
+    DASHBOARD_REMOTE_PORT="8888"
+
+    # Mata qualquer túnel de dashboard anterior para esta instância
+    if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+            OLD_DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE")
+            if kill -0 "$OLD_DASHBOARD_PID" 2>/dev/null; then
+                    echo "Matando túnel de dashboard anterior (PID: $OLD_DASHBOARD_PID)..."
+                    kill "$OLD_DASHBOARD_PID"
+                    sleep 2
+            fi
+            rm -f "$DASHBOARD_TUNNEL_PID_FILE"
+    fi
+
+    # Verifica se a porta local já está em uso
     if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
-        echo "⚠️  Porta $DASHBOARD_LOCAL_PORT também está em uso. Tentando porta 8890..."
-        DASHBOARD_LOCAL_PORT="8890"
+            echo "⚠️  Porta $DASHBOARD_LOCAL_PORT já está em uso. Tentando porta 8889..."
+            DASHBOARD_LOCAL_PORT="8889"
+            if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+                    echo "⚠️  Porta $DASHBOARD_LOCAL_PORT também está em uso. Tentando porta 8890..."
+                    DASHBOARD_LOCAL_PORT="8890"
+            fi
     fi
-fi
 
-# Cria o túnel do dashboard em background com nohup
-nohup ssh $SSH_OPTS -L $DASHBOARD_LOCAL_PORT:localhost:$DASHBOARD_REMOTE_PORT -N "root@$SSH_HOST" > /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log 2>&1 &
-DASHBOARD_TUNNEL_PID=$!
-echo "$DASHBOARD_TUNNEL_PID" > "$DASHBOARD_TUNNEL_PID_FILE"
+    # Cria o túnel do dashboard em background com nohup
+    nohup ssh $SSH_OPTS -L $DASHBOARD_LOCAL_PORT:localhost:$DASHBOARD_REMOTE_PORT -N "root@$SSH_HOST" > /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log 2>&1 &
+    DASHBOARD_TUNNEL_PID=$!
+    echo "$DASHBOARD_TUNNEL_PID" > "$DASHBOARD_TUNNEL_PID_FILE"
 
-# Aguarda um pouco para o túnel se estabelecer
-echo "Aguardando túnel do dashboard se estabelecer..."
-sleep 3
+    # Aguarda um pouco para o túnel se estabelecer
+    echo "Aguardando túnel do dashboard se estabelecer..."
+    sleep 3
 
-# Verifica se o túnel do dashboard está funcionando
-if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
-    echo "✅ Túnel SSH para dashboard Dask criado (PID: $DASHBOARD_TUNNEL_PID)"
-    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
-    echo "🌐 Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
+    # Verifica se o túnel do dashboard está funcionando
+    if nc -z -w5 127.0.0.1 "$DASHBOARD_LOCAL_PORT"; then
+            echo "✅ Túnel SSH para dashboard Dask criado (PID: $DASHBOARD_TUNNEL_PID)"
+            echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+            echo "🌐 Dashboard disponível em: http://localhost:$DASHBOARD_LOCAL_PORT"
+    else
+            echo "⚠️  Túnel do dashboard não conseguiu se estabelecer, mas continuando..."
+            echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    fi
 else
-    echo "⚠️  Túnel do dashboard não conseguiu se estabelecer, mas continuando..."
-    echo "📝 Logs do túnel dashboard: /tmp/vast_dashboard_tunnel_${INSTANCE_ID}.log"
+    echo -e "\nℹ️  Paralelização Dask desabilitada (use_dask_parallelization=false). Pulando túnel do dashboard."
 fi
 
 # --- SINCRONIZAÇÃO DE CÓDIGO ---
@@ -467,7 +476,7 @@ fi
 echo "📝 Logs completos salvos em: $PIPELINE_LOG_FILE"
 
 echo -e "\n🔗 TÚNEIS SSH ATIVOS:"
-if [[ -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
+if [[ -n "${DASHBOARD_TUNNEL_PID_FILE:-}" && -f "$DASHBOARD_TUNNEL_PID_FILE" ]]; then
     DASHBOARD_PID=$(cat "$DASHBOARD_TUNNEL_PID_FILE" 2>/dev/null || echo "N/A")
     echo "   • Dashboard Dask: localhost:$DASHBOARD_LOCAL_PORT → remoto:$DASHBOARD_REMOTE_PORT (PID: $DASHBOARD_PID)"
     echo "   • Acesse o dashboard em: http://localhost:$DASHBOARD_LOCAL_PORT"

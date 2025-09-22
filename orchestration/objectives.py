@@ -272,7 +272,12 @@ def _load_dataset(dataset_cfg: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.Series]
                         total_rows = None
                 if isinstance(total_rows, int) and total_rows >= 0:
                     n = min(max_rows, total_rows)
-                df = ddf.head(n, compute=True)
+                # Force scanning enough partitions to satisfy n
+                try:
+                    df = ddf.head(n, npartitions=getattr(ddf, 'npartitions', None) or 10, compute=True)
+                except TypeError:
+                    # Older Dask versions may not support npartitions kwarg
+                    df = ddf.head(n, compute=True)
             except Exception:
                 # Fallback to full read if dask path fails
                 df = pd.read_parquet(dataset_path)
